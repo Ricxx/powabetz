@@ -1,0 +1,9 @@
+name = "powabetz-proxy"
+main = "worker.js"
+compatibility_date = "2024-11-01"
+
+# Secrets are NOT set here (they'd be in source). Set them with:
+#   wrangler secret put API_FOOTBALL_KEY
+#   wrangler secret put ANTHROPIC_KEY
+#   wrangler secret put XAI_KEY
+#   wrangler secret put PROXY_TOKENS     # comma-separated user tokens

@@ -1,0 +1,50 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    @apply bg-ink text-slate-100;
+    margin: 0;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+  input,
+  textarea {
+    -webkit-user-select: text;
+    user-select: text;
+  }
+}
+
+@layer components {
+  .btn {
+    @apply rounded-xl px-4 py-3 font-semibold transition active:scale-[0.98];
+  }
+  .btn-primary {
+    @apply bg-accent text-ink hover:brightness-110 disabled:opacity-40 disabled:cursor-not-allowed;
+  }
+  .btn-ghost {
+    @apply bg-panel text-slate-200 border border-edge hover:border-slate-500;
+  }
+  .chip {
+    @apply rounded-full px-3 py-2 text-sm border border-edge bg-panel text-slate-200 transition active:scale-95;
+  }
+  .chip-on {
+    @apply bg-accent/20 border-accent text-accent;
+  }
+  .chip-dim {
+    @apply opacity-50;
+  }
+  .card {
+    @apply rounded-2xl bg-panel border border-edge p-4;
+  }
+  .badge {
+    @apply rounded-md px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide;
+  }
+}
