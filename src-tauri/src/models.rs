@@ -103,6 +103,7 @@ pub struct SettingsView {
     pub has_api_football_key: bool,
     pub has_anthropic_key: bool,
     pub has_grok_key: bool,
+    pub has_openai_key: bool,
     pub has_parlay_key: bool,
     pub model: String,
     pub books: Vec<String>,
@@ -312,6 +313,9 @@ pub struct BuildSelection {
     /// Run the per-fixture Haiku plausibility pre-score (cached) and blend it into ranking.
     #[serde(default)]
     pub use_plausibility: Option<bool>,
+    /// Feed matched browser-ingested page data into the build as labeled context.
+    #[serde(default)]
+    pub use_ingest: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -356,6 +360,48 @@ pub struct UsageBreakdown {
 pub struct LegResult {
     pub won: Option<bool>, // None = not yet gradeable
     pub detail: String,
+}
+
+/// A page the user ingested via the browser extension (raw → Haiku-structured).
+#[derive(Debug, Clone, Serialize)]
+pub struct IngestItem {
+    pub id: i64,
+    pub created_at: i64, // when ingested
+    pub url: String,
+    pub title: String,
+    pub note: String,
+    pub status: String, // new | processed
+    pub fixture_label: Option<String>,
+    pub fixture_date: Option<String>, // date of the fixture the page is about
+    pub summary: String,
+    pub data: Vec<IngestKV>, // the structured extraction, viewable to verify it isn't garbage
+    pub model: Option<String>,
+    pub used: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IngestKV {
+    pub label: String,
+    pub value: String,
+}
+
+/// Token usage + cost grouped by (model, purpose) — what each model contributed.
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelPurposeRow {
+    pub model: String,
+    pub purpose: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cost_usd: f64,
+}
+
+/// Local ingest endpoint info (for Settings + the extension to connect).
+#[derive(Debug, Clone, Serialize)]
+pub struct IngestInfo {
+    pub enabled: bool,
+    pub port: u16,
+    pub token: String,
+    pub new_count: i64,
 }
 
 /// Per-market (per-pick) settlement stats from the generated ledger — the model's

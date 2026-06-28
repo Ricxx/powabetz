@@ -14,6 +14,7 @@ export default function Settings({
   const [af, setAf] = useState("");
   const [an, setAn] = useState("");
   const [grok, setGrok] = useState("");
+  const [openai, setOpenai] = useState("");
   const [parlay, setParlay] = useState("");
   const [model, setModel] = useState(settings.model);
   const [limit, setLimit] = useState(String(settings.meter.limit));
@@ -27,12 +28,14 @@ export default function Settings({
 
   const [bank, setBank] = useState<BankrollView | null>(null);
   const [bankInput, setBankInput] = useState("");
+  const [ingestEnabled, setIngestEnabled] = useState(true);
 
   useEffect(() => {
     api.getBankroll().then((b) => {
       setBank(b);
       setBankInput(String(b.bankroll));
     }).catch(() => {});
+    api.ingestInfo().then((i) => setIngestEnabled(i.enabled)).catch(() => {});
   }, []);
 
   const meter = settings.meter;
@@ -47,6 +50,7 @@ export default function Settings({
         af || null,
         an || null,
         grok || null,
+        openai || null,
         parlay || null,
         model,
         Number.isFinite(lim) && lim > 0 ? lim : null,
@@ -54,12 +58,14 @@ export default function Settings({
         kelly,
         tz,
         proxyUrl.trim(),
-        proxyToken || null
+        proxyToken || null,
+        ingestEnabled
       );
       onSaved(next);
       setAf("");
       setAn("");
       setGrok("");
+      setOpenai("");
       setParlay("");
       setProxyToken("");
     } catch (e) {
@@ -305,6 +311,12 @@ export default function Settings({
           onChange={setGrok}
         />
         <KeyInput
+          label="OpenAI key — GPT analysis (2nd angle), optional"
+          set={settings.has_openai_key}
+          value={openai}
+          onChange={setOpenai}
+        />
+        <KeyInput
           label="Parlay API key — sharp odds / de-vig / +EV, optional"
           set={settings.has_parlay_key}
           value={parlay}
@@ -339,6 +351,24 @@ export default function Settings({
           Keys are stored locally in the app data folder, never in the binary. To share the app
           without giving out keys, run the proxy in <code>proxy/</code> and hand users a token.
         </p>
+      </div>
+
+      <div className="card space-y-2">
+        <div className="flex items-center justify-between">
+          <div className="min-w-0">
+            <div className="text-xs font-semibold text-slate-300">🧲 Browser-extension ingest</div>
+            <div className="text-[11px] text-slate-500">
+              Local server the Powabetz extension posts pages to. Restart the app to apply a change.
+            </div>
+          </div>
+          <button
+            className={`shrink-0 w-12 h-7 rounded-full transition relative ${ingestEnabled ? "bg-accent" : "bg-edge"}`}
+            onClick={() => setIngestEnabled((v) => !v)}
+            aria-label="toggle ingest"
+          >
+            <span className={`absolute top-1 w-5 h-5 rounded-full bg-ink transition-all ${ingestEnabled ? "left-6" : "left-1"}`} />
+          </button>
+        </div>
       </div>
 
       <div className="card space-y-2">

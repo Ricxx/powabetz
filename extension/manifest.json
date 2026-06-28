@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "Powabetz Ingest",
+  "version": "1.0.1",
+  "description": "Send the current page's content to your Powabetz desktop app for analysis.",
+  "permissions": ["contextMenus", "activeTab", "scripting", "storage", "tabs"],
+  "host_permissions": ["http://127.0.0.1/*", "http://localhost/*"],
+  "background": { "service_worker": "background.js" },
+  "action": { "default_popup": "popup.html", "default_title": "Powabetz Ingest" },
+  "icons": { "128": "icon.png" }
+}

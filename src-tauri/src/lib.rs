@@ -6,6 +6,7 @@ mod commands;
 mod db;
 mod features;
 mod grok;
+mod ingest;
 mod llm;
 mod models;
 mod odds;
@@ -28,6 +29,9 @@ pub struct Keys {
     /// Grok (x.ai) key for X/Twitter sentiment precursor (optional).
     #[serde(default)]
     pub grok: Option<String>,
+    /// OpenAI key — GPT models as a second analysis angle (optional).
+    #[serde(default)]
+    pub openai: Option<String>,
     /// Parlay API key (parlay-api.com) — sharp odds, de-vig, +EV scanner.
     #[serde(default)]
     pub parlay: Option<String>,
@@ -54,6 +58,13 @@ pub struct Keys {
     /// Per-user access token sent to the proxy (NOT a provider key).
     #[serde(default)]
     pub proxy_token: Option<String>,
+    /// Browser-extension ingest endpoint: enabled, shared token, and local port.
+    #[serde(default)]
+    pub ingest_enabled: Option<bool>,
+    #[serde(default)]
+    pub ingest_token: Option<String>,
+    #[serde(default)]
+    pub ingest_port: Option<u16>,
 }
 
 impl Keys {
@@ -73,6 +84,9 @@ impl Keys {
         }
         if keys.grok.is_none() {
             keys.grok = std::env::var("GROK_API_KEY").ok().filter(|s| !s.is_empty());
+        }
+        if keys.openai.is_none() {
+            keys.openai = std::env::var("OPENAI_API_KEY").ok().filter(|s| !s.is_empty());
         }
         if keys.parlay.is_none() {
             keys.parlay = std::env::var("PARLAY_API_KEY").ok().filter(|s| !s.is_empty());
@@ -136,7 +150,21 @@ pub fn run() {
             let settings_path = data_dir.join("settings.json");
 
             let conn = db::open(&db_path).map_err(std::io::Error::other)?;
-            let keys = Keys::load(&settings_path);
+            let mut keys = Keys::load(&settings_path);
+
+            // Ensure an ingest token exists (for the browser extension), then start
+            // the local ingest server unless the user disabled it.
+            if keys.ingest_token.is_none() {
+                keys.ingest_token = Some(ingest::gen_token());
+                let _ = keys.persist(&settings_path);
+            }
+            if keys.ingest_enabled.unwrap_or(true) {
+                ingest::start(
+                    db_path.clone(),
+                    keys.ingest_token.clone().unwrap_or_default(),
+                    keys.ingest_port.unwrap_or(8765),
+                );
+            }
 
             let http = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(180))
@@ -176,6 +204,13 @@ pub fn run() {
             commands::export_data,
             commands::import_data,
             commands::reset_data,
+            commands::usage_by_purpose,
+            commands::export_extension,
+            commands::ingest_info,
+            commands::list_ingested,
+            commands::process_ingested,
+            commands::delete_ingested,
+            commands::update_ingest_note,
             commands::save_ticket,
             commands::list_tickets,
             commands::list_grok_log,

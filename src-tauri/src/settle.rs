@@ -22,6 +22,7 @@ struct PlayerLine {
     fouls_drawn: f64,
     cards: f64,
     passes: f64,
+    saves: f64,
 }
 
 struct FixtureResult {
@@ -40,6 +41,8 @@ struct FixtureResult {
     away_outbox: Option<f64>,
     home_inbox: Option<f64>,
     away_inbox: Option<f64>,
+    home_offsides: Option<f64>,
+    away_offsides: Option<f64>,
     players: HashMap<String, PlayerLine>,
 }
 
@@ -171,6 +174,7 @@ async fn fetch_result(state: &AppState, fixture_id: i64) -> Option<FixtureResult
                             fouls_drawn: g("fouls", "drawn"),
                             cards: g("cards", "yellow") + g("cards", "red"),
                             passes: g("passes", "total"),
+                            saves: g("goals", "saves"),
                         },
                     );
                 }
@@ -182,6 +186,7 @@ async fn fetch_result(state: &AppState, fixture_id: i64) -> Option<FixtureResult
     let home_id = teams.and_then(|t| t.get("home")).and_then(|h| h.get("id")).and_then(|v| v.as_i64());
     let (mut home_corners, mut away_corners, mut home_shots, mut away_shots) = (None, None, None, None);
     let (mut home_outbox, mut away_outbox, mut home_inbox, mut away_inbox) = (None, None, None, None);
+    let (mut home_offsides, mut away_offsides) = (None, None);
     let stats_params = vec![("fixture", fixture_id.to_string())];
     let sj_res = if forced {
         af::fetch_fresh(state, "/fixtures/statistics", stats_params, TTL_RECHECK).await
@@ -203,11 +208,13 @@ async fn fetch_result(state: &AppState, fixture_id: i64) -> Option<FixtureResult
                 home_shots = stat(&team, "Total Shots");
                 home_outbox = stat(&team, "Shots outsidebox");
                 home_inbox = stat(&team, "Shots insidebox");
+                home_offsides = stat(&team, "Offsides");
             } else {
                 away_corners = stat(&team, "Corner Kicks");
                 away_shots = stat(&team, "Total Shots");
                 away_outbox = stat(&team, "Shots outsidebox");
                 away_inbox = stat(&team, "Shots insidebox");
+                away_offsides = stat(&team, "Offsides");
             }
         }
     }
@@ -228,6 +235,8 @@ async fn fetch_result(state: &AppState, fixture_id: i64) -> Option<FixtureResult
         away_outbox,
         home_inbox,
         away_inbox,
+        home_offsides,
+        away_offsides,
         players,
     })
 }
@@ -264,6 +273,23 @@ fn grade_leg(leg: &TicketLeg, r: &FixtureResult) -> LegResult {
     let total = r.home_goals + r.away_goals;
     let market = leg.market.as_str();
 
+    // Goals in a single half (uses the half-time score).
+    if (market.contains("1st Half") || market.contains("2nd Half")) && market.ends_with("Goals") {
+        let (hh, ha) = match (r.ht_home, r.ht_away) {
+            (Some(h), Some(a)) => (h, a),
+            _ => return ungraded("no halftime score"),
+        };
+        let half_goals = if market.contains("1st Half") {
+            hh + ha
+        } else {
+            (r.home_goals - hh) + (r.away_goals - ha)
+        };
+        let thr: f64 = line.chars().filter(|c| c.is_ascii_digit() || *c == '.').collect::<String>().parse().unwrap_or(0.5);
+        let hit = if line.to_lowercase().contains("over") { half_goals > thr } else { half_goals < thr };
+        let half = if market.contains("1st Half") { "1H" } else { "2H" };
+        return won(hit, format!("{half} {} goals", half_goals as i64));
+    }
+
     // Any goals O/U line (1.5 / 2.5 / 3.5 / …), not just 2.5.
     if (market.starts_with("Over ") || market.starts_with("Under ")) && market.ends_with("Goals") {
         let thr: f64 = market
@@ -281,6 +307,29 @@ fn grade_leg(leg: &TicketLeg, r: &FixtureResult) -> LegResult {
             r.home_goals > 0.0 && r.away_goals > 0.0,
             format!("FT {}-{}", r.home_goals as i64, r.away_goals as i64),
         ),
+        "Correct Score" => {
+            let p: Vec<i64> = line.split('-').filter_map(|s| s.trim().parse().ok()).collect();
+            if p.len() == 2 {
+                won(
+                    r.home_goals as i64 == p[0] && r.away_goals as i64 == p[1],
+                    format!("FT {}-{}", r.home_goals as i64, r.away_goals as i64),
+                )
+            } else {
+                ungraded("bad score line")
+            }
+        }
+        "Goals Range" => {
+            let nums: Vec<i64> = line
+                .split(|c: char| !c.is_ascii_digit())
+                .filter_map(|s| s.parse().ok())
+                .collect();
+            if nums.len() >= 2 {
+                let t = total as i64;
+                won(t >= nums[0] && t <= nums[1], format!("FT total {t}"))
+            } else {
+                ungraded("bad range")
+            }
+        }
         "Team Total Goals" => {
             let sel = leg.selection.to_lowercase();
             let hl = r.home_name.to_lowercase();
@@ -295,7 +344,7 @@ fn grade_leg(leg: &TicketLeg, r: &FixtureResult) -> LegResult {
             let hit = if line.to_lowercase().contains("over") { tg > thr } else { tg < thr };
             won(hit, format!("{} {}", leg.selection, tg as i64))
         }
-        "Team Corners" | "Team Shots" | "Team Shots Outside Box" | "Team Shots Inside Box" => {
+        "Team Corners" | "Team Shots" | "Team Shots Outside Box" | "Team Shots Inside Box" | "Team Offsides" => {
             let sel = leg.selection.to_lowercase();
             let hl = r.home_name.to_lowercase();
             let is_home = hl.contains(&sel) || sel.contains(&hl);
@@ -303,6 +352,7 @@ fn grade_leg(leg: &TicketLeg, r: &FixtureResult) -> LegResult {
                 "Team Corners" => (r.home_corners, r.away_corners),
                 "Team Shots" => (r.home_shots, r.away_shots),
                 "Team Shots Outside Box" => (r.home_outbox, r.away_outbox),
+                "Team Offsides" => (r.home_offsides, r.away_offsides),
                 _ => (r.home_inbox, r.away_inbox),
             };
             let val = if is_home { h } else { a };
@@ -363,7 +413,7 @@ fn grade_leg(leg: &TicketLeg, r: &FixtureResult) -> LegResult {
         },
         // Player markets
         "Anytime Scorer" | "Anytime Assist" | "Shots on Target" | "Player Shots" | "Tackles"
-        | "Fouls Committed" | "Fouls Drawn" | "To Be Carded" | "Passes Completed" => {
+        | "Fouls Committed" | "Fouls Drawn" | "To Be Carded" | "Passes Completed" | "Goalkeeper Saves" => {
             let p = match lookup_player(&r.players, &leg.selection) {
                 Some(p) => p,
                 None => return ungraded("no player stats"),
@@ -379,6 +429,7 @@ fn grade_leg(leg: &TicketLeg, r: &FixtureResult) -> LegResult {
                 "Fouls Drawn" => won(p.fouls_drawn >= k, format!("{} drawn", p.fouls_drawn as i64)),
                 "To Be Carded" => won(p.cards >= 1.0, format!("{} cards", p.cards as i64)),
                 "Passes Completed" => won(p.passes >= k, format!("{} passes", p.passes as i64)),
+                "Goalkeeper Saves" => won(p.saves >= k, format!("{} saves", p.saves as i64)),
                 _ => ungraded("unsupported"),
             }
         }

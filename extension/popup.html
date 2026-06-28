@@ -1,0 +1,27 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      body { font-family: system-ui, sans-serif; width: 280px; padding: 12px; background: #0b0f16; color: #e2e8f0; }
+      h1 { font-size: 14px; margin: 0 0 8px; }
+      label { font-size: 11px; color: #94a3b8; }
+      input { width: 100%; padding: 6px; margin: 3px 0 8px; background: #0f1622; border: 1px solid #243049; color: #e2e8f0; border-radius: 6px; font-size: 12px; box-sizing: border-box; }
+      button { width: 100%; padding: 8px; margin-top: 4px; border: 0; border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 12px; }
+      .primary { background: #16a34a; color: #04210f; }
+      .ghost { background: #243049; color: #e2e8f0; }
+      .s { font-size: 11px; color: #94a3b8; margin-top: 8px; min-height: 14px; }
+    </style>
+  </head>
+  <body>
+    <h1>Powabetz Ingest</h1>
+    <label>Endpoint (from the app's Ingest screen)</label>
+    <input id="endpoint" placeholder="http://127.0.0.1:8765/ingest" />
+    <label>Token</label>
+    <input id="token" placeholder="paste token from the app" />
+    <button id="save" class="ghost">Save settings</button>
+    <button id="ingest" class="primary">Ingest this page</button>
+    <div class="s" id="status"></div>
+    <script src="popup.js"></script>
+  </body>
+</html>

@@ -22,8 +22,14 @@ your proxy; the proxy holds the real keys and injects them. You hand each user a
    wrangler secret put API_FOOTBALL_KEY
    wrangler secret put ANTHROPIC_KEY
    wrangler secret put XAI_KEY
+   wrangler secret put OPENAI_KEY        # optional — GPT analysis
    wrangler secret put PROXY_TOKENS      # e.g.  alice-7f3a,bob-91kd,carol-22xt
    ```
+
+   **Updating a key later** (e.g. a new OpenAI key): just run the same command
+   again — `wrangler secret put OPENAI_KEY` — paste the new value; it takes effect
+   immediately, no redeploy needed. (Run `wrangler deploy` only when you change
+   `worker.js` itself, e.g. after pulling a new version that adds a route.)
    `PROXY_TOKENS` is a comma-separated list — invent one random token per user.
 3. Deploy:
    ```sh

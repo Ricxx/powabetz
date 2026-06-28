@@ -31,6 +31,14 @@ fn pois_ge1(l: f64) -> f64 {
 fn pois_ge2(l: f64) -> f64 {
     1.0 - (-l).exp() * (1.0 + l)
 }
+/// P(X = k) for Poisson(l), small k.
+fn pois_pmf(k: u32, l: f64) -> f64 {
+    let mut term = (-l).exp();
+    for i in 1..=k {
+        term *= l / i as f64;
+    }
+    term
+}
 /// P(X <= k) for Poisson(l), small k.
 fn pois_cdf(k: u32, l: f64) -> f64 {
     let mut term = (-l).exp();
@@ -82,6 +90,7 @@ struct PlayerSeason {
     fouls_drawn: f64,
     cards: f64,
     passes: f64,
+    saves: f64,
 }
 
 fn parse_player_season(json: &Value, league_id: i64) -> Option<PlayerSeason> {
@@ -148,6 +157,7 @@ fn accumulate_player(s: &mut PlayerSeason, row: &Value) {
     s.fouls_drawn += g("fouls", "drawn");
     s.cards += g("cards", "yellow") + g("cards", "yellowred") + g("cards", "red");
     s.passes += g("passes", "total");
+    s.saves += g("goals", "saves");
 }
 
 /// Parse a cached `/players` body into the inspector view (raw season totals +
@@ -237,7 +247,9 @@ pub fn build_player_candidates_entry(
     let cards_p90 = per90(s.cards);
     let passes_p90 = per90(s.passes);
     let assists_p90 = per90(s.assists);
+    let saves_p90 = per90(s.saves);
     let min_scale = exp_min / 90.0;
+    let is_keeper = s.position.to_lowercase().contains("goalkeeper") || s.position.eq_ignore_ascii_case("g");
 
     // Availability: injured/suspended unlikely to feature → sink + flag.
     let avail_mult = match ctx.availability.as_str() {
@@ -417,6 +429,27 @@ pub fn build_player_candidates_entry(
                     vec![],
                 ));
             }
+            "saves" => {
+                // Goalkeepers only — anything else has no save data.
+                if !is_keeper || saves_p90 < 0.5 {
+                    continue;
+                }
+                let lambda = saves_p90 * min_scale;
+                let (line, est) = if pois_ge2(lambda * 1.5) >= 0.5 {
+                    ("3+ saves", 1.0 - pois_cdf(2, lambda))
+                } else {
+                    ("2+ saves", 1.0 - pois_cdf(1, lambda))
+                };
+                out.push(base(
+                    "Goalkeeper Saves",
+                    "saves",
+                    line,
+                    saves_p90,
+                    est,
+                    vec![format!("saves/90 {:.1}", saves_p90), format!("exp_min {:.0}", exp_min)],
+                    vec![],
+                ));
+            }
             "assists" => {
                 let lambda = assists_p90 * min_scale;
                 if assists_p90 < 0.05 {
@@ -500,6 +533,7 @@ pub struct TeamStats {
     pub shots_against: Option<f64>,
     pub outbox_for: Option<f64>,
     pub inbox_for: Option<f64>,
+    pub offsides_for: Option<f64>,
 }
 
 pub fn parse_team_stats(json: &Value, name: &str) -> Option<TeamStats> {
@@ -560,6 +594,7 @@ pub fn parse_team_stats(json: &Value, name: &str) -> Option<TeamStats> {
         xg_for: None,
         xg_against: None,
         corners_for: None,
+        offsides_for: None,
         corners_against: None,
         shots_for: None,
         shots_against: None,
@@ -645,6 +680,53 @@ pub fn build_team_candidates(
                     out.push(mk("Match", &format!("Under {line_val:.1} Goals"), "ou25", &format!("Under {line_val:.1}"), total, 1.0 - over, sup));
                 }
             }
+            "h1goals" | "h2goals" => {
+                // Goals in a single half. 1H ≈ ~45% of the match (per-team share).
+                let first = g == "h1goals";
+                let sh = |s: f64| if first { s } else { 1.0 - s };
+                let lam = lambda_home * sh(home.first_half_share) + lambda_away * sh(away.first_half_share);
+                let half = if first { "1st Half" } else { "2nd Half" };
+                let sup = vec![format!("{half} exp_goals {lam:.2}")];
+                for thresh in [0u32, 1] {
+                    let line_val = thresh as f64 + 0.5;
+                    let over = 1.0 - pois_cdf(thresh, lam);
+                    out.push(mk("Match", &format!("{half} Over {line_val:.1} Goals"), g, &format!("Over {line_val:.1}"), lam, over, sup.clone()));
+                    out.push(mk("Match", &format!("{half} Under {line_val:.1} Goals"), g, &format!("Under {line_val:.1}"), lam, 1.0 - over, sup.clone()));
+                }
+            }
+            "exactscore" => {
+                // Most-likely correct scores from the independent-Poisson grid.
+                let mut scores: Vec<((u32, u32), f64)> = Vec::new();
+                for h in 0u32..=5 {
+                    for a in 0u32..=5 {
+                        scores.push(((h, a), pois_pmf(h, lambda_home) * pois_pmf(a, lambda_away)));
+                    }
+                }
+                scores.sort_by(|x, y| y.1.partial_cmp(&x.1).unwrap_or(std::cmp::Ordering::Equal));
+                for ((h, a), p) in scores.into_iter().take(6) {
+                    let line = format!("{h}-{a}");
+                    out.push(mk(
+                        "Match",
+                        "Correct Score",
+                        "exactscore",
+                        &line,
+                        p,
+                        clampp(p),
+                        vec![format!("xg {lambda_home:.2}-{lambda_away:.2}")],
+                    ));
+                }
+            }
+            "goalsrange" => {
+                let total = lambda_home + lambda_away;
+                let sup = vec![format!("exp_goals {total:.2}")];
+                // (lo, hi) inclusive total-goals bands.
+                for (lo, hi) in [(0u32, 1u32), (2, 3), (4, 6)] {
+                    let p_hi = pois_cdf(hi, total);
+                    let p_lo = if lo == 0 { 0.0 } else { pois_cdf(lo - 1, total) };
+                    let p = (p_hi - p_lo).clamp(0.0, 1.0);
+                    out.push(mk("Match", "Goals Range", "goalsrange", &format!("{lo}-{hi} goals"), total, clampp(p), sup.clone()));
+                }
+            }
             "tcorners" => {
                 for (team, cf) in [(&home.name, home.corners_for), (&away.name, away.corners_for)] {
                     if let Some(lam) = cf {
@@ -654,6 +736,19 @@ pub fn build_team_candidates(
                             let sup = vec![format!("corners/g {lam:.1}")];
                             out.push(mk(team, "Team Corners", "tcorners", &format!("Over {line:.1}"), lam, over, sup.clone()));
                             out.push(mk(team, "Team Corners", "tcorners", &format!("Under {line:.1}"), lam, 1.0 - over, sup));
+                        }
+                    }
+                }
+            }
+            "toffsides" => {
+                for (team, of) in [(&home.name, home.offsides_for), (&away.name, away.offsides_for)] {
+                    if let Some(lam) = of {
+                        for line in [0.5_f64, 1.5, 2.5] {
+                            let thr = line.floor() as u32;
+                            let over = 1.0 - pois_cdf(thr, lam);
+                            let sup = vec![format!("offsides/g {lam:.1}")];
+                            out.push(mk(team, "Team Offsides", "toffsides", &format!("Over {line:.1}"), lam, over, sup.clone()));
+                            out.push(mk(team, "Team Offsides", "toffsides", &format!("Under {line:.1}"), lam, 1.0 - over, sup));
                         }
                     }
                 }

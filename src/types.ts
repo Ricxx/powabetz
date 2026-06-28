@@ -56,6 +56,7 @@ export interface SettingsView {
   has_api_football_key: boolean;
   has_anthropic_key: boolean;
   has_grok_key: boolean;
+  has_openai_key: boolean;
   has_parlay_key: boolean;
   model: string;
   books: string[];
@@ -107,6 +108,13 @@ export const MODEL_OPTIONS = [
   { id: "claude-opus-4-8", label: "Opus 4.8", note: "$5 / $25 per 1M — sharpest" },
   { id: "claude-sonnet-4-6", label: "Sonnet 4.6", note: "$3 / $15 per 1M — balanced" },
   { id: "claude-haiku-4-5", label: "Haiku 4.5", note: "$1 / $5 per 1M — cheapest" },
+];
+
+// Models for the per-ticket quick analysis (a second angle). GPT needs an OpenAI key.
+export const ANALYSIS_MODELS = [
+  { id: "claude-haiku-4-5", label: "Haiku", provider: "claude" },
+  { id: "gpt-5-nano", label: "GPT-5 nano", provider: "openai" },
+  { id: "gpt-5-mini", label: "GPT-5 mini", provider: "openai" },
 ];
 
 export interface TicketLeg {
@@ -199,6 +207,41 @@ export interface MarketReportRow {
   won: number;
   hit_rate: number; // actual
   predicted: number; // model's mean predicted prob
+}
+
+export interface IngestKV {
+  label: string;
+  value: string;
+}
+
+export interface IngestItem {
+  id: number;
+  created_at: number;
+  url: string;
+  title: string;
+  note: string;
+  status: string; // new | processed
+  fixture_label?: string | null;
+  fixture_date?: string | null;
+  summary: string;
+  data: IngestKV[];
+  model?: string | null;
+  used: boolean;
+}
+
+export interface IngestInfo {
+  enabled: boolean;
+  port: number;
+  token: string;
+  new_count: number;
+}
+
+export interface ModelPurposeRow {
+  model: string;
+  purpose: string;
+  input_tokens: number;
+  output_tokens: number;
+  cost_usd: number;
 }
 
 export interface BuildResponse {
@@ -299,6 +342,7 @@ export interface BuildSelection {
   lucky_safe: number;
   lucky_moderate: number;
   lucky_risky: number;
+  use_ingest: boolean;
   min_legs: number | null;
   min_odds: number | null;
   max_odds: number | null;
@@ -466,8 +510,14 @@ export const MARKETS: MarketDef[] = [
   { key: "half1", label: "1st-half result", group: "team", sub: "Result" },
   { key: "half2", label: "2nd-half result", group: "team", sub: "Result" },
   { key: "ou25", label: "Goals O/U (1.5 / 2.5 / 3.5)", group: "team", sub: "Goals" },
+  { key: "h1goals", label: "1st-half Goals O/U", group: "team", sub: "Goals" },
+  { key: "h2goals", label: "2nd-half Goals O/U", group: "team", sub: "Goals" },
+  { key: "exactscore", label: "Correct Score", group: "team", sub: "Goals" },
+  { key: "goalsrange", label: "Goals Range (0-1 / 2-3 / 4-6)", group: "team", sub: "Goals" },
   { key: "tgoals", label: "Team Total Goals", group: "team", sub: "Goals" },
   { key: "btts", label: "BTTS", group: "team", sub: "Goals" },
   { key: "tcorners", label: "Team Corners (recent form)", group: "team", sub: "Goals" },
   { key: "tshots", label: "Team Shots (recent form)", group: "team", sub: "Goals" },
+  { key: "toffsides", label: "Team Offsides (recent form)", group: "team", sub: "Involvement" },
+  { key: "saves", label: "Goalkeeper Saves", group: "player", sub: "Involvement" },
 ];

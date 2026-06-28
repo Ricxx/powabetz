@@ -98,6 +98,130 @@ fn restore_table(conn: &Connection, table: &str, rows: &[serde_json::Value]) -> 
     Ok(())
 }
 
+// ---------- ingested web pages (from the browser extension) ----------
+
+/// Insert (or refresh) an ingested page, deduped by URL. Resets it to "new" so it
+/// re-processes if the content changed. Returns the row id.
+pub fn ingest_add(
+    conn: &Connection,
+    now: i64,
+    url: &str,
+    url_hash: &str,
+    title: &str,
+    content: &str,
+    note: &str,
+) -> Result<i64, String> {
+    conn.execute(
+        "INSERT INTO ingested (created_at, url, url_hash, title, content, note, status)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'new')
+         ON CONFLICT(url_hash) DO UPDATE SET
+            created_at=?1, title=?4, content=?5,
+            note=CASE WHEN ?6 <> '' THEN ?6 ELSE note END,
+            status='new'",
+        params![now, url, url_hash, title, content, note],
+    )
+    .map_err(|e| e.to_string())?;
+    conn.query_row("SELECT id FROM ingested WHERE url_hash = ?1", params![url_hash], |r| r.get(0))
+        .map_err(|e| e.to_string())
+}
+
+pub struct IngestRow {
+    pub id: i64,
+    pub created_at: i64,
+    pub url: String,
+    pub title: String,
+    pub content: String,
+    pub note: String,
+    pub status: String,
+    pub fixture_label: Option<String>,
+    pub fixture_id: Option<i64>,
+    pub extracted_json: Option<String>,
+    pub model: Option<String>,
+    pub used: bool,
+}
+
+fn ingest_row(r: &rusqlite::Row) -> rusqlite::Result<IngestRow> {
+    Ok(IngestRow {
+        id: r.get(0)?,
+        created_at: r.get(1)?,
+        url: r.get(2)?,
+        title: r.get(3)?,
+        content: r.get(4)?,
+        note: r.get(5)?,
+        status: r.get(6)?,
+        fixture_label: r.get(7)?,
+        fixture_id: r.get(8)?,
+        extracted_json: r.get(9)?,
+        model: r.get(10)?,
+        used: r.get::<_, i64>(11)? != 0,
+    })
+}
+
+const INGEST_COLS: &str =
+    "id, created_at, url, title, content, note, status, fixture_label, fixture_id, extracted_json, model, used";
+
+pub fn ingest_list(conn: &Connection) -> Result<Vec<IngestRow>, String> {
+    let mut stmt = conn
+        .prepare(&format!("SELECT {INGEST_COLS} FROM ingested ORDER BY created_at DESC"))
+        .map_err(|e| e.to_string())?;
+    let rows = stmt.query_map([], ingest_row).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r.map_err(|e| e.to_string())?);
+    }
+    Ok(out)
+}
+
+pub fn ingest_get(conn: &Connection, id: i64) -> Result<Option<IngestRow>, String> {
+    conn.query_row(&format!("SELECT {INGEST_COLS} FROM ingested WHERE id = ?1"), params![id], ingest_row)
+        .optional()
+        .map_err(|e| e.to_string())
+}
+
+pub fn ingest_set_processed(
+    conn: &Connection,
+    id: i64,
+    fixture_label: &str,
+    fixture_id: Option<i64>,
+    extracted_json: &str,
+    model: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "UPDATE ingested SET status='processed', fixture_label=?2, fixture_id=?3, extracted_json=?4, model=?5 WHERE id=?1",
+        params![id, fixture_label, fixture_id, extracted_json, model],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn ingest_set_note(conn: &Connection, id: i64, note: &str) -> Result<(), String> {
+    conn.execute("UPDATE ingested SET note=?2 WHERE id=?1", params![id, note]).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn ingest_mark_used(conn: &Connection, id: i64) -> Result<(), String> {
+    conn.execute("UPDATE ingested SET used=1 WHERE id=?1", params![id]).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn ingest_delete(conn: &Connection, id: i64) -> Result<(), String> {
+    conn.execute("DELETE FROM ingested WHERE id=?1", params![id]).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Processed items whose extracted home/away match either of these team names.
+pub fn ingest_for_fixture(conn: &Connection) -> Result<Vec<IngestRow>, String> {
+    let mut stmt = conn
+        .prepare(&format!("SELECT {INGEST_COLS} FROM ingested WHERE status='processed'"))
+        .map_err(|e| e.to_string())?;
+    let rows = stmt.query_map([], ingest_row).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r.map_err(|e| e.to_string())?);
+    }
+    Ok(out)
+}
+
 /// Serialize the meaningful app state to a portable JSON backup string.
 pub fn export_all(conn: &Connection) -> Result<String, String> {
     let mut tables = serde_json::Map::new();
@@ -238,6 +362,21 @@ fn init(conn: &Connection) -> Result<(), String> {
             leg_results_json TEXT NOT NULL DEFAULT '[]',
             UNIQUE(day, strategy, grok_used, sig)
         );
+        CREATE TABLE IF NOT EXISTS ingested (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at      INTEGER NOT NULL,
+            url             TEXT NOT NULL,
+            url_hash        TEXT NOT NULL UNIQUE,
+            title           TEXT NOT NULL DEFAULT '',
+            content         TEXT NOT NULL,
+            note            TEXT NOT NULL DEFAULT '',
+            status          TEXT NOT NULL DEFAULT 'new',
+            fixture_label   TEXT,
+            fixture_id      INTEGER,
+            extracted_json  TEXT,
+            model           TEXT,
+            used            INTEGER NOT NULL DEFAULT 0
+        );
         "#,
     )
     .map_err(|e| e.to_string())?;
@@ -259,6 +398,11 @@ fn init(conn: &Connection) -> Result<(), String> {
     // Ticket kind on the generated-tickets ledger (migration).
     let _ = conn.execute(
         "ALTER TABLE generated_tickets ADD COLUMN kind TEXT NOT NULL DEFAULT 'Single'",
+        [],
+    );
+    // What each AI call was FOR (build/eval/plausibility/ingest/tactics) — migration.
+    let _ = conn.execute(
+        "ALTER TABLE ai_usage ADD COLUMN purpose TEXT NOT NULL DEFAULT 'build'",
         [],
     );
     Ok(())
@@ -419,14 +563,33 @@ pub fn usage_add(
     model: &str,
     input: i64,
     output: i64,
+    purpose: &str,
 ) -> Result<(), String> {
     conn.execute(
-        "INSERT INTO ai_usage (created_at, model, input_tokens, output_tokens)
-         VALUES (?1, ?2, ?3, ?4)",
-        params![now, model, input, output],
+        "INSERT INTO ai_usage (created_at, model, input_tokens, output_tokens, purpose)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![now, model, input, output, purpose],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Token usage grouped by (model, purpose): (model, purpose, input, output).
+pub fn usage_by_purpose(conn: &Connection) -> Result<Vec<(String, String, i64, i64)>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT model, COALESCE(purpose,'build'), SUM(input_tokens), SUM(output_tokens)
+             FROM ai_usage GROUP BY model, COALESCE(purpose,'build')",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r.map_err(|e| e.to_string())?);
+    }
+    Ok(out)
 }
 
 // ---------- grok newsfeed log ----------

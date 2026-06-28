@@ -19,12 +19,13 @@ use crate::{db, AppState};
 
 #[tauri::command]
 pub fn get_settings(state: State<AppState>) -> Result<SettingsView, String> {
-    let (has_af, has_anthropic, has_grok, has_parlay, model, limit, books, kelly, timezone, proxy_url, has_proxy_token) = {
+    let (has_af, has_anthropic, has_grok, has_openai, has_parlay, model, limit, books, kelly, timezone, proxy_url, has_proxy_token) = {
         let keys = state.keys.lock().map_err(|_| "keys lock")?;
         (
             keys.api_football.is_some(),
             keys.anthropic.is_some(),
             keys.grok.is_some(),
+            keys.openai.is_some(),
             keys.parlay.is_some(),
             keys.model.clone().unwrap_or_else(|| llm::DEFAULT_MODEL.to_string()),
             keys.daily_limit.unwrap_or(db::DEFAULT_DAILY_LIMIT),
@@ -51,6 +52,7 @@ pub fn get_settings(state: State<AppState>) -> Result<SettingsView, String> {
         has_api_football_key: has_af,
         has_anthropic_key: has_anthropic,
         has_grok_key: has_grok,
+        has_openai_key: has_openai,
         has_parlay_key: has_parlay,
         model,
         books,
@@ -73,6 +75,7 @@ pub fn save_settings(
     api_football_key: Option<String>,
     anthropic_key: Option<String>,
     grok_key: Option<String>,
+    openai_key: Option<String>,
     parlay_key: Option<String>,
     model: Option<String>,
     daily_limit: Option<i64>,
@@ -81,6 +84,7 @@ pub fn save_settings(
     timezone: Option<String>,
     proxy_url: Option<String>,
     proxy_token: Option<String>,
+    ingest_enabled: Option<bool>,
 ) -> Result<SettingsView, String> {
     {
         let mut keys = state.keys.lock().map_err(|_| "keys lock")?;
@@ -104,6 +108,9 @@ pub fn save_settings(
         if let Some(k) = grok_key {
             keys.grok = non_empty(k);
         }
+        if let Some(k) = openai_key {
+            keys.openai = non_empty(k);
+        }
         if let Some(k) = parlay_key {
             keys.parlay = non_empty(k);
         }
@@ -112,6 +119,9 @@ pub fn save_settings(
         }
         if let Some(t) = proxy_token {
             keys.proxy_token = non_empty(t);
+        }
+        if let Some(e) = ingest_enabled {
+            keys.ingest_enabled = Some(e);
         }
         if let Some(m) = model {
             if llm::is_allowed_model(&m) {
@@ -531,6 +541,8 @@ struct TeamForm {
     outbox_against: Option<f64>,
     inbox_for: Option<f64>,
     inbox_against: Option<f64>,
+    offsides_for: Option<f64>,
+    offsides_against: Option<f64>,
 }
 
 fn stat_val(stats: &Value, ty: &str) -> Option<f64> {
@@ -554,8 +566,8 @@ async fn fetch_team_form(state: &AppState, team_id: i64) -> Option<TeamForm> {
     .await
     .ok()?;
     // (sum, n) per metric (for & against interleaved).
-    let metrics = ["expected_goals", "Corner Kicks", "Total Shots", "Shots outsidebox", "Shots insidebox"];
-    let mut acc: [(f64, f64); 10] = [(0.0, 0.0); 10];
+    let metrics = ["expected_goals", "Corner Kicks", "Total Shots", "Shots outsidebox", "Shots insidebox", "Offsides"];
+    let mut acc: [(f64, f64); 12] = [(0.0, 0.0); 12];
     for f in response_array(&lj) {
         let short = f.get("fixture").and_then(|x| x.get("status")).and_then(|s| s.get("short")).and_then(|v| v.as_str()).unwrap_or("");
         if !matches!(short, "FT" | "AET" | "PEN") {
@@ -604,6 +616,8 @@ async fn fetch_team_form(state: &AppState, team_id: i64) -> Option<TeamForm> {
         outbox_against: avg(acc[7]),
         inbox_for: avg(acc[8]),
         inbox_against: avg(acc[9]),
+        offsides_for: avg(acc[10]),
+        offsides_against: avg(acc[11]),
     };
     if form.xg_for.is_none() && form.corners_for.is_none() && form.shots_for.is_none() && form.outbox_for.is_none() {
         return None;
@@ -714,7 +728,7 @@ async fn team_tactics(state: &AppState, team: &str, coach: Option<&str>, formati
             return None;
         }
         let conn = state.db.lock().ok()?;
-        let _ = db::usage_add(&conn, now, "claude-haiku-4-5", gin, gout);
+        let _ = db::usage_add(&conn, now, "claude-haiku-4-5", gin, gout, "tactics");
         let _ = db::cache_put(&conn, &key, "tactics", &text, now, 14 * 24 * 3600);
         text
     };
@@ -731,7 +745,7 @@ async fn team_tactics(state: &AppState, team: &str, coach: Option<&str>, formati
 fn is_player_market(m: &str) -> bool {
     matches!(
         m,
-        "scorer" | "sot" | "tackles" | "fouls" | "cards" | "passes" | "assists" | "pshots"
+        "scorer" | "sot" | "tackles" | "fouls" | "cards" | "passes" | "assists" | "pshots" | "saves"
     )
 }
 
@@ -763,9 +777,10 @@ fn map_availability(kind: &str, reason: &str) -> String {
 
 // ---------- build tickets ----------
 
-const ALL_MARKETS: [&str; 18] = [
+const ALL_MARKETS: [&str; 24] = [
     "scorer", "sot", "pshots", "assists", "tackles", "fouls", "cards", "passes", "win", "dc",
-    "btts", "half1", "half2", "ou25", "tgoals", "tcorners", "tshots", "ahandicap",
+    "btts", "half1", "half2", "ou25", "tgoals", "tcorners", "tshots", "ahandicap", "h1goals",
+    "h2goals", "exactscore", "goalsrange", "saves", "toffsides",
 ];
 
 /// Fetch a team's full player list + season stats (paged), for auto candidate
@@ -1109,7 +1124,7 @@ async fn attach_plausibility(
             tin += gin;
             tout += gout;
             if let Ok(conn) = state.db.lock() {
-                let _ = db::usage_add(&conn, af::now_ts(), model, gin, gout);
+                let _ = db::usage_add(&conn, af::now_ts(), model, gin, gout, "plausibility");
             }
             for (subj, market, line, score, reason) in sc {
                 let sl = crate::odds::fold(&subj);
@@ -1450,7 +1465,7 @@ pub async fn build_tickets(
             // Recent-form data (xG, corners, shots). Needed for xG-toggle or the
             // corner/shots markets. Opt-in / auto — extra requests, cached after.
             let need_form = selection.use_xg.unwrap_or(false)
-                || team_groups.iter().any(|m| matches!(m.as_str(), "tcorners" | "tshots" | "toutbox" | "tinbox"));
+                || team_groups.iter().any(|m| matches!(m.as_str(), "tcorners" | "tshots" | "toutbox" | "tinbox" | "toffsides"));
             if need_form {
                 let apply = |t: &mut crate::features::TeamStats, f: &TeamForm| {
                     t.xg_for = f.xg_for;
@@ -1461,6 +1476,7 @@ pub async fn build_tickets(
                     t.shots_against = f.shots_against;
                     t.outbox_for = f.outbox_for;
                     t.inbox_for = f.inbox_for;
+                    t.offsides_for = f.offsides_for;
                 };
                 if let Some(h) = home.as_mut() {
                     if let Some(f) = fetch_team_form(&state, fx.home_team_id).await {
@@ -1650,6 +1666,38 @@ pub async fn build_tickets(
         min_legs: selection.min_legs.unwrap_or(1).clamp(1, 12),
         max_per_subject: selection.max_per_subject.unwrap_or(0).min(20),
     };
+    // Pull in any browser-ingested pages matched to these fixtures — labeled
+    // 3rd-party context for the model, and mark each item "used".
+    if selection.use_ingest.unwrap_or(true) {
+        let conn = state.db.lock().map_err(|_| "db lock")?;
+        if let Ok(items) = db::ingest_for_fixture(&conn) {
+            for it in items.iter().filter(|i| i.status == "processed") {
+                let fl = crate::odds::fold(&it.fixture_label.clone().unwrap_or_default());
+                if fl.is_empty() {
+                    continue;
+                }
+                let m = selection.fixtures.iter().find(|f| {
+                    fl.contains(&crate::odds::fold(&f.home_team)) || fl.contains(&crate::odds::fold(&f.away_team))
+                });
+                if let Some(f) = m {
+                    let detail = it
+                        .extracted_json
+                        .as_deref()
+                        .and_then(|j| serde_json::from_str::<Value>(j).ok())
+                        .map(|v| compact_ingest(&v))
+                        .unwrap_or_default();
+                    if !detail.is_empty() {
+                        pred_notes.push(format!(
+                            "{} vs {}: INGESTED 3rd-party data (from {}): {}",
+                            f.home_team, f.away_team, it.url, detail
+                        ));
+                        let _ = db::ingest_mark_used(&conn, it.id);
+                    }
+                }
+            }
+        }
+    }
+
     let hash = llm::input_hash(
         &table,
         &markets,
@@ -1714,7 +1762,7 @@ pub async fn build_tickets(
             {
                 let conn = state.db.lock().map_err(|_| "db lock")?;
                 db::ai_put(&conn, &hash, &stored, &model, af::now_ts())?;
-                db::usage_add(&conn, af::now_ts(), &model, call.input_tokens, call.output_tokens)?;
+                db::usage_add(&conn, af::now_ts(), &model, call.input_tokens, call.output_tokens, "build")?;
                 // Auto-save every fresh run so it's viewable later.
                 let sel_json = serde_json::to_string(&markets).unwrap_or_default();
                 let _ = db::save_ticket(&conn, af::now_ts(), &sel_json, &stored, &selection.notes);
@@ -1848,7 +1896,7 @@ async fn gather_candidates(
         if !team_groups.is_empty() {
             let mut home = fetch_team_stats(state, fx.home_team_id, &fx.home_team, fx.league_id, fx.season).await.ok().flatten();
             let mut away = fetch_team_stats(state, fx.away_team_id, &fx.away_team, fx.league_id, fx.season).await.ok().flatten();
-            if team_groups.iter().any(|m| matches!(m.as_str(), "tcorners" | "tshots" | "toutbox" | "tinbox")) {
+            if team_groups.iter().any(|m| matches!(m.as_str(), "tcorners" | "tshots" | "toutbox" | "tinbox" | "toffsides")) {
                 let apply = |t: &mut crate::features::TeamStats, f: &TeamForm| {
                     t.corners_for = f.corners_for;
                     t.corners_against = f.corners_against;
@@ -1856,6 +1904,7 @@ async fn gather_candidates(
                     t.shots_against = f.shots_against;
                     t.outbox_for = f.outbox_for;
                     t.inbox_for = f.inbox_for;
+                    t.offsides_for = f.offsides_for;
                 };
                 if let Some(h) = home.as_mut() {
                     if let Some(f) = fetch_team_form(state, fx.home_team_id).await {
@@ -1998,13 +2047,32 @@ pub async fn build_ladder(
     } else {
         markets
     };
+    let had_player = markets.iter().any(|m| is_player_market(m));
+    let had_team = markets.iter().any(|m| !is_player_market(m));
     match scope.as_str() {
         "team" => markets.retain(|m| !is_player_market(m)),
         "props" => markets.retain(|m| is_player_market(m)),
         _ => {} // mixed → keep both
     }
     if markets.is_empty() {
-        return Err("No markets match this scope — pick some, or switch the ladder's markets scope.".to_string());
+        let reason = match scope.as_str() {
+            "team" => {
+                if had_player {
+                    "The ladder scope is 'Teams/Match', but you only selected PLAYER-prop markets. Switch the ladder scope to 'Props' or 'Mixed', or add a team market (Match Result, Goals O/U, Team Corners…)."
+                } else {
+                    "No team/match markets selected. Pick at least one (Match Result, Goals O/U, BTTS, Team Corners…)."
+                }
+            }
+            "props" => {
+                if had_team {
+                    "The ladder scope is 'Props', but you only selected TEAM/match markets. Switch the ladder scope to 'Teams/Match' or 'Mixed', or add a player prop (Anytime Scorer, Shots on Target…)."
+                } else {
+                    "No player-prop markets selected. Pick at least one (Anytime Scorer, Shots on Target, Tackles…)."
+                }
+            }
+            _ => "No markets selected — pick some markets above first.",
+        };
+        return Err(reason.to_string());
     }
     let books = {
         let keys = state.keys.lock().map_err(|_| "keys lock")?;
@@ -2245,8 +2313,8 @@ pub async fn evaluate_tickets(
         return Ok(vec![]);
     }
     let model = model
-        .filter(|m| llm::is_allowed_model(m))
-        .unwrap_or_else(|| "claude-sonnet-4-6".to_string());
+        .filter(|m| llm::is_allowed_analysis_model(m))
+        .unwrap_or_else(|| "claude-haiku-4-5".to_string());
     let leagues = leagues.unwrap_or_default();
 
     let mut rows = Vec::new();
@@ -2276,7 +2344,7 @@ pub async fn evaluate_tickets(
     let (mut evals, gin, gout) = llm::evaluate(&state, &model, &compact).await?;
     {
         let conn = state.db.lock().map_err(|_| "db lock")?;
-        db::usage_add(&conn, af::now_ts(), &model, gin, gout)?;
+        db::usage_add(&conn, af::now_ts(), &model, gin, gout, "eval")?;
     }
     while evals.len() < n {
         evals.push(TicketEval {
@@ -2717,6 +2785,197 @@ pub fn import_data(state: State<AppState>, json: String) -> Result<usize, String
 pub fn reset_data(state: State<AppState>) -> Result<(), String> {
     let conn = state.db.lock().map_err(|_| "db lock")?;
     db::reset_all(&conn)
+}
+
+/// Token spend grouped by model AND purpose (build / eval / plausibility / ingest
+/// / tactics) — so the ledger shows what each model contributed to the data.
+#[tauri::command]
+pub fn usage_by_purpose(state: State<AppState>) -> Result<Vec<ModelPurposeRow>, String> {
+    let conn = state.db.lock().map_err(|_| "db lock")?;
+    let mut out: Vec<ModelPurposeRow> = db::usage_by_purpose(&conn)?
+        .into_iter()
+        .map(|(model, purpose, i, o)| ModelPurposeRow {
+            cost_usd: (llm::cost_usd(&model, i, o) * 10000.0).round() / 10000.0,
+            model,
+            purpose,
+            input_tokens: i,
+            output_tokens: o,
+        })
+        .collect();
+    out.sort_by(|a, b| b.cost_usd.partial_cmp(&a.cost_usd).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(out)
+}
+
+/// Write the bundled browser extension to the user's Downloads so they can load it
+/// unpacked. Returns the folder path.
+#[tauri::command]
+pub fn export_extension(app: tauri::AppHandle) -> Result<String, String> {
+    use tauri::Manager;
+    let dir = app
+        .path()
+        .download_dir()
+        .or_else(|_| app.path().app_data_dir())
+        .map_err(|e| format!("no folder: {e}"))?
+        .join("powabetz-extension");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let files: [(&str, &[u8]); 5] = [
+        ("manifest.json", include_bytes!("../../extension/manifest.json")),
+        ("background.js", include_bytes!("../../extension/background.js")),
+        ("popup.html", include_bytes!("../../extension/popup.html")),
+        ("popup.js", include_bytes!("../../extension/popup.js")),
+        ("icon.png", include_bytes!("../../extension/icon.png")),
+    ];
+    for (name, bytes) in files {
+        std::fs::write(dir.join(name), bytes).map_err(|e| e.to_string())?;
+    }
+    // Reveal the folder so it's tangible (it IS the extension — load it unpacked).
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else if cfg!(target_os = "windows") {
+        "explorer"
+    } else {
+        "xdg-open"
+    };
+    let _ = std::process::Command::new(opener).arg(&dir).spawn();
+    Ok(dir.to_string_lossy().to_string())
+}
+
+// ---------- browser-extension ingest ----------
+
+/// Short one-line digest of an ingested page's extracted JSON for the prompt.
+fn compact_ingest(v: &Value) -> String {
+    let summary = v.get("summary").and_then(|s| s.as_str()).unwrap_or("");
+    let data: Vec<String> = v
+        .get("data")
+        .and_then(|d| d.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| {
+                    let l = e.get("label").and_then(|x| x.as_str())?;
+                    let val = e.get("value").and_then(|x| x.as_str())?;
+                    Some(format!("{l}={val}"))
+                })
+                .take(8)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut out = summary.to_string();
+    if !data.is_empty() {
+        if !out.is_empty() {
+            out.push_str(" | ");
+        }
+        out.push_str(&data.join("; "));
+    }
+    out.chars().take(400).collect()
+}
+
+fn to_ingest_item(r: &db::IngestRow) -> IngestItem {
+    let v = r
+        .extracted_json
+        .as_deref()
+        .and_then(|j| serde_json::from_str::<Value>(j).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let summary = v.get("summary").and_then(|s| s.as_str()).unwrap_or_default().to_string();
+    let fixture_date = v
+        .get("date")
+        .and_then(|s| s.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let data: Vec<IngestKV> = v
+        .get("data")
+        .and_then(|d| d.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| {
+                    Some(IngestKV {
+                        label: e.get("label").and_then(|x| x.as_str())?.to_string(),
+                        value: e.get("value").and_then(|x| x.as_str())?.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    IngestItem {
+        id: r.id,
+        created_at: r.created_at,
+        url: r.url.clone(),
+        title: r.title.clone(),
+        note: r.note.clone(),
+        status: r.status.clone(),
+        fixture_label: r.fixture_label.clone(),
+        fixture_date,
+        summary,
+        data,
+        model: r.model.clone(),
+        used: r.used,
+    }
+}
+
+/// Local ingest endpoint info — shown in Settings so you can paste the URL + token
+/// into the browser extension.
+#[tauri::command]
+pub fn ingest_info(state: State<AppState>) -> Result<IngestInfo, String> {
+    let (enabled, port, token) = {
+        let keys = state.keys.lock().map_err(|_| "keys lock")?;
+        (
+            keys.ingest_enabled.unwrap_or(true),
+            keys.ingest_port.unwrap_or(8765),
+            keys.ingest_token.clone().unwrap_or_default(),
+        )
+    };
+    let new_count = {
+        let conn = state.db.lock().map_err(|_| "db lock")?;
+        db::ingest_list(&conn)?.iter().filter(|r| r.status == "new").count() as i64
+    };
+    Ok(IngestInfo { enabled, port, token, new_count })
+}
+
+#[tauri::command]
+pub fn list_ingested(state: State<AppState>) -> Result<Vec<IngestItem>, String> {
+    let conn = state.db.lock().map_err(|_| "db lock")?;
+    Ok(db::ingest_list(&conn)?.iter().map(to_ingest_item).collect())
+}
+
+#[tauri::command]
+pub fn delete_ingested(state: State<AppState>, id: i64) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|_| "db lock")?;
+    db::ingest_delete(&conn, id)
+}
+
+#[tauri::command]
+pub fn update_ingest_note(state: State<AppState>, id: i64, note: String) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|_| "db lock")?;
+    db::ingest_set_note(&conn, id, &note)
+}
+
+/// Run Haiku over an ingested page: structure it + tag the fixture it's about.
+#[tauri::command]
+pub async fn process_ingested(
+    state: State<'_, AppState>,
+    id: i64,
+    model: Option<String>,
+) -> Result<IngestItem, String> {
+    let row = {
+        let conn = state.db.lock().map_err(|_| "db lock")?;
+        db::ingest_get(&conn, id)?.ok_or_else(|| "not found".to_string())?
+    };
+    let model = model
+        .filter(|m| llm::is_allowed_analysis_model(m))
+        .unwrap_or_else(|| "claude-haiku-4-5".to_string());
+    let model = model.as_str();
+    let (json, gin, gout) = llm::extract_ingest(&state, model, &row.content, &row.note).await?;
+    let v: Value = serde_json::from_str(&json).unwrap_or_else(|_| serde_json::json!({}));
+    let home = v.get("home").and_then(|x| x.as_str()).unwrap_or("").trim();
+    let away = v.get("away").and_then(|x| x.as_str()).unwrap_or("").trim();
+    let label = if !home.is_empty() && !away.is_empty() { format!("{home} vs {away}") } else { String::new() };
+    {
+        let conn = state.db.lock().map_err(|_| "db lock")?;
+        let _ = db::usage_add(&conn, af::now_ts(), model, gin, gout, "ingest");
+        db::ingest_set_processed(&conn, id, &label, None, &json, model)?;
+    }
+    let conn = state.db.lock().map_err(|_| "db lock")?;
+    let updated = db::ingest_get(&conn, id)?.ok_or_else(|| "not found".to_string())?;
+    Ok(to_ingest_item(&updated))
 }
 
 #[tauri::command]

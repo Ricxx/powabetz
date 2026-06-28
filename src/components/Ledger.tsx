@@ -1,6 +1,83 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
-import type { GenReportRow, MarketReportRow } from "../types";
+import type { GenReportRow, MarketReportRow, ModelPurposeRow } from "../types";
+
+function purposeLabel(p: string): string {
+  const m: Record<string, string> = {
+    build: "Build tickets",
+    eval: "Quick analysis",
+    plausibility: "Plausibility",
+    ingest: "Ingest (web pages)",
+    tactics: "Tactics/coach",
+  };
+  return m[p] || p;
+}
+function modelShort(m: string): string {
+  if (m.includes("opus")) return "Opus";
+  if (m.includes("sonnet")) return "Sonnet";
+  if (m.includes("haiku")) return "Haiku";
+  if (m === "gpt-5-nano") return "GPT-5 nano";
+  if (m === "gpt-5-mini") return "GPT-5 mini";
+  if (m.startsWith("gpt-")) return m;
+  return m;
+}
+function providerOf(m: string): string {
+  if (m.startsWith("gpt-")) return "OpenAI";
+  if (m.includes("claude")) return "Claude";
+  return "Other";
+}
+
+function ModelPurposeTable({ rows }: { rows: ModelPurposeRow[] }) {
+  if (rows.length === 0) return null;
+  const grand = rows.reduce((a, r) => a + r.cost_usd, 0);
+  // Group by provider for a presentable breakdown with subtotals.
+  const byProvider = new Map<string, ModelPurposeRow[]>();
+  for (const r of rows) {
+    const p = providerOf(r.model);
+    if (!byProvider.has(p)) byProvider.set(p, []);
+    byProvider.get(p)!.push(r);
+  }
+  const providers = [...byProvider.entries()].sort(
+    (a, b) => b[1].reduce((s, r) => s + r.cost_usd, 0) - a[1].reduce((s, r) => s + r.cost_usd, 0)
+  );
+  return (
+    <div className="card space-y-2">
+      <div className="flex items-baseline justify-between">
+        <div className="text-xs font-semibold text-slate-400">AI spend — by provider, model &amp; purpose</div>
+        <div className="text-sm font-bold text-accent">${grand.toFixed(4)}</div>
+      </div>
+      {providers.map(([prov, prs]) => {
+        const sub = prs.reduce((a, r) => a + r.cost_usd, 0);
+        return (
+          <div key={prov}>
+            <div className="flex items-baseline justify-between text-[11px] mb-0.5">
+              <span className="font-semibold text-slate-300">{prov}</span>
+              <span className="text-slate-400">${sub.toFixed(4)}</span>
+            </div>
+            <table className="w-full text-xs">
+              <tbody>
+                {prs
+                  .slice()
+                  .sort((a, b) => b.cost_usd - a.cost_usd)
+                  .map((r, i) => (
+                    <tr key={i} className="border-t border-edge">
+                      <td className="py-1 text-slate-300">
+                        {modelShort(r.model)} <span className="text-slate-500">· {purposeLabel(r.purpose)}</span>
+                      </td>
+                      <td className="text-right text-slate-500 w-20">
+                        {((r.input_tokens + r.output_tokens) / 1000).toFixed(0)}k
+                      </td>
+                      <td className="text-right text-slate-200 w-16">${r.cost_usd.toFixed(4)}</td>
+                    </tr>
+                  ))}
+              </tbody>
+            </table>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
 
 function stratLabel(s: string): string {
   if (s === "likely") return "Secret picks";
@@ -131,12 +208,14 @@ export default function Ledger({ onClose }: { onClose: () => void }) {
   const [rows, setRows] = useState<GenReportRow[] | null>(null);
   const [byKind, setByKind] = useState<GenReportRow[]>([]);
   const [byMarket, setByMarket] = useState<MarketReportRow[]>([]);
+  const [byPurpose, setByPurpose] = useState<ModelPurposeRow[]>([]);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
   function loadAgg() {
     api.generatedReportByKind().then(setByKind).catch(() => {});
     api.generatedReportByMarket().then(setByMarket).catch(() => {});
+    api.usageByPurpose().then(setByPurpose).catch(() => {});
   }
   function load() {
     api.generatedReport().then(setRows).catch((e) => setErr(String(e)));
@@ -181,6 +260,9 @@ export default function Ledger({ onClose }: { onClose: () => void }) {
       </button>
 
       {err && <div className="text-xs text-bad">{err}</div>}
+
+      <ModelPurposeTable rows={byPurpose} />
+
       {!rows && !err && <div className="text-sm text-slate-400">Loading…</div>}
       {rows && rows.length === 0 && (
         <div className="card text-sm text-slate-400">

@@ -25,10 +25,11 @@ import Inspector from "./components/Inspector";
 import Tracker from "./components/Tracker";
 import Newsfeed from "./components/Newsfeed";
 import Ledger from "./components/Ledger";
+import Ingest from "./components/Ingest";
 import PicksBoard from "./components/PicksBoard";
 
 type Step = "date" | "matches" | "markets" | "results";
-type Overlay = "settings" | "history" | "tracker" | "newsfeed" | "ledger" | null;
+type Overlay = "settings" | "history" | "tracker" | "newsfeed" | "ledger" | "ingest" | null;
 
 function fmtDate(d: Date): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
@@ -177,7 +178,7 @@ export default function App() {
   const [regMinLegs, setRegMinLegs] = useState(1);
   const [regMaxPerSubject, setRegMaxPerSubject] = useState(0); // 0 = model default
   const [usePlausibility, setUsePlausibility] = useState(true); // Haiku pre-score
-  const [bgPrescore, setBgPrescore] = useState(true); // pre-warm plausibility on the build screen
+  const [useIngest, setUseIngest] = useState(true); // feed ingested page data into builds
   const [prewarmBusy, setPrewarmBusy] = useState(false);
   const [prewarmProgress, setPrewarmProgress] = useState<{ done: number; total: number } | null>(null);
   const prewarmedRef = useRef<string>("");
@@ -393,6 +394,7 @@ export default function App() {
         lucky_safe: luckySafe,
         lucky_moderate: luckyModerate,
         lucky_risky: luckyRisky,
+        use_ingest: useIngest,
         min_legs: regMinLegs > 1 ? regMinLegs : null,
         min_odds: oddsMin > 1.01 ? oddsMin : null,
         max_odds: oddsMax < 999 ? oddsMax : null,
@@ -447,7 +449,6 @@ export default function App() {
   useEffect(() => {
     if (
       step === "markets" &&
-      bgPrescore &&
       usePlausibility &&
       selectedFixtures.length > 0 &&
       selMarkets.size > 0 &&
@@ -457,7 +458,7 @@ export default function App() {
       runPrewarm();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [step, bgPrescore, usePlausibility, fixturesSig]);
+  }, [step, usePlausibility, fixturesSig]);
 
   async function buildLadder(append = false) {
     if (busy || prewarmBusy) return; // guard against double-fire / request spam
@@ -654,6 +655,14 @@ export default function App() {
     return (
       <Shell meter={meter} cost={settings?.usage.cost_usd ?? 0} grokCost={costBreak?.grok_lifetime ?? 0} onCoins={openCost} onNav={setOverlay} current="ledger">
         <Ledger onClose={() => setOverlay(null)} />
+      </Shell>
+    );
+  }
+
+  if (overlay === "ingest") {
+    return (
+      <Shell meter={meter} cost={settings?.usage.cost_usd ?? 0} grokCost={costBreak?.grok_lifetime ?? 0} onCoins={openCost} onNav={setOverlay} current="ingest">
+        <Ingest onClose={() => setOverlay(null)} />
       </Shell>
     );
   }
@@ -992,25 +1001,23 @@ export default function App() {
               </p>
             </div>
             <Toggle label="Use plausibility scoring" on={usePlausibility} onChange={setUsePlausibility} />
+            <Toggle
+              label="Include ingested page data as context"
+              on={useIngest}
+              onChange={setUseIngest}
+            />
             {usePlausibility && (
-              <Toggle
-                label="Pre-build it now in the background (locks Generate until the 1-time pass finishes)"
-                on={bgPrescore}
-                onChange={setBgPrescore}
-              />
-            )}
-            {usePlausibility && !bgPrescore && (
-              <button
-                className="btn btn-ghost w-full text-sm"
-                disabled={prewarmBusy || selMarkets.size === 0 || selectedFixtures.length === 0}
-                onClick={runPrewarm}
-              >
+              <div className="text-[11px] text-slate-400 inline-flex items-center gap-2">
                 {prewarmBusy ? (
-                  <span className="inline-flex items-center gap-2"><Spinner /> Pre-scoring…</span>
+                  <>
+                    <Spinner /> Building plausibility data in the background…
+                  </>
+                ) : prewarmedRef.current === fixturesSig ? (
+                  <span className="text-accent">✓ Plausibility data ready (cached for this slate).</span>
                 ) : (
-                  "Pre-score now"
+                  "Plausibility data builds automatically in the background — no action needed."
                 )}
-              </button>
+              </div>
             )}
           </div>
 
@@ -1340,7 +1347,7 @@ export default function App() {
               </div>
               <input
                 type="range"
-                min={30}
+                min={10}
                 max={90}
                 step={5}
                 value={Math.round(ladderMinProb * 100)}
@@ -1589,6 +1596,7 @@ const NAV_ITEMS: { id: Overlay; icon: string; label: string }[] = [
   { id: "tracker", icon: "💰", label: "Tracker" },
   { id: "ledger", icon: "📊", label: "Ledger" },
   { id: "newsfeed", icon: "📰", label: "News" },
+  { id: "ingest", icon: "🧲", label: "Ingest" },
   { id: "history", icon: "🗂", label: "History" },
   { id: "settings", icon: "⚙", label: "Settings" },
 ];

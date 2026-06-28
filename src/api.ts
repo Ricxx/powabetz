@@ -13,8 +13,11 @@ import type {
   GenReportRow,
   GrokLogEntry,
   InspectFixture,
+  IngestInfo,
+  IngestItem,
   LeagueOption,
   MarketReportRow,
+  ModelPurposeRow,
   PlacedBet,
   PlayerInspect,
   RequestMeter,
@@ -35,6 +38,7 @@ export const api = {
     apiFootballKey: string | null,
     anthropicKey: string | null,
     grokKey: string | null,
+    openaiKey: string | null,
     parlayKey: string | null,
     model: string | null,
     dailyLimit: number | null,
@@ -42,12 +46,14 @@ export const api = {
     kellyFraction: number | null,
     timezone: string | null,
     proxyUrl: string | null,
-    proxyToken: string | null
+    proxyToken: string | null,
+    ingestEnabled: boolean | null
   ) =>
     invoke<SettingsView>("save_settings", {
       apiFootballKey,
       anthropicKey,
       grokKey,
+      openaiKey,
       parlayKey,
       model,
       dailyLimit,
@@ -56,6 +62,7 @@ export const api = {
       timezone,
       proxyUrl,
       proxyToken,
+      ingestEnabled,
     }),
 
   calibration: () => invoke<CalibrationReport>("calibration"),
@@ -155,6 +162,16 @@ export const api = {
   exportData: () => invoke<string>("export_data"),
   importData: (json: string) => invoke<number>("import_data", { json }),
   resetData: () => invoke<void>("reset_data"),
+
+  usageByPurpose: () => invoke<ModelPurposeRow[]>("usage_by_purpose"),
+  exportExtension: () => invoke<string>("export_extension"),
+
+  ingestInfo: () => invoke<IngestInfo>("ingest_info"),
+  listIngested: () => invoke<IngestItem[]>("list_ingested"),
+  processIngested: (id: number, model?: string) =>
+    invoke<IngestItem>("process_ingested", { id, model: model ?? null }),
+  deleteIngested: (id: number) => invoke<void>("delete_ingested", { id }),
+  updateIngestNote: (id: number, note: string) => invoke<void>("update_ingest_note", { id, note }),
 
   getBankroll: () => invoke<BankrollView>("get_bankroll"),
   setBankroll: (amount: number) => invoke<BankrollView>("set_bankroll", { amount }),

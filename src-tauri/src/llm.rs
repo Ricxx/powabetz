@@ -10,17 +10,33 @@ use crate::AppState;
 
 pub const DEFAULT_MODEL: &str = "claude-opus-4-8";
 const ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
+const OPENAI_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
 
-/// Allowed model ids the UI can switch between.
+/// Allowed model ids for the main BUILD (Claude only — the deterministic engine
+/// feeds it; we keep the sharp model on the home provider).
 pub fn is_allowed_model(m: &str) -> bool {
     matches!(m, "claude-opus-4-8" | "claude-sonnet-4-6" | "claude-haiku-4-5")
 }
 
-/// (input, output) USD price per 1M tokens. Unknown ids fall back to Opus.
+/// An OpenAI (GPT) model id.
+pub fn is_openai_model(m: &str) -> bool {
+    m.starts_with("gpt-")
+}
+
+/// Models allowed for the quick ANALYSIS (a second angle) — Claude + GPT.
+pub fn is_allowed_analysis_model(m: &str) -> bool {
+    is_allowed_model(m) || matches!(m, "gpt-5-nano" | "gpt-5-mini")
+}
+
+/// (input, output) USD price per 1M tokens. GPT prices are estimates. Unknown
+/// Claude ids fall back to Opus.
 pub fn model_pricing(model: &str) -> (f64, f64) {
     match model {
         "claude-sonnet-4-6" => (3.0, 15.0),
         "claude-haiku-4-5" => (1.0, 5.0),
+        "gpt-5-nano" => (0.05, 0.40),
+        "gpt-5-mini" => (0.75, 1.25),
+        _ if model.starts_with("gpt-") => (0.75, 1.25),
         _ => (5.0, 25.0), // claude-opus-4-8
     }
 }
@@ -412,6 +428,74 @@ pub async fn anthropic_call(
     Ok((out.to_string(), input_tokens, output_tokens))
 }
 
+/// One OpenAI (GPT) chat call — a second analysis angle. Returns (text, in, out).
+pub async fn openai_call(
+    state: &AppState,
+    model: &str,
+    system: &str,
+    user: &str,
+    max_tokens: i64,
+) -> Result<(String, i64, i64), String> {
+    let (api_key, proxy) = {
+        let keys = state.keys.lock().map_err(|_| "keys lock")?;
+        (keys.openai.clone(), keys.proxy())
+    };
+    if proxy.is_none() && api_key.is_none() {
+        return Err("OpenAI key not set. Add it in Settings.".to_string());
+    }
+    let body = serde_json::json!({
+        "model": model,
+        "max_completion_tokens": max_tokens,
+        "messages": [
+            { "role": "system", "content": system },
+            { "role": "user", "content": user }
+        ]
+    });
+    let endpoint = match &proxy {
+        Some((base, _)) => format!("{base}/openai/v1/chat/completions"),
+        None => OPENAI_ENDPOINT.to_string(),
+    };
+    let mut req = state.http.post(&endpoint).header("content-type", "application/json");
+    req = match &proxy {
+        Some((_, token)) => req.header("x-proxy-token", token),
+        None => req.header("authorization", format!("Bearer {}", api_key.unwrap_or_default())),
+    };
+    let resp = req.json(&body).send().await.map_err(|e| format!("openai request failed: {e}"))?;
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!("openai {status}: {text}"));
+    }
+    let json: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    let out = json
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| "no content in OpenAI response".to_string())?;
+    let usage = json.get("usage");
+    let input_tokens = usage.and_then(|u| u.get("prompt_tokens")).and_then(|v| v.as_i64()).unwrap_or(0);
+    let output_tokens = usage.and_then(|u| u.get("completion_tokens")).and_then(|v| v.as_i64()).unwrap_or(0);
+    Ok((out.to_string(), input_tokens, output_tokens))
+}
+
+/// Route an analysis call to the right provider by model id.
+pub async fn chat_call(
+    state: &AppState,
+    model: &str,
+    system: &str,
+    user: &str,
+    max_tokens: i64,
+) -> Result<(String, i64, i64), String> {
+    if is_openai_model(model) {
+        openai_call(state, model, system, user, max_tokens).await
+    } else {
+        anthropic_call(state, model, system, user, max_tokens).await
+    }
+}
+
 const PLAUSIBILITY_SYSTEM: &str = r#"You are a sharp football analyst scoring how PLAUSIBLE each pre-computed bet line is for THIS specific match. This is NOT about value or odds — it's a real-world read: given the matchup, each player's role and likely minutes, probable tactics/formations, motivation and ROTATION risk, how realistic is this exact line? Score each line 1-5:
 5 = highly plausible (key starter, line fits their role and the matchup — e.g. the main striker to score, a press-heavy side's winger for shots).
 4 = plausible.
@@ -462,6 +546,63 @@ Output ONLY this JSON, one entry per line in the same order:
     Ok((out, gin, gout))
 }
 
+const INGEST_SYSTEM: &str = r#"You turn a raw web page's text into structured, betting-relevant data for ONE football fixture. Identify which match it is about (home & away team, date if shown, competition) and pull the useful facts and any analyst read. Be faithful to the page — do NOT invent numbers. Output strict JSON only."#;
+
+/// Haiku-structure an ingested web page (its visible text) into fixture-tagged
+/// JSON. Honours an optional user note ("extract only xyz"). Returns the JSON
+/// string + token usage.
+/// Strip the common token-busters from a page's text: collapse runs of
+/// whitespace, drop blank-line spam and exact consecutive duplicate lines (nav /
+/// menu / cookie boilerplate tends to repeat), so Haiku sees mostly real content.
+fn clean_page_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last = String::new();
+    let mut blanks = 0;
+    for line in s.lines() {
+        let t = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if t.is_empty() {
+            blanks += 1;
+            if blanks <= 1 {
+                out.push('\n');
+            }
+            continue;
+        }
+        blanks = 0;
+        if t == last {
+            continue; // skip immediate duplicate lines
+        }
+        last = t.clone();
+        out.push_str(&t);
+        out.push('\n');
+    }
+    out
+}
+
+pub async fn extract_ingest(
+    state: &AppState,
+    model: &str,
+    page_text: &str,
+    note: &str,
+) -> Result<(String, i64, i64), String> {
+    let text: String = clean_page_text(page_text).chars().take(24_000).collect();
+    let note_line = if note.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\n\nUSER INSTRUCTIONS — follow these for WHAT to extract: {note}")
+    };
+    let user = format!(
+        r#"Page text (may be messy navigation + content):
+{text}{note_line}
+
+Return ONLY this JSON (omit unknown fields, keep values short):
+{{ "home": "home team", "away": "away team", "date": "YYYY-MM-DD or ''", "league": "competition or ''", "summary": "2-3 sentence real-world betting read from this page", "data": [ {{ "label": "e.g. Forebet 1X2 / predicted score / analyst note", "value": "the value or quote" }} ] }}"#
+    );
+    let (resp, gin, gout) = chat_call(state, model, INGEST_SYSTEM, &user, 1500).await?;
+    let start = resp.find('{').ok_or("model returned no JSON")?;
+    let end = resp.rfind('}').ok_or("model returned no JSON")?;
+    Ok((resp[start..=end].to_string(), gin, gout))
+}
+
 const EVAL_SYSTEM: &str = r#"You are a sharp football betting analyst. Return CLEAR, STRUCTURED output — never a rambling paragraph. Reason about the ACTUAL match(es) — the specific teams/players, the competition (use the per-leg "competition" — a World Cup knockout is not a friendly), likely lineups and ROTATION, tactics/formation, motivation, referee, home/away and form — NOT just the supplied numbers.
 
 For EACH ticket return exactly these fields:
@@ -494,7 +635,7 @@ Output ONLY this JSON object — no markdown, no prose:
   "recommendations": ["..."]
 }} ] }}"#
     );
-    let (text, gin, gout) = anthropic_call(state, model, EVAL_SYSTEM, &user, 6000).await?;
+    let (text, gin, gout) = chat_call(state, model, EVAL_SYSTEM, &user, 6000).await?;
     Ok((parse_evals(&text), gin, gout))
 }
 

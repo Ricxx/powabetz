@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { api } from "../api";
 import Spinner from "./Spinner";
-import type { Ticket, TicketEval } from "../types";
+import { ANALYSIS_MODELS, type Ticket, type TicketEval } from "../types";
 
 function verdictColor(v: string): string {
   if (v === "Strong") return "bg-accent text-ink";
@@ -35,19 +35,27 @@ export default function TicketAnalysis({
   const [res, setRes] = useState<TicketEval | null>(null);
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [model, setModel] = useState("claude-haiku-4-5");
+  const [usedModel, setUsedModel] = useState<string | null>(null);
 
-  async function analyze() {
-    setOpen((v) => !v);
-    if (res || busy) return;
+  async function runWith(m: string) {
+    setModel(m);
     setBusy(true);
+    setRes(null);
     try {
-      const r = await api.evaluateTickets([ticket], "claude-haiku-4-5", leagues);
+      const r = await api.evaluateTickets([ticket], m, leagues);
       setRes(r[0] ?? { analysis: "(no analysis)", leg_notes: [], risks: [], recommendations: [], verdict: "" });
-    } catch {
-      setRes({ analysis: "Analysis failed — check your Anthropic key.", leg_notes: [], risks: [], recommendations: [], verdict: "" });
+      setUsedModel(m);
+    } catch (e) {
+      setRes({ analysis: `Analysis failed: ${e}`, leg_notes: [], risks: [], recommendations: [], verdict: "" });
     } finally {
       setBusy(false);
     }
+  }
+
+  function analyze() {
+    setOpen((v) => !v);
+    if (!res && !busy) runWith(model);
   }
 
   return (
@@ -56,10 +64,29 @@ export default function TicketAnalysis({
         className="text-[11px] text-slate-400 hover:text-slate-100 flex items-center gap-1"
         onClick={analyze}
       >
-        🤖 Quick analysis (Haiku) {open ? "▴" : "▾"}
+        🤖 Quick analysis {open ? "▴" : "▾"}
       </button>
       {open && (
         <div className="mt-1.5 rounded-lg bg-ink border border-edge px-2.5 py-2 text-xs space-y-2">
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <span className="text-[10px] text-slate-500">model:</span>
+            {ANALYSIS_MODELS.map((m) => (
+              <button
+                key={m.id}
+                className={`chip text-[10px] py-0.5 ${model === m.id ? "chip-on" : ""}`}
+                disabled={busy}
+                onClick={() => runWith(m.id)}
+                title={m.provider === "openai" ? "needs an OpenAI key" : ""}
+              >
+                {m.label}
+              </button>
+            ))}
+            {usedModel && (
+              <span className="text-[10px] text-slate-600">
+                · read by {ANALYSIS_MODELS.find((x) => x.id === usedModel)?.label || usedModel}
+              </span>
+            )}
+          </div>
           {busy && (
             <div className="text-slate-400 inline-flex items-center gap-2">
               <Spinner /> Analysing…
