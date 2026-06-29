@@ -21,6 +21,7 @@ export default function Settings({
   const [limit, setLimit] = useState(String(settings.meter.limit));
   const [selBooks, setSelBooks] = useState<Set<string>>(new Set(settings.books));
   const [kelly, setKelly] = useState(settings.kelly_fraction);
+  const [defStake, setDefStake] = useState(String(settings.default_stake ?? 0.5));
   const [tz, setTz] = useState(settings.timezone);
   const [proxyUrl, setProxyUrl] = useState(settings.proxy_url || "");
   const [proxyToken, setProxyToken] = useState("");
@@ -57,6 +58,7 @@ export default function Settings({
         Number.isFinite(lim) && lim > 0 ? lim : null,
         [...selBooks],
         kelly,
+        Number.isFinite(parseFloat(defStake)) && parseFloat(defStake) >= 0 ? parseFloat(defStake) : null,
         tz,
         proxyUrl.trim(),
         proxyToken || null,
@@ -191,14 +193,42 @@ export default function Settings({
         </div>
 
         <div className="pt-1">
-          <div className="text-xs font-semibold text-slate-400 mb-1">
-            Stake sizing (Kelly)
-            <Hint text="The Kelly criterion sizes each stake from your edge and the odds to grow a bankroll fastest. It's aggressive, so we use a fraction (¼ is the sane default) — far less swing for almost the same growth." />
-          </div>
+          <div className="text-xs font-semibold text-slate-400 mb-1">Default stake</div>
           <p className="text-[11px] text-slate-500 mb-2">
-            Suggests a stake per ticket from edge + bankroll. Fractional Kelly trades a little
-            growth for far less variance — ¼ is the sane default.
+            Prefilled into the place box so you never type a stake. Use the +¢ buttons on a
+            ticket to bump it. Recommended over Kelly.
           </p>
+          <div className="flex items-center gap-2">
+            <span className="text-sm text-slate-500">$</span>
+            <input
+              type="number"
+              inputMode="decimal"
+              step="0.25"
+              min="0"
+              className="w-24 rounded-lg bg-ink border border-edge px-3 py-2 text-sm"
+              value={defStake}
+              onChange={(e) => setDefStake(e.target.value)}
+              placeholder="0.50"
+            />
+            <div className="flex gap-1">
+              {[0.5, 1, 2, 5].map((v) => (
+                <button key={v} className={`chip text-xs ${parseFloat(defStake) === v ? "chip-on" : ""}`} onClick={() => setDefStake(String(v))}>
+                  ${v}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        <div className="pt-1">
+          <div className="text-xs font-semibold text-slate-400 mb-1">
+            Stake sizing (Kelly) — advanced
+            <Hint text="Kelly sizes each stake from your edge and the odds to grow a bankroll fastest. We default it OFF: varying stakes by perceived edge is a classic signal books use to limit/ban sharp accounts. Flat staking (a fixed default stake) is far safer for keeping your account healthy." />
+          </div>
+          <div className="rounded-lg border border-warn/40 bg-warn/10 px-2.5 py-1.5 text-[11px] text-warn mb-2">
+            ⚠ Leave this <b>Off</b> unless you know what you're doing. Edge-varying stakes flag
+            sharp accounts and get them limited or banned — flat staking is safer.
+          </div>
           <div className="flex gap-1.5">
             {[
               ["Off", 0],

@@ -19,7 +19,7 @@ use crate::{db, AppState};
 
 #[tauri::command]
 pub fn get_settings(state: State<AppState>) -> Result<SettingsView, String> {
-    let (has_af, has_anthropic, has_grok, has_openai, has_parlay, model, limit, books, kelly, timezone, proxy_url, has_proxy_token) = {
+    let (has_af, has_anthropic, has_grok, has_openai, has_parlay, model, limit, books, kelly, default_stake, timezone, proxy_url, has_proxy_token) = {
         let keys = state.keys.lock().map_err(|_| "keys lock")?;
         (
             keys.api_football.is_some(),
@@ -30,7 +30,8 @@ pub fn get_settings(state: State<AppState>) -> Result<SettingsView, String> {
             keys.model.clone().unwrap_or_else(|| llm::DEFAULT_MODEL.to_string()),
             keys.daily_limit.unwrap_or(db::DEFAULT_DAILY_LIMIT),
             keys.books.clone(),
-            keys.kelly_fraction.unwrap_or(0.25),
+            keys.kelly_fraction.unwrap_or(0.0), // off by default — flat staking is safer
+            keys.default_stake.unwrap_or(0.50),
             keys.timezone.clone().unwrap_or_else(|| "Etc/GMT+5".to_string()),
             keys.proxy_url.clone().unwrap_or_default(),
             keys.proxy_token.is_some(),
@@ -57,6 +58,7 @@ pub fn get_settings(state: State<AppState>) -> Result<SettingsView, String> {
         model,
         books,
         kelly_fraction: kelly,
+        default_stake,
         timezone,
         proxy_url,
         has_proxy_token,
@@ -81,6 +83,7 @@ pub fn save_settings(
     daily_limit: Option<i64>,
     books: Option<Vec<String>>,
     kelly_fraction: Option<f64>,
+    default_stake: Option<f64>,
     timezone: Option<String>,
     proxy_url: Option<String>,
     proxy_token: Option<String>,
@@ -93,6 +96,9 @@ pub fn save_settings(
         }
         if let Some(k) = kelly_fraction {
             keys.kelly_fraction = Some(k.clamp(0.0, 1.0));
+        }
+        if let Some(d) = default_stake {
+            keys.default_stake = Some(d.max(0.0));
         }
         if let Some(tz) = timezone {
             if !tz.trim().is_empty() {

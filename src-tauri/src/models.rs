@@ -108,6 +108,7 @@ pub struct SettingsView {
     pub model: String,
     pub books: Vec<String>,
     pub kelly_fraction: f64,
+    pub default_stake: f64,
     pub timezone: String,
     pub proxy_url: String,
     pub has_proxy_token: bool,

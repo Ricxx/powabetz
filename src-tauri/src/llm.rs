@@ -332,12 +332,8 @@ pub async fn call_model(
     grok: Option<&str>,
     opts: &PromptOpts<'_>,
 ) -> Result<ModelCall, String> {
-    let api_key = {
-        let keys = state.keys.lock().map_err(|_| "keys lock")?;
-        keys.anthropic
-            .clone()
-            .ok_or_else(|| "Anthropic key not set. Add it in Settings.".to_string())?
-    };
+    // No local-key guard here: anthropic_call (below) fetches the key OR routes
+    // through the configured proxy, so proxy-mode installs (no local key) work.
 
     let prompt = user_prompt(table, markets, reasoning, notes, predictions, grok, opts);
 
@@ -346,7 +342,7 @@ pub async fn call_model(
     let max_tokens = (2400 + count * 540 + opts.lucky_total() as i64 * 560).clamp(3000, 16000);
 
     // First attempt — strict parse, then salvage a truncated slate.
-    let (text, in1, out1) = request_text(state, model, &api_key, &prompt, max_tokens).await?;
+    let (text, in1, out1) = request_text(state, model, &prompt, max_tokens).await?;
     if let Ok(parsed) = parse_result(&text) {
         return Ok(ModelCall { result: parsed, input_tokens: in1, output_tokens: out1 });
     }
@@ -356,7 +352,7 @@ pub async fn call_model(
         "{prompt}\n\nIMPORTANT: Output ONLY the JSON object, starting with {{ and ending with }}. No markdown, no commentary. Keep each 'why' to one short sentence so the JSON is complete."
     );
     let (text2, in2, out2) =
-        request_text(state, model, &api_key, &stricter, (max_tokens + 2000).min(12000)).await?;
+        request_text(state, model, &stricter, (max_tokens + 2000).min(12000)).await?;
     let result =
         parse_result(&text2).map_err(|e| format!("model returned unparseable JSON: {e}"))?;
     Ok(ModelCall {
@@ -369,7 +365,6 @@ pub async fn call_model(
 async fn request_text(
     state: &AppState,
     model: &str,
-    _api_key: &str,
     prompt: &str,
     max_tokens: i64,
 ) -> Result<(String, i64, i64), String> {

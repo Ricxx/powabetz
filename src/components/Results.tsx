@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import TicketAnalysis from "./TicketAnalysis";
+import StakeBumps from "./StakeBumps";
 import { api } from "../api";
 import { kellyStake, legKey, shortTeam } from "../types";
 import type { BuildResult, BuildUsage, SgpPrice, Ticket, TicketLeg } from "../types";
@@ -51,6 +52,7 @@ function TicketCard({
   onPlace,
   bankroll = 0,
   kellyFraction = 0,
+  defaultStake = 0,
   leagues,
   onVoidSubject,
   cartKeys,
@@ -60,6 +62,7 @@ function TicketCard({
   onPlace?: (t: Ticket, stake: number, odds: number | null) => Promise<void>;
   bankroll?: number;
   kellyFraction?: number;
+  defaultStake?: number;
   leagues?: Record<number, string>;
   onVoidSubject?: (subject: string, voided: boolean) => void;
   cartKeys?: Set<string>;
@@ -103,9 +106,10 @@ function TicketCard({
   // still letting the user edit before committing.
   useEffect(() => {
     if (placed) return;
-    setStake((s) => (s === "" && recStake > 0 ? String(recStake) : s));
+    const prefill = recStake > 0 ? recStake : defaultStake; // Kelly if on, else flat default
+    setStake((s) => (s === "" && prefill > 0 ? prefill.toFixed(2) : s));
     setOdds((o) => (o === "" && combinedOdds != null ? combinedOdds.toFixed(2) : o));
-  }, [recStake, combinedOdds, placed]);
+  }, [recStake, combinedOdds, placed, defaultStake]);
 
   async function confirm() {
     const s = parseFloat(stake);
@@ -292,15 +296,19 @@ function TicketCard({
               Place{stake ? ` $${stake}` : ""}
             </button>
           </div>
-          {recStake > 0 && (
-            <div className="text-[10px] text-slate-500">
-              Kelly suggests ${recStake.toFixed(2)}
-              {recStake.toFixed(2) !== stake && (
-                <button className="ml-1 text-accent underline" onClick={() => setStake(recStake.toFixed(2))}>use</button>
-              )}
-              {removed.size > 0 ? " · voided ticket" : ""}
-            </div>
-          )}
+          <div className="flex items-center justify-between">
+            <StakeBumps value={stake} onChange={setStake} />
+            {recStake > 0 ? (
+              <div className="text-[10px] text-slate-500">
+                Kelly ${recStake.toFixed(2)}
+                {recStake.toFixed(2) !== stake && (
+                  <button className="ml-1 text-accent underline" onClick={() => setStake(recStake.toFixed(2))}>use</button>
+                )}
+              </div>
+            ) : (
+              <div className="text-[10px] text-slate-500">flat stake</div>
+            )}
+          </div>
         </div>
       ))}
     </div>
@@ -319,6 +327,7 @@ export default function Results({
   busy,
   bankroll = 0,
   kellyFraction = 0,
+  defaultStake = 0,
   leagues,
   onVoidSubject,
   cartKeys,
@@ -335,6 +344,7 @@ export default function Results({
   busy?: boolean;
   bankroll?: number;
   kellyFraction?: number;
+  defaultStake?: number;
   leagues?: Record<number, string>;
   onVoidSubject?: (subject: string, voided: boolean) => void;
   cartKeys?: Set<string>;
@@ -369,6 +379,7 @@ export default function Results({
           onPlace={onPlace}
           bankroll={bankroll}
           kellyFraction={kellyFraction}
+          defaultStake={defaultStake}
           leagues={leagues}
           onVoidSubject={onVoidSubject}
           cartKeys={cartKeys}

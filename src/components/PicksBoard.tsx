@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { errMsg, toast } from "../toast";
 import { api } from "../api";
 import Hint from "./Hint";
+import StakeBumps from "./StakeBumps";
 import { kellyStake, shortTeam } from "../types";
 import type { Candidate, FixtureInput, Ticket, TicketEval } from "../types";
 
@@ -39,6 +40,7 @@ export default function PicksBoard({
   markets,
   bankroll = 0,
   kellyFraction = 0,
+  defaultStake = 0,
   mode = "all",
   onClose,
   onPlaced,
@@ -47,6 +49,7 @@ export default function PicksBoard({
   markets: string[];
   bankroll?: number;
   kellyFraction?: number;
+  defaultStake?: number;
   mode?: "all" | "bankers";
   onClose: () => void;
   onPlaced: () => void;
@@ -223,6 +226,7 @@ export default function PicksBoard({
               <PlaceRow
                 ticket={b.ticket}
                 recStake={kellyStake(b.ticket.legs, b.ticket.combined_odds, bankroll, kellyFraction)}
+                defaultStake={defaultStake}
                 onPlaced={onPlaced}
                 onRemove={() => setBuilt((p) => p.filter((_, j) => j !== bi))}
               />
@@ -344,15 +348,17 @@ export default function PicksBoard({
 function PlaceRow({
   ticket,
   recStake = 0,
+  defaultStake = 0,
   onPlaced,
   onRemove,
 }: {
   ticket: Ticket;
   recStake?: number;
+  defaultStake?: number;
   onPlaced: () => void;
   onRemove: () => void;
 }) {
-  const [stake, setStake] = useState(recStake > 0 ? String(recStake) : "");
+  const [stake, setStake] = useState((recStake > 0 ? recStake : defaultStake) > 0 ? (recStake > 0 ? recStake : defaultStake).toFixed(2) : "");
   const [odds, setOdds] = useState(ticket.combined_odds != null ? String(ticket.combined_odds) : "");
   const [placed, setPlaced] = useState(false);
 
@@ -398,11 +404,14 @@ function PlaceRow({
           remove
         </button>
       </div>
-      {recStake > 0 && (
-        <button className="text-[10px] text-accent underline" onClick={() => setStake(String(recStake))}>
-          Kelly ${recStake.toFixed(2)}
-        </button>
-      )}
+      <div className="flex items-center gap-2">
+        <StakeBumps value={stake} onChange={setStake} />
+        {recStake > 0 && (
+          <button className="text-[10px] text-accent underline" onClick={() => setStake(recStake.toFixed(2))}>
+            Kelly ${recStake.toFixed(2)}
+          </button>
+        )}
+      </div>
     </div>
   );
 }

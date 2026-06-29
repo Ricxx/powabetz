@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import TicketAnalysis from "./TicketAnalysis";
+import StakeBumps from "./StakeBumps";
 import { api } from "../api";
 import { kellyStake, legKey, shortTeam, type SgpPrice, type Ticket, type TicketLeg } from "../types";
 
@@ -10,6 +11,7 @@ export default function CustomSlip({
   legs,
   bankroll = 0,
   kellyFraction = 0,
+  defaultStake = 0,
   leagues,
   onRemove,
   onClear,
@@ -18,6 +20,7 @@ export default function CustomSlip({
   legs: TicketLeg[];
   bankroll?: number;
   kellyFraction?: number;
+  defaultStake?: number;
   leagues?: Record<number, string>;
   onRemove: (key: string) => void;
   onClear: () => void;
@@ -68,9 +71,10 @@ export default function CustomSlip({
 
   // Prefill stake (Kelly) and odds inline so placing is one tap, still editable.
   useEffect(() => {
-    setStake((s) => (s === "" && recStake > 0 ? recStake.toFixed(2) : s));
+    const prefill = recStake > 0 ? recStake : defaultStake;
+    setStake((s) => (s === "" && prefill > 0 ? prefill.toFixed(2) : s));
     setOdds((o) => (o === "" && combinedOdds != null ? combinedOdds.toFixed(2) : o));
-  }, [recStake, combinedOdds]);
+  }, [recStake, combinedOdds, defaultStake]);
 
   async function confirm() {
     const s = parseFloat(stake);
@@ -177,14 +181,17 @@ export default function CustomSlip({
                 Place{stake ? ` $${stake}` : " slip"}
               </button>
             </div>
-            {recStake > 0 && (
-              <div className="text-[10px] text-slate-500">
-                Kelly suggests ${recStake.toFixed(2)}
-                {recStake.toFixed(2) !== stake && (
-                  <button className="ml-1 text-accent underline" onClick={() => setStake(recStake.toFixed(2))}>use</button>
-                )}
-              </div>
-            )}
+            <div className="flex items-center justify-between">
+              <StakeBumps value={stake} onChange={setStake} />
+              {recStake > 0 && (
+                <div className="text-[10px] text-slate-500">
+                  Kelly ${recStake.toFixed(2)}
+                  {recStake.toFixed(2) !== stake && (
+                    <button className="ml-1 text-accent underline" onClick={() => setStake(recStake.toFixed(2))}>use</button>
+                  )}
+                </div>
+              )}
+            </div>
           </div>
         </>
       )}

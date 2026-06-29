@@ -61,6 +61,7 @@ export interface SettingsView {
   model: string;
   books: string[];
   kelly_fraction: number;
+  default_stake: number;
   timezone: string;
   proxy_url: string;
   has_proxy_token: boolean;

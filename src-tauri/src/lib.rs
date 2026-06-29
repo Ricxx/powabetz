@@ -49,6 +49,9 @@ pub struct Keys {
     /// Fractional-Kelly multiplier for staking suggestions (0 = off, 0.25 = ¼).
     #[serde(default)]
     pub kelly_fraction: Option<f64>,
+    /// Flat default stake to prefill the place box when Kelly is off (e.g. 0.50).
+    #[serde(default)]
+    pub default_stake: Option<f64>,
     /// IANA timezone for fixture times + date boundaries (default UTC-5).
     #[serde(default)]
     pub timezone: Option<String>,

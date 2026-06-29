@@ -251,7 +251,7 @@ function AppInner() {
         setSettings(s);
         setMeter(s.meter);
         setModel(s.model);
-        if (s.has_api_football_key) loadLeagues();
+        if (s.has_api_football_key || s.proxy_url) loadLeagues();
       })
       .catch((e) => setError(String(e)));
     api.getBankroll().then((b) => setBankroll(b.current)).catch(() => {});
@@ -662,7 +662,7 @@ function AppInner() {
             setSettings(s);
             setMeter(s.meter);
             setModel(s.model);
-            if (s.has_api_football_key) loadLeagues();
+            if (s.has_api_football_key || s.proxy_url) loadLeagues();
           }}
           onClose={() => setOverlay(null)}
         />
@@ -761,6 +761,7 @@ function AppInner() {
               markets={[...selMarkets]}
               bankroll={bankroll}
               kellyFraction={settings?.kelly_fraction ?? 0}
+              defaultStake={settings?.default_stake ?? 0.5}
               mode={boardMode}
               onClose={() => setShowBoard(false)}
               onPlaced={() => api.getBankroll().then((b) => setBankroll(b.current)).catch(() => {})}
@@ -852,9 +853,9 @@ function AppInner() {
               `Load matches · ${selLeagues.size} league${selLeagues.size > 1 ? "s" : ""}`
             )}
           </button>
-          {settings && !settings.has_api_football_key && (
+          {settings && !settings.has_api_football_key && !settings.proxy_url && (
             <div className="text-xs text-warn">
-              Add your API-Football key in Settings first.
+              Add your API-Football key (or a proxy URL) in Settings first.
             </div>
           )}
         </div>
@@ -1249,7 +1250,7 @@ function AppInner() {
             <Toggle label="Reasoning (why per ticket)" on={reasoning} onChange={setReasoning} />
             <Toggle label="Implied-prob comparison" on={impliedProb} onChange={setImpliedProb} />
             <Toggle label="Bias builders to priced markets" on={biasBuilders} onChange={setBiasBuilders} />
-            {settings?.has_grok_key ? (
+            {settings?.has_grok_key || settings?.proxy_url ? (
               <>
                 <Toggle
                   label="Grok X/news sentiment (injuries, team news)"
@@ -1575,6 +1576,7 @@ function AppInner() {
             busy={busy}
             bankroll={bankroll}
             kellyFraction={settings?.kelly_fraction ?? 0}
+            defaultStake={settings?.default_stake ?? 0.5}
             leagues={leagueByFixtureId}
             onSave={saveCurrent}
             onCopy={copyCurrent}
@@ -1589,6 +1591,7 @@ function AppInner() {
             legs={cart}
             bankroll={bankroll}
             kellyFraction={settings?.kelly_fraction ?? 0}
+            defaultStake={settings?.default_stake ?? 0.5}
             leagues={leagueByFixtureId}
             onRemove={removeCartLeg}
             onClear={() => setCart([])}
@@ -1814,7 +1817,8 @@ function LeaguePicker({
   if (leagues.length === 0) {
     return (
       <div className="text-xs text-slate-500 py-2">
-        Add an API-Football key in Settings to load leagues.
+        No leagues loaded yet — add an API-Football key (or a working proxy URL) in Settings,
+        then reopen this screen.
       </div>
     );
   }
