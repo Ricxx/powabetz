@@ -989,11 +989,26 @@ pub fn build_team_candidates(
             "goalsrange" => {
                 let total = lambda_home + lambda_away;
                 let sup = vec![format!("exp_goals {total:.2}"), dc_note.clone()];
-                // (lo, hi) inclusive total-goals bands, from the DC score grid.
-                for (lo, hi) in [(0i64, 1i64), (2, 3), (4, 6)] {
+                // Bet365-style total-goals ranges (inclusive), priced EXACTLY from
+                // the DC score grid: tight bands pay more, wide bands are safer.
+                // Covers the common book lines (e.g. 2-4, 1-6) so they can anchor an
+                // SGP with player props.
+                for (lo, hi) in [(0i64, 1i64), (1, 2), (2, 3), (3, 4), (1, 3), (2, 4), (3, 5), (1, 4), (2, 5), (1, 6)] {
                     let p = (p_total_le(hi) - p_total_le(lo - 1)).clamp(0.0, 1.0);
                     out.push(mk("Match", "Goals Range", "goalsrange", &format!("{lo}-{hi} goals"), total, clampp(p), sup.clone()));
                 }
+            }
+            "firstscore" => {
+                // First team to score = a race between two Poisson processes:
+                // P(side first) = its rate share × P(any goal); plus a "No goal" out.
+                let p_no = dc[0][0]; // DC-corrected 0-0 (match ends goalless)
+                let denom = (lambda_home + lambda_away).max(1e-6);
+                let p_home = (lambda_home / denom * (1.0 - p_no)).clamp(0.0, 1.0);
+                let p_away = (lambda_away / denom * (1.0 - p_no)).clamp(0.0, 1.0);
+                let sup = vec![format!("xg {lambda_home:.2} vs {lambda_away:.2}"), "competing-Poisson race".into()];
+                out.push(mk(&home.name, "First Team to Score", "firstscore", "first to score", p_home * 100.0, clampp(p_home), sup.clone()));
+                out.push(mk(&away.name, "First Team to Score", "firstscore", "first to score", p_away * 100.0, clampp(p_away), sup.clone()));
+                out.push(mk("No goal", "First Team to Score", "firstscore", "no goal", p_no * 100.0, clampp(p_no), sup));
             }
             "tcorners" => {
                 for (team, cf) in [(&home.name, home.corners_for), (&away.name, away.corners_for)] {

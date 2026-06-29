@@ -40,7 +40,6 @@ export default function TicketAnalysis({
   const [usedModel, setUsedModel] = useState<string | null>(null);
 
   async function runWith(m: string) {
-    setModel(m);
     setBusy(true);
     setRes(null);
     try {
@@ -55,8 +54,7 @@ export default function TicketAnalysis({
   }
 
   function analyze() {
-    setOpen((v) => !v);
-    if (!res && !busy) runWith(model);
+    setOpen((v) => !v); // just open the panel — let the user pick a model and press Run
   }
 
   return (
@@ -77,18 +75,23 @@ export default function TicketAnalysis({
                 key={m.id}
                 className={`chip text-[10px] py-0.5 ${model === m.id ? "chip-on" : ""}`}
                 disabled={busy}
-                onClick={() => runWith(m.id)}
+                onClick={() => setModel(m.id)}
                 title={m.provider === "openai" ? "needs an OpenAI key" : ""}
               >
                 {m.label}
               </button>
             ))}
-            {usedModel && (
-              <span className="text-[10px] text-slate-500">
-                · read by {ANALYSIS_MODELS.find((x) => x.id === usedModel)?.label || usedModel}
-              </span>
-            )}
+            <button
+              className="btn btn-primary text-[10px] px-2 py-0.5 ml-auto"
+              disabled={busy}
+              onClick={() => runWith(model)}
+            >
+              {res || usedModel ? "Re-run" : "Run"}
+            </button>
           </div>
+          {usedModel && !busy && (
+            <div className="text-[10px] text-slate-500">read by {ANALYSIS_MODELS.find((x) => x.id === usedModel)?.label || usedModel}</div>
+          )}
           {busy && (
             <div className="text-slate-400 inline-flex items-center gap-2">
               <Spinner /> Analysing…

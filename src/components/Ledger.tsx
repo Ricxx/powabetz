@@ -86,6 +86,9 @@ function stratLabel(s: string): string {
   if (s === "oracle") return "Oracle ✦";
   if (s === "power") return "Power Stacker ⚡";
   if (s === "bankers") return "Anchors ⚓";
+  if (s === "jackpot") return "Jackpot 🎰";
+  if (s === "predictor") return "Match Predictor 🔮";
+  if (s === "live") return "Live 🔴";
   if (s === "custom") return "Cherry-picked 🍒";
   if (s === "ladder") return "Acca ladder";
   if (s === "board") return "Board";
@@ -168,12 +171,14 @@ function MarketTable({ rows }: { rows: MarketReportRow[] }) {
             <td className="text-right pb-1">pred</td>
             <td className="text-right pb-1">actual</td>
             <td className="text-right pb-1">bias</td>
+            <td className="text-right pb-1">±line</td>
           </tr>
         </thead>
         <tbody>
           {sorted.map((r, i) => {
             const bias = r.hit_rate - r.predicted; // +ve = model under-rates this market
             const strong = Math.abs(bias) >= 0.08 && r.settled >= 10;
+            const hasMargin = r.avg_margin != null;
             return (
               <tr key={i} className="border-t border-edge">
                 <td className="py-1">{r.market}</td>
@@ -192,15 +197,26 @@ function MarketTable({ rows }: { rows: MarketReportRow[] }) {
                     {Math.round(bias * 100)}%
                   </span>
                 </td>
+                <td className="text-right">
+                  {hasMargin ? (
+                    <span className={(r.avg_margin as number) >= 0 ? "text-accent" : "text-warn"} title={`avg gap to the line; ${r.near_misses ?? 0} near-miss loss${(r.near_misses ?? 0) === 1 ? "" : "es"} (within 1)`}>
+                      {(r.avg_margin as number) >= 0 ? "+" : ""}{(r.avg_margin as number).toFixed(1)}
+                      {(r.near_misses ?? 0) > 0 ? ` (${r.near_misses}✕)` : ""}
+                    </span>
+                  ) : (
+                    <span className="text-slate-600">—</span>
+                  )}
+                </td>
               </tr>
             );
           })}
         </tbody>
       </table>
       <p className="text-[10px] text-slate-500 mt-1">
-        bias = actual − predicted. <span className="text-accent">+</span> = model under-rates that
-        market (your picks land more than it expects); <span className="text-bad">−</span> = over-rates
-        (a trap-prone market). Needs ~10+ settled legs to trust.
+        bias = actual − predicted (<span className="text-accent">+</span> under-rated, <span className="text-bad">−</span> over-rated).
+        <b className="text-slate-300"> ±line</b> = average distance from the O/U line in your favour
+        (<span className="text-accent">+</span> cleared comfortably, <span className="text-warn">−</span> landing tight); <span className="text-warn">N✕</span> = near-miss losses
+        (lost by &lt;1, e.g. Over 5.5 → 5). Tight negatives mean the direction's right but the line's a touch high.
       </p>
     </div>
   );

@@ -50,6 +50,14 @@ export default function CustomSlip({
   const combinedOdds = allPriced ? legs.reduce((a, l) => a * (l.book_odds as number), 1) : null;
   const recStake = kellyStake(legs, combinedOdds, bankroll, kellyFraction);
 
+  // Prefill stake (Kelly) and odds inline so placing is one tap, still editable.
+  // MUST be before any early return — all hooks run unconditionally every render.
+  useEffect(() => {
+    const prefill = defaultStake > 0 ? defaultStake : recStake; // flat default wins
+    setStake((s) => (s === "" && prefill > 0 ? prefill.toFixed(2) : s));
+    setOdds((o) => (o === "" && combinedOdds != null ? combinedOdds.toFixed(2) : o));
+  }, [recStake, combinedOdds, defaultStake]);
+
   if (legs.length === 0) return null;
 
   const kind = legs.length <= 1 ? "Single" : new Set(legs.map((l) => l.match)).size <= 1 ? "SGP" : "Custom";
@@ -68,13 +76,6 @@ export default function CustomSlip({
       why: null,
     };
   }
-
-  // Prefill stake (Kelly) and odds inline so placing is one tap, still editable.
-  useEffect(() => {
-    const prefill = recStake > 0 ? recStake : defaultStake;
-    setStake((s) => (s === "" && prefill > 0 ? prefill.toFixed(2) : s));
-    setOdds((o) => (o === "" && combinedOdds != null ? combinedOdds.toFixed(2) : o));
-  }, [recStake, combinedOdds, defaultStake]);
 
   async function confirm() {
     const s = parseFloat(stake);

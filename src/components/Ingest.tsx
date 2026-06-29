@@ -27,6 +27,7 @@ export default function Ingest({ onClose }: { onClose: () => void }) {
   const [extPath, setExtPath] = useState<string | null>(null);
   const [showSetup, setShowSetup] = useState(false);
   const [expanded, setExpanded] = useState<Set<number>>(new Set());
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [procModel, setProcModel] = useState("claude-haiku-4-5");
 
   function load() {
@@ -69,9 +70,9 @@ export default function Ingest({ onClose }: { onClose: () => void }) {
     }
   }
 
-  // Process every un-processed page, one at a time (bounded cost, sequential).
-  async function processAllNew() {
-    const ids = items.filter((x) => x.status !== "processed").map((x) => x.id);
+  // Process a set of un-processed pages, one at a time (bounded cost, sequential).
+  async function processIds(idsAll: number[]) {
+    const ids = idsAll.filter((id) => items.find((x) => x.id === id)?.status !== "processed");
     if (ids.length === 0) return;
     setBulk({ done: 0, total: ids.length });
     for (let i = 0; i < ids.length; i++) {
@@ -80,6 +81,7 @@ export default function Ingest({ onClose }: { onClose: () => void }) {
     }
     setBulk(null);
   }
+  const processAllNew = () => processIds(items.filter((x) => x.status !== "processed").map((x) => x.id));
   function del(id: number) {
     setItems((prev) => prev.filter((x) => x.id !== id)); // optimistic
     const timer = setTimeout(() => {
@@ -219,15 +221,35 @@ export default function Ingest({ onClose }: { onClose: () => void }) {
         </div>
       )}
 
-      {grouped.map((g) => (
-        <div key={g.label + g.date} className="space-y-2">
-          <div className="flex items-baseline gap-2 px-1">
-            <span className="text-sm font-semibold text-slate-200">📌 {g.label}</span>
-            {g.date && <span className="text-[11px] text-slate-500">fixture {g.date}</span>}
-            <span className="text-[11px] text-slate-500">· {g.items.length} source{g.items.length > 1 ? "s" : ""}</span>
+      {grouped.map((g) => {
+        const gkey = g.label + g.date;
+        const isCollapsed = collapsed.has(gkey);
+        const unprocessed = g.items.filter((x) => x.status !== "processed").length;
+        return (
+        <div key={gkey} className="space-y-2">
+          <div className="flex items-center gap-2 px-1">
+            <button
+              className="flex items-center gap-2 text-left min-w-0"
+              onClick={() => setCollapsed((p) => { const n = new Set(p); n.has(gkey) ? n.delete(gkey) : n.add(gkey); return n; })}
+            >
+              <span className="text-slate-500 text-xs">{isCollapsed ? "▸" : "▾"}</span>
+              <span className="text-sm font-semibold text-slate-200 truncate">📌 {g.label}</span>
+              {g.date && <span className="text-[11px] text-slate-500 shrink-0">{g.date}</span>}
+              <span className="text-[11px] text-slate-500 shrink-0">· {g.items.length} src{unprocessed > 0 ? `, ${unprocessed} new` : ""}</span>
+            </button>
+            {unprocessed > 0 && (
+              <button
+                className="ml-auto chip text-[10px] py-0.5 shrink-0"
+                disabled={!!bulk}
+                onClick={() => processIds(g.items.map((x) => x.id))}
+                title="Process every new source for this fixture"
+              >
+                Process {unprocessed}
+              </button>
+            )}
           </div>
 
-          {g.items.map((it) => (
+          {!isCollapsed && g.items.map((it) => (
             <div key={it.id} className="card space-y-1.5">
               <div className="flex items-start justify-between gap-2">
                 <div className="min-w-0">
@@ -298,7 +320,8 @@ export default function Ingest({ onClose }: { onClose: () => void }) {
             </div>
           ))}
         </div>
-      ))}
+        );
+      })}
     </div>
   );
 }

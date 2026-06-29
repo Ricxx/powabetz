@@ -27,6 +27,7 @@ struct PlayerLine {
 
 struct FixtureResult {
     finished: bool,
+    first_scorer_team: Option<String>,
     home_name: String,
     away_name: String,
     home_goals: f64,
@@ -228,8 +229,32 @@ async fn fetch_result(state: &AppState, fixture_id: i64) -> Option<FixtureResult
         }
     }
 
+    // First team to score — the team of the earliest real Goal event (skip
+    // own-goal? no: an own goal still counts as a goal for the team it credits;
+    // skip missed/cancelled penalties). None if 0-0 or events unavailable.
+    let mut first_scorer_team: Option<String> = None;
+    if home_goals + away_goals > 0.0 {
+        if let Ok(ej) = af::cached_get(state, "/fixtures/events", vec![("fixture", fixture_id.to_string())], TTL_RESULT).await {
+            let mut best: Option<(i64, String)> = None;
+            for ev in response_array(&ej) {
+                let kind = ev.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                let detail = ev.get("detail").and_then(|v| v.as_str()).unwrap_or("");
+                if kind != "Goal" || detail.contains("Missed") || detail.contains("Cancelled") {
+                    continue;
+                }
+                let minute = ev.get("time").and_then(|t| t.get("elapsed")).and_then(|v| v.as_i64()).unwrap_or(999);
+                let team = ev.get("team").and_then(|t| t.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                if best.as_ref().map_or(true, |(m, _)| minute < *m) {
+                    best = Some((minute, team));
+                }
+            }
+            first_scorer_team = best.map(|(_, t)| t);
+        }
+    }
+
     Some(FixtureResult {
         finished,
+        first_scorer_team,
         home_name,
         away_name,
         home_goals,
@@ -261,10 +286,17 @@ fn threshold(line: &str) -> f64 {
 }
 
 fn won(b: bool, detail: String) -> LegResult {
-    LegResult { won: Some(b), detail }
+    LegResult { won: Some(b), detail, margin: None }
+}
+/// O/U-style result: `over` = the bet direction, `actual`/`thr` the value & line.
+/// Records the signed gap to the line (positive = cleared it, negative = missed).
+fn won_ou(over: bool, actual: f64, thr: f64, detail: String) -> LegResult {
+    let hit = if over { actual > thr } else { actual < thr };
+    let margin = if over { actual - thr } else { thr - actual };
+    LegResult { won: Some(hit), detail, margin: Some((margin * 100.0).round() / 100.0) }
 }
 fn ungraded(detail: &str) -> LegResult {
-    LegResult { won: None, detail: detail.to_string() }
+    LegResult { won: None, detail: detail.to_string(), margin: None }
 }
 
 fn lookup_player<'a>(players: &'a HashMap<String, PlayerLine>, name: &str) -> Option<&'a PlayerLine> {
@@ -296,9 +328,8 @@ fn grade_leg(leg: &TicketLeg, r: &FixtureResult) -> LegResult {
             (r.home_goals - hh) + (r.away_goals - ha)
         };
         let thr: f64 = line.chars().filter(|c| c.is_ascii_digit() || *c == '.').collect::<String>().parse().unwrap_or(0.5);
-        let hit = if line.to_lowercase().contains("over") { half_goals > thr } else { half_goals < thr };
         let half = if market.contains("1st Half") { "1H" } else { "2H" };
-        return won(hit, format!("{half} {} goals", half_goals as i64));
+        return won_ou(line.to_lowercase().contains("over"), half_goals, thr, format!("{half} {} goals", half_goals as i64));
     }
 
     // Any goals O/U line (1.5 / 2.5 / 3.5 / …), not just 2.5.
@@ -309,8 +340,7 @@ fn grade_leg(leg: &TicketLeg, r: &FixtureResult) -> LegResult {
             .collect::<String>()
             .parse()
             .unwrap_or(2.5);
-        let hit = if market.starts_with("Over") { total > thr } else { total < thr };
-        return won(hit, format!("FT total {}", total as i64));
+        return won_ou(market.starts_with("Over"), total, thr, format!("FT total {}", total as i64));
     }
 
     match market {
@@ -333,8 +363,7 @@ fn grade_leg(leg: &TicketLeg, r: &FixtureResult) -> LegResult {
             let is_home = r.home_name.to_lowercase().contains(&sel) || sel.contains(&r.home_name.to_lowercase());
             let val = if is_home { r.home_cards } else { r.away_cards };
             let thr: f64 = line.chars().filter(|c| c.is_ascii_digit() || *c == '.').collect::<String>().parse().unwrap_or(1.5);
-            let hit = if line.to_lowercase().contains("over") { val > thr } else { val < thr };
-            won(hit, format!("{} {} cards", leg.selection, val as i64))
+            won_ou(line.to_lowercase().contains("over"), val, thr, format!("{} {} cards", leg.selection, val as i64))
         }
         "Correct Score" => {
             let p: Vec<i64> = line.split('-').filter_map(|s| s.trim().parse().ok()).collect();
@@ -370,8 +399,7 @@ fn grade_leg(leg: &TicketLeg, r: &FixtureResult) -> LegResult {
                 .collect::<String>()
                 .parse()
                 .unwrap_or(1.5);
-            let hit = if line.to_lowercase().contains("over") { tg > thr } else { tg < thr };
-            won(hit, format!("{} {}", leg.selection, tg as i64))
+            won_ou(line.to_lowercase().contains("over"), tg, thr, format!("{} {}", leg.selection, tg as i64))
         }
         "Team Corners" | "Team Shots" | "Team Shots Outside Box" | "Team Shots Inside Box" | "Team Offsides" => {
             let sel = leg.selection.to_lowercase();
@@ -388,8 +416,7 @@ fn grade_leg(leg: &TicketLeg, r: &FixtureResult) -> LegResult {
             match val {
                 Some(v) => {
                     let thr: f64 = line.chars().filter(|c| c.is_ascii_digit() || *c == '.').collect::<String>().parse().unwrap_or(0.5);
-                    let hit = if line.to_lowercase().contains("over") { v > thr } else { v < thr };
-                    won(hit, format!("{} {}", leg.selection, v as i64))
+                    won_ou(line.to_lowercase().contains("over"), v, thr, format!("{} {}", leg.selection, v as i64))
                 }
                 None => ungraded("no team stats"),
             }
@@ -424,6 +451,20 @@ fn grade_leg(leg: &TicketLeg, r: &FixtureResult) -> LegResult {
             let is_home = leg.selection.eq_ignore_ascii_case(&r.home_name);
             let (gf, ga) = if is_home { (r.home_goals, r.away_goals) } else { (r.away_goals, r.home_goals) };
             won(gf > ga, format!("FT {}-{}", r.home_goals as i64, r.away_goals as i64))
+        }
+        "First Team to Score" => {
+            let total = (r.home_goals + r.away_goals) as i64;
+            let sel = leg.selection.to_lowercase();
+            if sel.contains("no goal") || sel == "neither" {
+                won(total == 0, format!("FT {}-{}", r.home_goals as i64, r.away_goals as i64))
+            } else if total == 0 {
+                won(false, "0-0, no scorer".to_string())
+            } else {
+                match &r.first_scorer_team {
+                    Some(t) => won(t.eq_ignore_ascii_case(&leg.selection), format!("first: {t}")),
+                    None => ungraded("no goal timeline"),
+                }
+            }
         }
         "Double Chance" => {
             let team = leg.selection.to_lowercase().replace(" or draw", "");

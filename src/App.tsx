@@ -29,11 +29,14 @@ import Ingest from "./components/Ingest";
 import Live from "./components/Live";
 import PicksBoard from "./components/PicksBoard";
 import { Toaster, toast } from "./toast";
+import ErrorBoundary from "./components/ErrorBoundary";
 
 export default function App() {
   return (
     <>
-      <AppInner />
+      <ErrorBoundary>
+        <AppInner />
+      </ErrorBoundary>
       <Toaster />
     </>
   );
@@ -174,9 +177,26 @@ function AppInner() {
   const [impliedProb, setImpliedProb] = useState(true);
   const [notes, setNotes] = useState("");
   const [ticketCount, setTicketCount] = useState(10);
-  const [ticketTypes, setTicketTypes] = useState<Set<string>>(new Set(TICKET_TYPES));
+  // Singles off by default — stacking is where the value is.
+  const [ticketTypes, setTicketTypes] = useState<Set<string>>(new Set(TICKET_TYPES.filter((t) => t !== "Single")));
   const [biasBuilders, setBiasBuilders] = useState(false);
+  // Simple vs Advanced mode. Remembered across launches only if "remember" is on.
+  const [mode, setMode] = useState<"simple" | "advanced">(() => (localStorage.getItem("pb_mode") as "simple" | "advanced") || "simple");
+  const [rememberMode, setRememberMode] = useState(() => localStorage.getItem("pb_mode") != null);
+  function chooseMode(m: "simple" | "advanced") {
+    setMode(m);
+    if (rememberMode) localStorage.setItem("pb_mode", m);
+  }
+  function toggleRemember(on: boolean) {
+    setRememberMode(on);
+    if (on) localStorage.setItem("pb_mode", mode);
+    else localStorage.removeItem("pb_mode");
+  }
   const [strategy, setStrategy] = useState("value");
+  // Match Predictor only works with one fixture — fall back if that changes.
+  useEffect(() => {
+    if (strategy === "predictor" && selFixtureIds.size !== 1) setStrategy("value");
+  }, [selFixtureIds, strategy]);
   const [maxLegProb, setMaxLegProb] = useState(1);
   const [useGrok, setUseGrok] = useState(false);
   const [grokVeto, setGrokVeto] = useState(true);
@@ -190,7 +210,7 @@ function AppInner() {
   const [useTactics, setUseTactics] = useState(false);
   const [ladderCount, setLadderCount] = useState(5);
   const [ladderMinProb, setLadderMinProb] = useState(0.55);
-  const [ladderScope, setLadderScope] = useState("team");
+  const [ladderScope, setLadderScope] = useState("mixed");
   const [ladderMaxLegs, setLadderMaxLegs] = useState(8);
   const [ladderMinHit, setLadderMinHit] = useState(0.05);
   const [ladderMaxPerSubject, setLadderMaxPerSubject] = useState(2);
@@ -199,7 +219,7 @@ function AppInner() {
   const [ladderDiversityReset, setLadderDiversityReset] = useState(true);
   const [ladderVariation, setLadderVariation] = useState(0);
   // Shared per-leg odds sweet-spot (applies to regular + acca builds). 1 / 1000 = off.
-  const [oddsMin, setOddsMin] = useState(1.0);
+  const [oddsMin, setOddsMin] = useState(1.2); // skip near-certain short legs by default
   const [oddsMax, setOddsMax] = useState(1000);
   // Regular build: minimum legs per ticket (4-fold etc.) and diversity cap.
   const [regMinLegs, setRegMinLegs] = useState(1);
@@ -390,30 +410,34 @@ function AppInner() {
     setCart((prev) => prev.filter((x) => legKey(x) !== key));
   }
 
-  async function build(opts?: { variation?: number; exclude?: string[] }) {
+  async function build(opts?: { variation?: number; exclude?: string[]; simple?: boolean }) {
     if (busy || prewarmBusy) return; // guard against double-fire / request spam
     const v = opts?.variation ?? 0;
+    const simple = opts?.simple ?? false;
     setBusy(true);
     setError(null);
     setSaved(false);
     setVariation(v);
+    setBuildTab("regular");
     try {
       const selection = {
         fixtures: toFixtureInputs(selectedFixtures),
-        markets: [...selMarkets],
-        reasoning,
+        // Simple = the whole market for every match, a varied set of tickets,
+        // a couple of jackpot longshots, all the data + ingests — zero setup.
+        markets: simple ? [...allMarketKeys] : [...selMarkets],
+        reasoning: simple ? true : reasoning,
         implied_prob: impliedProb,
         notes,
         model,
-        ticket_count: ticketCount,
-        ticket_types: [...ticketTypes],
+        ticket_count: simple ? 12 : ticketCount,
+        ticket_types: simple ? [...TICKET_TYPES] : [...ticketTypes],
         variation: v,
         exclude: opts?.exclude ?? [],
         bias_builders: biasBuilders,
-        most_likely: strategy === "likely",
-        strategy,
+        most_likely: simple ? false : strategy === "likely",
+        strategy: simple ? "value" : strategy,
         max_leg_prob: maxLegProb,
-        use_grok: useGrok,
+        use_grok: simple ? false : useGrok,
         grok_veto: grokVeto,
         grok_categories: [...grokCats],
         use_weather: useWeather,
@@ -423,19 +447,20 @@ function AppInner() {
         use_predictions: usePredictions,
         use_xg: useXg,
         use_tactics: useTactics,
-        lucky_safe: luckySafe,
-        lucky_moderate: luckyModerate,
-        lucky_risky: luckyRisky,
-        use_ingest: useIngest,
-        min_legs: regMinLegs > 1 ? regMinLegs : null,
-        min_odds: oddsMin > 1.01 ? oddsMin : null,
-        max_odds: oddsMax < 999 ? oddsMax : null,
-        max_per_subject: regMaxPerSubject > 0 ? regMaxPerSubject : null,
+        lucky_safe: simple ? 0 : luckySafe,
+        lucky_moderate: simple ? 1 : luckyModerate,
+        lucky_risky: simple ? 2 : luckyRisky,
+        use_ingest: simple ? true : useIngest,
+        min_legs: simple ? null : regMinLegs > 1 ? regMinLegs : null,
+        min_odds: simple ? null : oddsMin > 1.01 ? oddsMin : null,
+        max_odds: simple ? null : oddsMax < 999 ? oddsMax : null,
+        max_per_subject: simple ? null : regMaxPerSubject > 0 ? regMaxPerSubject : null,
         use_plausibility: usePlausibility,
+        simple,
       };
       const resp = await api.buildTickets(selection);
       setResult(resp.result);
-      setBuildStrategy(strategy);
+      setBuildStrategy(simple ? "value" : strategy);
       setUsage(resp.usage);
       setMeter(resp.meter);
       setStep("results");
@@ -709,7 +734,12 @@ function AppInner() {
   if (overlay === "live") {
     return (
       <Shell meter={meter} cost={settings?.usage.cost_usd ?? 0} grokCost={costBreak?.grok_lifetime ?? 0} onCoins={openCost} onNav={setOverlay} current="live">
-        <Live onClose={() => setOverlay(null)} />
+        <Live
+          onClose={() => setOverlay(null)}
+          defaultStake={settings?.default_stake ?? 0.5}
+          buildModel={settings?.model ?? "claude-opus-4-8"}
+          onPlaced={() => api.getBankroll().then((b) => setBankroll(b.current)).catch(() => {})}
+        />
       </Shell>
     );
   }
@@ -958,7 +988,43 @@ function AppInner() {
       {/* MARKETS + OPTIONS + BUILD */}
       {step === "markets" && (
         <div className="space-y-4 pb-44">
-          <Header title="Markets" onBack={() => setStep("matches")} />
+          <Header title={mode === "simple" ? "Build" : "Markets"} onBack={() => setStep("matches")} />
+
+          {/* Simple ⇄ Advanced toggle */}
+          <div className="flex items-center justify-between -mt-1">
+            <div className="flex rounded-lg overflow-hidden border border-edge text-xs">
+              {(["simple", "advanced"] as const).map((m) => (
+                <button
+                  key={m}
+                  className={`px-3 py-1.5 ${mode === m ? "bg-accent text-ink font-semibold" : "text-slate-300"}`}
+                  onClick={() => chooseMode(m)}
+                >
+                  {m === "simple" ? "🟢 Simple" : "⚙️ Advanced"}
+                </button>
+              ))}
+            </div>
+            <label className="text-[10px] text-slate-500 flex items-center gap-1 cursor-pointer">
+              <input type="checkbox" checked={rememberMode} onChange={(e) => toggleRemember(e.target.checked)} />
+              remember until next launch
+            </label>
+          </div>
+
+          {mode === "simple" && (
+            <div className="card space-y-2 border-accent/40">
+              <div className="text-sm font-bold">🟢 Simple build</div>
+              <p className="text-xs text-slate-400">
+                We'll read <b>every market</b> for your {selFixtureIds.size} match{selFixtureIds.size === 1 ? "" : "es"}, forecast each game, and build a
+                varied set — <b>singles, SGPs, SGP+ and a couple of jackpot longshots</b> — using all the data (and your ingested pages where they
+                match). No setup. The per-match forecast shows under the tickets.
+              </p>
+              <button className="btn btn-primary w-full text-sm py-2.5" disabled={busy || prewarmBusy} onClick={() => build({ simple: true })}>
+                {busy ? <span className="inline-flex items-center gap-2"><Spinner /> Building…</span> : prewarmBusy ? "🔒 Pre-scoring…" : "✨ Build my tickets"}
+              </button>
+              <p className="text-[10px] text-slate-500">Want the knobs (markets, strategies, ladders)? Switch to ⚙️ Advanced above.</p>
+            </div>
+          )}
+
+          {mode === "advanced" && (<>
           <p className="text-xs text-slate-400 -mt-1">Step 3 of 4 — pick what to bet on, then choose how to build below (or use a quick preset).</p>
 
           <div>
@@ -1089,25 +1155,37 @@ function AppInner() {
             <div>
               <div className="text-xs font-semibold text-slate-400 mb-2">Strategy</div>
               <div className="flex flex-wrap gap-1.5">
-                {[
+                {([
                   ["value", "Value +EV"],
                   ["favorites", "Form faves"],
                   ["likely", "Secret picks"],
                   ["oracle", "Oracle ✦"],
                   ["power", "Power Stacker ⚡"],
                   ["bankers", "Anchors ⚓"],
-                ].map(([id, label]) => (
-                  <button
-                    key={id}
-                    className={`chip flex-1 text-center whitespace-nowrap ${strategy === id ? "chip-on" : ""} ${
-                      id === "oracle" || id === "power" || id === "bankers" ? "border-accent/60" : ""
-                    }`}
-                    onClick={() => setStrategy(id)}
-                  >
-                    {label}
-                  </button>
-                ))}
+                  ["jackpot", "Jackpot 🎰"],
+                  ["predictor", "Match Predictor 🔮"],
+                ] as [string, string][]).map(([id, label]) => {
+                  // Match Predictor needs exactly one fixture — show it but disable
+                  // it (with a hint) otherwise, so it's discoverable.
+                  const dis = id === "predictor" && selFixtureIds.size !== 1;
+                  return (
+                    <button
+                      key={id}
+                      disabled={dis}
+                      title={dis ? "Select exactly ONE match to use Match Predictor" : undefined}
+                      className={`chip flex-1 text-center whitespace-nowrap ${strategy === id ? "chip-on" : ""} ${
+                        id === "oracle" || id === "power" || id === "bankers" || id === "jackpot" || id === "predictor" ? "border-accent/60" : ""
+                      } ${dis ? "opacity-40 cursor-not-allowed" : ""}`}
+                      onClick={() => !dis && setStrategy(id)}
+                    >
+                      {label}
+                    </button>
+                  );
+                })}
               </div>
+              {selFixtureIds.size !== 1 && (
+                <p className="text-[10px] text-slate-500 mt-1">🔮 Match Predictor needs exactly one match selected (you have {selFixtureIds.size}).</p>
+              )}
               <p className="text-[11px] text-slate-500 mt-1">
                 {strategy === "favorites"
                   ? "In-form favourites at useful odds (~1.5–2.5): known scorers, strong wins — bankable parlays, not chalk or longshots."
@@ -1119,7 +1197,11 @@ function AppInner() {
                         ? "⚡ Power Stacker — cross-game DOUBLES (rarely a treble) only. Stacks two high-likelihood 'must-happen' picks the book prices generously (~2.0) into 4x–10x for fewer things to connect. Low variance, lottery-like payout. Auto-builds 2-leg parlays regardless of the type toggles."
                         : strategy === "bankers"
                           ? "⚓ Anchors — auto-builds a ticket from the 'this basically always happens' picks: regular bookers, reliable shooters, high-volume passers, corner-heavy teams. Leans on the measured recent hit-rate (carded N of last M). (For a browsable, cherry-pick version of the same idea, use the 🏦 Bankers board tab.)"
-                          : "Ranks by +EV — value/longshots where the price beats the true probability."}
+                          : strategy === "jackpot"
+                            ? "🎰 Jackpot — deliberate lottery tickets: 5-8 plausible longshots stacked for ~1-5% hit chance at 20x-150x+. Every leg is reasonable on its own; it's a longshot only because they must ALL land. Prefers correlated same-game legs so the true chance beats the multiply. Stake tiny (your 50¢), build a couple daily, wait for one to hit."
+                            : strategy === "predictor"
+                              ? "🔮 Match Predictor — a deep read of THIS one game. Forces every market, shows a forecast (likely result, scores, goals, cards, key players with %), then builds several same-game SGP variations. If the match is already in-play, it pulls the LIVE score/stats and the model adjusts every suggestion for the time remaining. (Single fixture only.)"
+                              : "Ranks by +EV — value/longshots where the price beats the true probability."}
               </p>
             </div>
             <div>
@@ -1514,7 +1596,7 @@ function AppInner() {
               </div>
             )}
             {buildTab === "regular" && (
-              <button className="btn btn-primary w-full" disabled={selMarkets.size === 0 || busy || prewarmBusy} onClick={() => build()}>
+              <button className="btn btn-primary w-full" disabled={(selMarkets.size === 0 && strategy !== "predictor") || busy || prewarmBusy} onClick={() => build()}>
                 {busy ? (
                   <span className="inline-flex items-center gap-2"><Spinner /> Building…</span>
                 ) : prewarmBusy ? (
@@ -1556,6 +1638,7 @@ function AppInner() {
               </div>
             )}
           </Sticky>
+          </>)}
         </div>
       )}
 

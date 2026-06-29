@@ -1,16 +1,31 @@
-import { useEffect, useState } from "react";
-import { errMsg } from "../toast";
+import { useEffect, useMemo, useState } from "react";
+import { errMsg, toast } from "../toast";
 import { api } from "../api";
 import Spinner from "./Spinner";
 import Hint from "./Hint";
-import { ANALYSIS_MODELS, type LiveFixture, type LiveSnapshot, type LiveTicket } from "../types";
+import StakeBumps from "./StakeBumps";
+import ForecastPanel from "./ForecastPanel";
+import { ANALYSIS_MODELS, type LiveFixture, type LiveSnapshot, type LiveTicket, type MatchForecast } from "../types";
 
-export default function Live({ onClose }: { onClose: () => void }) {
+export default function Live({ onClose, defaultStake = 0.5, buildModel = "claude-opus-4-8", onPlaced }: { onClose: () => void; defaultStake?: number; buildModel?: string; onPlaced?: () => void }) {
   const [fixtures, setFixtures] = useState<LiveFixture[] | null>(null);
   const [snap, setSnap] = useState<LiveSnapshot | null>(null);
   const [sel, setSel] = useState<LiveFixture | null>(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
+
+  const shown = useMemo(() => {
+    if (!fixtures) return null;
+    const q = query.trim().toLowerCase();
+    if (!q) return fixtures;
+    return fixtures.filter(
+      (f) =>
+        f.home_team.toLowerCase().includes(q) ||
+        f.away_team.toLowerCase().includes(q) ||
+        f.league_name.toLowerCase().includes(q)
+    );
+  }, [fixtures, query]);
 
   async function loadList() {
     setBusy(true);
@@ -52,7 +67,7 @@ export default function Live({ onClose }: { onClose: () => void }) {
             {busy ? <Spinner /> : "↻ refresh"}
           </button>
         </div>
-        <SnapshotView snap={snap} busy={busy} err={err} fallback={sel} />
+        <SnapshotView snap={snap} busy={busy} err={err} fallback={sel} defaultStake={defaultStake} buildModel={buildModel} onPlaced={onPlaced} />
       </div>
     );
   }
@@ -73,9 +88,18 @@ export default function Live({ onClose }: { onClose: () => void }) {
         see current stats + our estimate for the time remaining.
       </p>
       {err && <div className="text-xs text-bad">{err}</div>}
+      {fixtures && fixtures.length > 0 && (
+        <input
+          className="w-full rounded-lg bg-ink border border-edge px-3 py-2 text-sm"
+          placeholder="Filter by team or league…"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+        />
+      )}
       {!fixtures && busy && <div className="text-sm text-slate-400 inline-flex items-center gap-2"><Spinner /> Loading live matches…</div>}
       {fixtures && fixtures.length === 0 && <div className="card text-sm text-slate-400">No matches in play right now.</div>}
-      {fixtures?.map((f) => (
+      {shown && shown.length === 0 && <div className="text-xs text-slate-500">No live matches match "{query}".</div>}
+      {shown?.map((f) => (
         <button key={f.fixture_id} className="card w-full text-left hover:border-accent/50" onClick={() => open(f)}>
           <div className="flex items-center justify-between gap-2">
             <div className="min-w-0">
@@ -94,7 +118,7 @@ export default function Live({ onClose }: { onClose: () => void }) {
   );
 }
 
-function SnapshotView({ snap, busy, err, fallback }: { snap: LiveSnapshot | null; busy: boolean; err: string | null; fallback: LiveFixture }) {
+function SnapshotView({ snap, busy, err, fallback, defaultStake, buildModel, onPlaced }: { snap: LiveSnapshot | null; busy: boolean; err: string | null; fallback: LiveFixture; defaultStake: number; buildModel: string; onPlaced?: () => void }) {
   const f = snap?.fixture ?? fallback;
   return (
     <div className="space-y-3">
@@ -109,6 +133,8 @@ function SnapshotView({ snap, busy, err, fallback }: { snap: LiveSnapshot | null
         </div>
         <div className="text-[11px] text-slate-500">{f.league_name}</div>
       </div>
+
+      <LivePredict fixture={f} buildModel={buildModel} />
 
       {busy && !snap && <div className="text-sm text-slate-400 inline-flex items-center gap-2"><Spinner /> Reading live data…</div>}
       {err && <div className="text-xs text-bad">{err}</div>}
@@ -166,7 +192,7 @@ function SnapshotView({ snap, busy, err, fallback }: { snap: LiveSnapshot | null
             </div>
           )}
 
-          <TicketBuilder fixture={snap.fixture} />
+          <TicketBuilder fixture={snap.fixture} defaultStake={defaultStake} onPlaced={onPlaced} />
 
           <p className="text-[10px] text-slate-500">{snap.note}</p>
         </>
@@ -175,17 +201,101 @@ function SnapshotView({ snap, busy, err, fallback }: { snap: LiveSnapshot | null
   );
 }
 
-function TicketBuilder({ fixture }: { fixture: LiveFixture }) {
+// One-tap: run the full Match Predictor for this fixture (live-aware) and show
+// the forecast — no need to leave the Live screen.
+function LivePredict({ fixture, buildModel }: { fixture: LiveFixture; buildModel: string }) {
+  const [forecast, setForecast] = useState<MatchForecast | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  async function predict() {
+    setBusy(true);
+    try {
+      const resp = await api.buildTickets({
+        fixtures: [
+          {
+            fixture_id: fixture.fixture_id,
+            league_id: fixture.league_id,
+            season: fixture.season,
+            home_team_id: fixture.home_team_id,
+            home_team: fixture.home_team,
+            away_team_id: fixture.away_team_id,
+            away_team: fixture.away_team,
+          },
+        ],
+        markets: [],
+        reasoning: true,
+        implied_prob: false,
+        notes: "",
+        model: buildModel,
+        ticket_types: ["SGP"],
+        variation: 0,
+        exclude: [],
+        bias_builders: false,
+        most_likely: false,
+        strategy: "predictor",
+        max_leg_prob: 1,
+        use_grok: false,
+        grok_veto: false,
+        grok_categories: [],
+        use_weather: false,
+        use_standings: false,
+        use_h2h: false,
+        use_lineups: false,
+        use_predictions: false,
+        use_xg: true,
+        use_tactics: false,
+        lucky_safe: 0,
+        lucky_moderate: 0,
+        lucky_risky: 0,
+        use_ingest: true,
+        min_legs: null,
+        min_odds: null,
+        max_odds: null,
+        max_per_subject: null,
+        use_plausibility: false,
+      });
+      setForecast(resp.result.forecast ?? null);
+      if (!resp.result.forecast) toast.info("No forecast available for this match yet.");
+    } catch (e) {
+      toast.error(e);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="space-y-2">
+      <button className="btn btn-ghost w-full text-sm py-2 border border-accent/40" onClick={predict} disabled={busy}>
+        {busy ? <Spinner /> : forecast ? "🔮 Re-predict (live-adjusted)" : "🔮 Predict full match"}
+      </button>
+      {forecast && (
+        <ForecastPanel
+          f={forecast}
+          footer={
+            forecast.headline.startsWith("⚡")
+              ? "Live-adjusted from the current score & time remaining (the minute is in the header — re-predict as the game moves)."
+              : "Pre-match forecast — this match isn't in-play yet (or live data was unavailable)."
+          }
+        />
+      )}
+    </div>
+  );
+}
+
+function TicketBuilder({ fixture, defaultStake, onPlaced }: { fixture: LiveFixture; defaultStake: number; onPlaced?: () => void }) {
   const [model, setModel] = useState(ANALYSIS_MODELS[0].id);
-  const [ticket, setTicket] = useState<LiveTicket | null>(null);
+  const [pool, setPool] = useState<LiveTicket | null>(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [stake, setStake] = useState(defaultStake > 0 ? defaultStake.toFixed(2) : "");
+  const [sel, setSel] = useState<Set<number>>(new Set());
 
   async function build() {
     setBusy(true);
     setErr(null);
+    setSel(new Set());
     try {
-      setTicket(await api.liveTicket(fixture, model));
+      setPool(await api.liveTicket(fixture, model));
     } catch (e) {
       setErr(errMsg(e));
     } finally {
@@ -193,56 +303,109 @@ function TicketBuilder({ fixture }: { fixture: LiveFixture }) {
     }
   }
 
-  const confColor = (c: string) => (c === "high" ? "text-accent" : c === "low" ? "text-bad" : "text-warn");
+  const picks = pool?.legs ?? [];
+  const chosen = [...sel].map((i) => picks[i]).filter(Boolean);
+  const allPriced = chosen.length > 0 && chosen.every((p) => p.odds != null);
+  const comboOdds = allPriced ? chosen.reduce((a, p) => a * (p.odds as number), 1) : null;
+
+  async function place() {
+    if (chosen.length === 0) {
+      toast.error("Tap one or more picks first.");
+      return;
+    }
+    const s = parseFloat(stake);
+    if (!Number.isFinite(s) || s <= 0) {
+      toast.error("Enter a stake greater than 0.");
+      return;
+    }
+    const match = `${fixture.home_team} vs ${fixture.away_team}`;
+    const ticketObj = {
+      type: chosen.length === 1 ? "Live" : "Live combo",
+      title: `Live ${fixture.elapsed}': ${chosen.map((p) => p.label).slice(0, 2).join(" + ")}${chosen.length > 2 ? "…" : ""}`,
+      confidence: pool?.confidence ?? "",
+      legs: chosen.map((p) => ({
+        match,
+        fixture_id: fixture.fixture_id,
+        market: "Live",
+        selection: p.label,
+        line: null,
+        est_prob: p.prob,
+        book_odds: p.odds,
+      })),
+      combined_prob: chosen.reduce((a, p) => a * p.prob, 1),
+      combined_odds: comboOdds,
+      combined_ev: null,
+      flags: ["in-play"],
+      why: pool?.rationale ?? null,
+    };
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await api.placeBet(ticketObj as any, s, comboOdds, false, "live");
+    } catch (e) {
+      toast.error(e);
+      return;
+    }
+    toast.success(`Live bet placed — $${s.toFixed(2)} · ${chosen.length} pick${chosen.length > 1 ? "s" : ""} · Live 🔴`);
+    setSel(new Set());
+    onPlaced?.();
+  }
 
   return (
     <div className="card space-y-2 border-accent/30">
       <div className="flex items-center justify-between gap-2">
         <div className="text-xs font-semibold text-accent">
-          🎟️ Build an in-play ticket
-          <Hint text="Spends one cached model call per game state (rebuild is free until the score/minute changes). Cost order: GPT-5 nano cheapest, then Haiku, then GPT-5 mini. GPT needs an OpenAI key." />
+          🎯 Live picks pool
+          <Hint text="The best individual in-play bets right now (incl. live player props — who's actually shooting). One cached model call per game state. Tap picks to select, then Place — one pick = a single, several = your own combo." />
         </div>
-        <select
-          className="rounded-lg bg-ink border border-edge px-2 py-1 text-[11px]"
-          value={model}
-          onChange={(e) => setModel(e.target.value)}
-        >
+        <select className="rounded-lg bg-ink border border-edge px-2 py-1 text-[11px]" value={model} onChange={(e) => setModel(e.target.value)}>
           {ANALYSIS_MODELS.map((m) => (
             <option key={m.id} value={m.id}>{m.label}</option>
           ))}
         </select>
       </div>
       <p className="text-[10px] text-slate-500">
-        Feeds the live score, stats, events and your ingested notes to the model — it assembles a coherent ticket from
-        our estimates + the live odds. One cached call per game state.
+        A pool of standalone singles (team + live player props) for the current game state. Tap the ones you want — place a single or build your own combo.
       </p>
       <button className="btn btn-primary w-full text-sm py-2" onClick={build} disabled={busy}>
-        {busy ? <Spinner /> : ticket ? "Rebuild" : "Build ticket"}
+        {busy ? <Spinner /> : pool ? "Refresh picks" : "Get live picks"}
       </button>
       {err && <div className="text-xs text-bad">{err}</div>}
-      {ticket && (
+      {pool && (
         <div className="space-y-1.5 pt-1">
-          <div className="flex items-center justify-between text-[11px]">
-            <span className={`font-semibold ${confColor(ticket.confidence)}`}>{ticket.confidence.toUpperCase()} confidence</span>
-            <span className="text-slate-400">
-              {ticket.combined_odds ? `~${ticket.combined_odds.toFixed(2)} · ` : ""}
-              {Math.round(ticket.combined_prob * 100)}% combined
-            </span>
-          </div>
-          {ticket.legs.map((l, i) => (
-            <div key={i} className="text-xs border-t border-edge pt-1">
-              <div className="flex items-center justify-between gap-2">
-                <span className="text-slate-200 min-w-0">{l.label}</span>
-                <span className="shrink-0 text-slate-400">
-                  {l.odds ? `${l.odds.toFixed(2)} · ` : ""}{Math.round(l.prob * 100)}%
-                  <span className="text-slate-500"> {l.source === "book" ? "book" : "model"}</span>
-                </span>
-              </div>
-              {l.why && <div className="text-[10px] text-slate-500">{l.why}</div>}
+          {pool.rationale && <p className="text-[11px] text-slate-300">{pool.rationale}</p>}
+          {picks.map((l, i) => {
+            const on = sel.has(i);
+            return (
+              <button
+                key={i}
+                className={`w-full text-left text-xs rounded-lg border px-2.5 py-1.5 ${on ? "border-accent bg-accent/10" : "border-edge bg-ink hover:border-accent/40"}`}
+                onClick={() => setSel((p) => { const n = new Set(p); n.has(i) ? n.delete(i) : n.add(i); return n; })}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-slate-100 min-w-0 break-words">{on ? "✓ " : ""}{l.label}</span>
+                  <span className="shrink-0 text-slate-400">
+                    {l.odds ? `${l.odds.toFixed(2)} · ` : ""}{Math.round(l.prob * 100)}%
+                    <span className="text-slate-500"> {l.source === "book" ? "book" : "model"}</span>
+                  </span>
+                </div>
+                {l.why && <div className="text-[10px] text-slate-500">{l.why}</div>}
+              </button>
+            );
+          })}
+          <p className="text-[10px] text-slate-500">{pool.note}{pool.cached ? " · cached" : ""}</p>
+
+          <div className="space-y-1 border-t border-edge pt-1.5">
+            <div className="flex items-center gap-1.5">
+              <span className="text-sm text-slate-500">$</span>
+              <input className="w-16 rounded-lg bg-ink border border-edge px-2 py-1.5 text-sm" placeholder="stake" inputMode="decimal" value={stake} onChange={(e) => setStake(e.target.value)} />
+              <button className="btn btn-primary text-sm px-3 py-1.5 flex-1" onClick={place} disabled={chosen.length === 0}>
+                {chosen.length === 0
+                  ? "Select picks"
+                  : `Place ${chosen.length} ${chosen.length === 1 ? "single" : "combo"}${comboOdds ? ` @ ${comboOdds.toFixed(2)}` : ""}`}
+              </button>
             </div>
-          ))}
-          {ticket.rationale && <p className="text-[11px] text-slate-300 pt-1">{ticket.rationale}</p>}
-          <p className="text-[10px] text-slate-500">{ticket.note}{ticket.cached ? " · cached" : ""}</p>
+            <StakeBumps value={stake} onChange={setStake} />
+          </div>
         </div>
       )}
     </div>

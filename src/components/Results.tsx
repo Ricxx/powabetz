@@ -1,8 +1,9 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import TicketAnalysis from "./TicketAnalysis";
 import StakeBumps from "./StakeBumps";
 import { api } from "../api";
 import { kellyStake, legKey, shortTeam } from "../types";
+import ForecastPanel from "./ForecastPanel";
 import type { BuildResult, BuildUsage, SgpPrice, Ticket, TicketLeg } from "../types";
 
 function modelLabel(id: string): string {
@@ -44,6 +45,7 @@ function GrokBanner({ digest }: { digest?: string | null }) {
 function typeBadge(t: string): string {
   if (t === "SGP+") return "bg-accent text-ink";
   if (t === "SGP") return "bg-accent/30 text-accent";
+  if (t === "Acca") return "bg-warn/25 text-warn";
   return "bg-edge text-slate-300";
 }
 
@@ -79,8 +81,13 @@ function TicketCard({
   const combinedProb = allEst ? active.reduce((a, l) => a * (l.est_prob as number), 1) : null;
   const allPriced = active.length > 0 && active.every((l) => l.book_odds != null);
   const combinedOdds = allPriced ? active.reduce((a, l) => a * (l.book_odds as number), 1) : null;
+  // SGP+ only if a fixture actually contributes 2+ legs (a same-game core);
+  // a multi-fixture ticket with 1 leg each is just a cross-game Acca.
+  const fixCounts = active.reduce<Record<string, number>>((m, l) => ((m[l.match] = (m[l.match] || 0) + 1), m), {});
+  const nFix = Object.keys(fixCounts).length;
+  const maxPerFix = Math.max(0, ...Object.values(fixCounts));
   const kind =
-    active.length <= 1 ? "Single" : new Set(active.map((l) => l.match)).size <= 1 ? "SGP" : "SGP+";
+    active.length <= 1 ? "Single" : nFix <= 1 ? "SGP" : maxPerFix >= 2 ? "SGP+" : "Acca";
   const modified: Ticket = {
     ...t,
     legs: active,
@@ -106,7 +113,9 @@ function TicketCard({
   // still letting the user edit before committing.
   useEffect(() => {
     if (placed) return;
-    const prefill = recStake > 0 ? recStake : defaultStake; // Kelly if on, else flat default
+    // Flat default ALWAYS prefills (safer for accounts). Kelly is only a tappable
+    // suggestion below — never the auto-fill.
+    const prefill = defaultStake > 0 ? defaultStake : recStake;
     setStake((s) => (s === "" && prefill > 0 ? prefill.toFixed(2) : s));
     setOdds((o) => (o === "" && combinedOdds != null ? combinedOdds.toFixed(2) : o));
   }, [recStake, combinedOdds, placed, defaultStake]);
@@ -350,6 +359,15 @@ export default function Results({
   cartKeys?: Set<string>;
   onToggleCartLeg?: (l: import("../types").TicketLeg) => void;
 }) {
+  const [sortBy, setSortBy] = useState<"default" | "odds" | "ev" | "prob">("default");
+  const tickets = useMemo(() => {
+    const arr = result.tickets.map((t, i) => ({ t, i }));
+    if (sortBy === "odds") arr.sort((a, b) => (b.t.combined_odds ?? -1) - (a.t.combined_odds ?? -1));
+    else if (sortBy === "prob") arr.sort((a, b) => (b.t.combined_prob ?? -1) - (a.t.combined_prob ?? -1));
+    else if (sortBy === "ev") arr.sort((a, b) => (b.t.combined_ev ?? -9) - (a.t.combined_ev ?? -9));
+    return arr;
+  }, [result.tickets, sortBy]);
+
   return (
     <div className="space-y-3">
       {result.from_cache && (
@@ -366,13 +384,35 @@ export default function Results({
 
       {result.grok_used && <GrokBanner digest={result.grok_digest} />}
 
+      {result.forecast && <ForecastPanel f={result.forecast} footer="Deterministic forecast from our model — no AI call. The tickets below are variations built from it." />}
+
       {result.tickets.length === 0 && (
         <div className="card text-sm text-slate-300">
           The model returned no picks for this selection.
         </div>
       )}
 
-      {result.tickets.map((t, i) => (
+      {result.tickets.length > 1 && (
+        <div className="flex items-center gap-1.5 text-[11px]">
+          <span className="text-slate-500">Sort:</span>
+          {([
+            ["default", "Default"],
+            ["odds", "Odds"],
+            ["ev", "EV+"],
+            ["prob", "Hit chance"],
+          ] as const).map(([id, label]) => (
+            <button
+              key={id}
+              className={`chip text-[11px] py-0.5 ${sortBy === id ? "chip-on" : ""}`}
+              onClick={() => setSortBy(id)}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {tickets.map(({ t, i }) => (
         <TicketCard
           key={i}
           t={t}
@@ -386,6 +426,15 @@ export default function Results({
           onToggleCartLeg={onToggleCartLeg}
         />
       ))}
+
+      {result.forecasts && result.forecasts.length > 0 && (
+        <div className="space-y-2">
+          <div className="text-xs font-semibold text-slate-400 pt-1">📊 The data — one forecast per match</div>
+          {result.forecasts.map((f, i) => (
+            <ForecastPanel key={i} f={f} />
+          ))}
+        </div>
+      )}
 
       {result.context_notes && result.context_notes.length > 0 && (
         <details className="card bg-ink">

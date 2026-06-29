@@ -358,7 +358,8 @@ function PlaceRow({
   onPlaced: () => void;
   onRemove: () => void;
 }) {
-  const [stake, setStake] = useState((recStake > 0 ? recStake : defaultStake) > 0 ? (recStake > 0 ? recStake : defaultStake).toFixed(2) : "");
+  const initStake = defaultStake > 0 ? defaultStake : recStake; // flat default wins
+  const [stake, setStake] = useState(initStake > 0 ? initStake.toFixed(2) : "");
   const [odds, setOdds] = useState(ticket.combined_odds != null ? String(ticket.combined_odds) : "");
   const [placed, setPlaced] = useState(false);
 

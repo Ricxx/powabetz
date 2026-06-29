@@ -973,10 +973,11 @@ fn map_availability(kind: &str, reason: &str) -> String {
 
 // ---------- build tickets ----------
 
-const ALL_MARKETS: [&str; 27] = [
+const ALL_MARKETS: [&str; 28] = [
     "scorer", "sot", "pshots", "assists", "tackles", "fouls", "cards", "passes", "win", "dc",
     "btts", "half1", "half2", "ou25", "tgoals", "tcorners", "tshots", "ahandicap", "h1goals",
     "h2goals", "exactscore", "goalsrange", "saves", "toffsides", "tcards", "bothcards", "mostcards",
+    "firstscore",
 ];
 
 /// Fetch a team's full player list + season stats (paged), for auto candidate
@@ -1161,12 +1162,19 @@ fn reground_tickets(
             None
         };
 
+        let mut per_fix: HashMap<String, usize> = HashMap::new();
+        for l in &t.legs {
+            *per_fix.entry(l.r#match.clone()).or_insert(0) += 1;
+        }
+        let max_pf = per_fix.values().copied().max().unwrap_or(0);
         t.kind = if t.legs.len() <= 1 {
             "Single".to_string()
-        } else if fixtures.len() <= 1 {
+        } else if per_fix.len() <= 1 {
             "SGP".to_string()
+        } else if max_pf >= 2 {
+            "SGP+".to_string() // a real same-game core combined across fixtures
         } else {
-            "SGP+".to_string()
+            "Acca".to_string() // one leg per fixture — cross-game parlay, not SGP+
         };
         if t.legs.len() > 1 && t.combined_odds.is_some() {
             t.flags.push("estimated parlay price".to_string());
@@ -1460,6 +1468,200 @@ async fn h2h_note(state: &AppState, home_id: i64, away_id: i64, home: &str, away
     ))
 }
 
+fn pois_pmf_c(k: u32, l: f64) -> f64 {
+    let mut t = (-l).exp();
+    for i in 1..=k {
+        t *= l / i as f64;
+    }
+    t
+}
+
+/// Live-adjusted goal forecast: given the CURRENT score and the remaining-time
+/// goal expectations, rebuild Result / final scorelines / Goals from
+/// (current score + additional goals). Replaces the stale pre-match versions so
+/// a 1-1 game never shows "0-0 34%".
+fn live_goal_sections(home: &str, away: &str, gh: i64, ga: i64, lh: f64, la: f64) -> Vec<crate::models::ForecastSection> {
+    use crate::models::{ForecastLine, ForecastSection};
+    let max = 6usize;
+    let mut m = vec![vec![0.0f64; max + 1]; max + 1];
+    for (x, row) in m.iter_mut().enumerate() {
+        for (y, cell) in row.iter_mut().enumerate() {
+            *cell = pois_pmf_c(x as u32, lh) * pois_pmf_c(y as u32, la);
+        }
+    }
+    let pct = |p: f64| (p * 100.0).round();
+    let mk = |label: String, p: f64| ForecastLine { label, pct: pct(p) };
+
+    // Result from the FINAL score (current + additional).
+    let (mut ph, mut pd, mut pa) = (0.0, 0.0, 0.0);
+    for (x, row) in m.iter().enumerate() {
+        for (y, c) in row.iter().enumerate() {
+            let (fh, fa) = (gh + x as i64, ga + y as i64);
+            if fh > fa {
+                ph += c;
+            } else if fh == fa {
+                pd += c;
+            } else {
+                pa += c;
+            }
+        }
+    }
+
+    // Most likely FINAL scorelines.
+    let mut scores: std::collections::HashMap<(i64, i64), f64> = std::collections::HashMap::new();
+    for (x, row) in m.iter().enumerate() {
+        for (y, c) in row.iter().enumerate() {
+            *scores.entry((gh + x as i64, ga + y as i64)).or_insert(0.0) += c;
+        }
+    }
+    let mut score_v: Vec<((i64, i64), f64)> = scores.into_iter().collect();
+    score_v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Goals: total = current + remaining.
+    let cur = gh + ga;
+    let mut over25 = 0.0;
+    for (x, row) in m.iter().enumerate() {
+        for (y, c) in row.iter().enumerate() {
+            if cur + x as i64 + y as i64 >= 3 {
+                over25 += c;
+            }
+        }
+    }
+    let btts = if gh >= 1 && ga >= 1 {
+        1.0
+    } else if gh >= 1 {
+        1.0 - (-la).exp()
+    } else if ga >= 1 {
+        1.0 - (-lh).exp()
+    } else {
+        (1.0 - (-lh).exp()) * (1.0 - (-la).exp())
+    };
+    let any_more = 1.0 - m[0][0];
+
+    vec![
+        ForecastSection {
+            title: "Result (from here)".into(),
+            lines: vec![mk(format!("{home} win"), ph), mk("Draw".into(), pd), mk(format!("{away} win"), pa)],
+        },
+        ForecastSection {
+            title: "Goals (live-adjusted)".into(),
+            lines: vec![
+                mk("Another goal coming".into(), any_more),
+                mk("Over 2.5 total".into(), over25),
+                mk("Both teams to score".into(), btts),
+            ],
+        },
+        ForecastSection {
+            title: "Most likely FINAL score".into(),
+            lines: score_v.iter().take(4).map(|((h, a), p)| mk(format!("{h}-{a}"), *p)).collect(),
+        },
+    ]
+}
+
+/// Best (highest-prob) candidate in a market group matching a predicate.
+fn fc_best<'a>(cands: &'a [Candidate], group: &str, pred: impl Fn(&Candidate) -> bool) -> Option<&'a Candidate> {
+    cands
+        .iter()
+        .filter(|c| c.market_group == group && pred(c))
+        .max_by(|a, b| a.est_prob.partial_cmp(&b.est_prob).unwrap_or(std::cmp::Ordering::Equal))
+}
+
+/// Build a deterministic single-match forecast from the computed candidate
+/// probabilities — likely result, scorelines, goals, cards/corners, key players.
+/// No model call: every % is read straight off our engine's numbers.
+fn forecast_from_candidates(all: &[Candidate], fixture_label: &str, home: &str, away: &str) -> crate::models::MatchForecast {
+    use crate::models::{ForecastLine, ForecastSection, MatchForecast};
+    // Only this fixture's candidates (so a multi-match build doesn't bleed across).
+    let owned: Vec<Candidate> = all.iter().filter(|c| c.fixture == fixture_label).cloned().collect();
+    let cands = owned.as_slice();
+    let mk = |label: String, p: f64| ForecastLine { label, pct: (p * 100.0).round() };
+    let prob = |group: &str, p: &dyn Fn(&Candidate) -> bool| fc_best(cands, group, |c| p(c)).map(|c| c.est_prob).unwrap_or(0.0);
+    let top_n = |group: &str, n: usize| -> Vec<&Candidate> {
+        let mut v: Vec<&Candidate> = cands.iter().filter(|c| c.market_group == group).collect();
+        v.sort_by(|a, b| b.est_prob.partial_cmp(&a.est_prob).unwrap_or(std::cmp::Ordering::Equal));
+        v.truncate(n);
+        v
+    };
+    let mut sections: Vec<ForecastSection> = Vec::new();
+
+    // Result
+    let hw = prob("win", &|c| c.subject == home);
+    let aw = prob("win", &|c| c.subject == away);
+    let draw = (1.0 - hw - aw).max(0.0);
+    sections.push(ForecastSection {
+        title: "Result".into(),
+        lines: vec![mk(format!("{home} win"), hw), mk("Draw".into(), draw), mk(format!("{away} win"), aw)],
+    });
+
+    // Goals
+    let over25 = prob("ou25", &|c| c.line.to_lowercase().starts_with("over 2.5"));
+    let mut goals = vec![mk("Over 2.5 goals".into(), over25), mk("Both teams to score".into(), prob("btts", &|_| true))];
+    if let Some(gr) = fc_best(cands, "goalsrange", |_| true) {
+        goals.push(mk(format!("Most likely: {}", gr.line), gr.est_prob));
+    }
+    let fh = prob("firstscore", &|c| c.subject == home);
+    if fh > 0.0 {
+        goals.push(mk(format!("{home} score first"), fh));
+        goals.push(mk(format!("{away} score first"), prob("firstscore", &|c| c.subject == away)));
+    }
+    sections.push(ForecastSection { title: "Goals".into(), lines: goals });
+
+    // Most likely scorelines
+    let scores = top_n("exactscore", 4);
+    if !scores.is_empty() {
+        sections.push(ForecastSection {
+            title: "Most likely scores".into(),
+            lines: scores.iter().map(|c| mk(c.line.clone(), c.est_prob)).collect(),
+        });
+    }
+
+    // Cards & corners
+    let mut cc = Vec::new();
+    if let Some(m) = fc_best(cands, "mostcards", |_| true) {
+        cc.push(mk(format!("Most cards: {}", m.subject), m.est_prob));
+    }
+    let both = prob("bothcards", &|_| true);
+    if both > 0.0 {
+        cc.push(mk("Both teams carded".into(), both));
+    }
+    if let Some(co) = fc_best(cands, "tcorners", |c| c.line.to_lowercase().starts_with("over")) {
+        cc.push(mk(format!("{} {}", co.subject, co.line.to_lowercase()), co.est_prob));
+    }
+    if !cc.is_empty() {
+        sections.push(ForecastSection { title: "Cards & corners".into(), lines: cc });
+    }
+
+    // Likely players
+    let mut players = Vec::new();
+    for c in top_n("scorer", 3) {
+        players.push(mk(format!("{} to score", c.subject), c.est_prob));
+    }
+    for c in top_n("sot", 2) {
+        players.push(mk(format!("{} — {}", c.subject, c.line), c.est_prob));
+    }
+    for c in top_n("cards", 2) {
+        players.push(mk(format!("{} to be carded", c.subject), c.est_prob));
+    }
+    if !players.is_empty() {
+        sections.push(ForecastSection { title: "Likely players".into(), lines: players });
+    }
+
+    let lean = if hw > aw + 0.12 {
+        format!("{home} favoured")
+    } else if aw > hw + 0.12 {
+        format!("{away} favoured")
+    } else {
+        "Tight match".to_string()
+    };
+    let goalsy = if over25 >= 0.55 { "high-scoring" } else if over25 <= 0.42 { "low-scoring" } else { "moderate goals" };
+    crate::models::MatchForecast {
+        home: home.to_string(),
+        away: away.to_string(),
+        headline: format!("{lean} · {goalsy}"),
+        sections,
+    }
+}
+
 #[tauri::command]
 pub async fn build_tickets(
     state: State<'_, AppState>,
@@ -1469,7 +1671,10 @@ pub async fn build_tickets(
         return Err("Select at least one match first.".to_string());
     }
 
-    let markets: Vec<String> = if selection.markets.is_empty() {
+    // Match Predictor: a deep read of ONE game — force every market so the
+    // forecast and the SGP variations have the full picture.
+    let predictor = selection.strategy.as_deref() == Some("predictor") && selection.fixtures.len() == 1;
+    let markets: Vec<String> = if selection.markets.is_empty() || predictor {
         ALL_MARKETS.iter().map(|s| s.to_string()).collect()
     } else {
         selection.markets.clone()
@@ -1785,7 +1990,9 @@ pub async fn build_tickets(
     let odds_lo = selection.min_odds.unwrap_or(1.0);
     let odds_hi = selection.max_odds.unwrap_or(1000.0);
     if odds_lo > 1.01 || odds_hi < 999.0 {
-        candidates.retain(|c| matches!(c.book_odds, Some(o) if o >= odds_lo && o <= odds_hi));
+        // Filter PRICED legs to the band; keep unpriced ones (most player props
+        // have no odds — a min-odds floor shouldn't silently delete them).
+        candidates.retain(|c| c.book_odds.map_or(true, |o| o >= odds_lo && o <= odds_hi));
     }
 
     if candidates.is_empty() {
@@ -1855,6 +2062,8 @@ pub async fn build_tickets(
         "oracle" => (60, 8),  // Claude's read — selective, diverse across markets
         "power" => (64, 7),   // power stacker — generous-priced bankers, tight per-market
         "bankers" => (80, 16), // wide net of reliable recurring events
+        "jackpot" => (90, 14), // lottery — wide pool of plausible longshots to stack big
+        "predictor" => (110, 20), // deep single-match read — the whole market for one game
         _ => (50, 8),         // value
     };
     // Make sure the pool is big enough to actually BUILD the requested slate: with
@@ -1888,6 +2097,106 @@ pub async fn build_tickets(
             ));
         }
     }
+    // Match Predictor: deterministic forecast from the FULL candidate set (before
+    // the shortlist trims it). If the match is IN-PLAY, pull live state, fold a
+    // live section into the forecast, and inject the live situation so the model
+    // adjusts its suggestions to what's actually happening.
+    let forecast = if predictor {
+        let fx = &selection.fixtures[0];
+        let fl = format!("{} vs {}", fx.home_team, fx.away_team);
+        let mut fc = forecast_from_candidates(&candidates, &fl, &fx.home_team, &fx.away_team);
+        let now = af::now_ts();
+        // In the kickoff window if we have a time; if no time was supplied (e.g.
+        // the one-tap predict from the Live screen) attempt the live pull anyway —
+        // the snapshot's status decides whether to actually adjust.
+        let live_window = fx
+            .date_utc
+            .as_deref()
+            .and_then(|d| chrono::DateTime::parse_from_rfc3339(d).ok())
+            .map(|ko| now >= ko.timestamp() - 300 && now <= ko.timestamp() + 3 * 3600)
+            .unwrap_or(true);
+        if live_window {
+            let lf = crate::models::LiveFixture {
+                fixture_id: fx.fixture_id,
+                league_id: fx.league_id,
+                league_name: String::new(),
+                season: fx.season,
+                home_team: fx.home_team.clone(),
+                away_team: fx.away_team.clone(),
+                home_team_id: fx.home_team_id,
+                away_team_id: fx.away_team_id,
+                status: String::new(),
+                elapsed: 0,
+                home_goals: 0,
+                away_goals: 0,
+                has_stats: false,
+            };
+            if let Ok(snap) = live_snapshot_inner(&state, lf).await {
+                let f = snap.fixture.clone();
+                // In-play if there's an elapsed minute and it isn't finished/not-started.
+                let in_play = (f.elapsed > 0 || f.status == "HT")
+                    && !matches!(f.status.as_str(), "FT" | "AET" | "PEN" | "NS" | "TBD" | "PST" | "CANC" | "ABD" | "AWD" | "WO" | "");
+                if in_play {
+                    fc.headline = format!("⚡ LIVE {}' · {} {}-{} {}", f.elapsed, f.home_team, f.home_goals, f.away_goals, f.away_team);
+                    // Rebuild the goal-derived sections from the CURRENT score +
+                    // remaining-time expectation, replacing the stale pre-match ones.
+                    let remaining = (90 - f.elapsed).clamp(0, 90) as f64;
+                    let frac = remaining / 90.0;
+                    let h_ts = fetch_team_stats(&state, fx.home_team_id, &fx.home_team, fx.league_id, fx.season).await.ok().flatten();
+                    let a_ts = fetch_team_stats(&state, fx.away_team_id, &fx.away_team, fx.league_id, fx.season).await.ok().flatten();
+                    fc.sections.retain(|s| !matches!(s.title.as_str(), "Result" | "Goals" | "Most likely scores"));
+                    let mut new_secs: Vec<crate::models::ForecastSection> = Vec::new();
+                    // Live remaining-time estimates first.
+                    let live_lines: Vec<crate::models::ForecastLine> = snap
+                        .estimates
+                        .iter()
+                        .map(|e| crate::models::ForecastLine { label: e.label.clone(), pct: (e.prob * 100.0).round() })
+                        .collect();
+                    if !live_lines.is_empty() {
+                        new_secs.push(crate::models::ForecastSection { title: format!("Live — remaining ~{}'", remaining as i64), lines: live_lines });
+                    }
+                    if let (Some(h), Some(a)) = (&h_ts, &a_ts) {
+                        let lh = ((h.gf_avg + a.ga_avg) / 2.0).max(0.05) * frac;
+                        let la = ((a.gf_avg + h.ga_avg) / 2.0).max(0.05) * frac;
+                        new_secs.extend(live_goal_sections(&f.home_team, &f.away_team, f.home_goals, f.away_goals, lh, la));
+                    }
+                    new_secs.append(&mut fc.sections); // keep Cards & corners + Likely players
+                    fc.sections = new_secs;
+                    let stat_str = snap
+                        .stats
+                        .iter()
+                        .map(|t| format!("{}: {}", t.team, t.stats.iter().map(|s| format!("{} {}", s.label, s.value)).collect::<Vec<_>>().join(", ")))
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    let ev_str = snap.events.iter().rev().take(8).map(|e| format!("{}' {} {}", e.minute, e.kind, e.player)).collect::<Vec<_>>().join("; ");
+                    let est_str = snap.estimates.iter().map(|e| format!("{} {}%", e.label, (e.prob * 100.0).round() as i64)).collect::<Vec<_>>().join("; ");
+                    pred_notes.push(format!(
+                        "⚡ THIS MATCH IS LIVE: {} {}-{} {} at {}' ({}). The pre-match season-rate numbers in the table are NOW STALE — re-weigh EVERY suggestion for the CURRENT score, momentum and time remaining. Live stats: {}. Recent events: {}. Our live remaining-time estimates: {}. Favour bets that fit what is ACTUALLY happening (a side dominating shots to score next; a tight late game → lean unders; chasing team → more shots/corners/cards).",
+                        f.home_team, f.home_goals, f.away_goals, f.away_team, f.elapsed, f.status,
+                        if stat_str.is_empty() { "(none)".into() } else { stat_str },
+                        if ev_str.is_empty() { "(none)".into() } else { ev_str },
+                        if est_str.is_empty() { "(none)".into() } else { est_str },
+                    ));
+                }
+            }
+        }
+        Some(fc)
+    } else {
+        None
+    };
+    // Simple mode: a forecast for EVERY selected match.
+    let simple_forecasts: Vec<crate::models::MatchForecast> = if selection.simple.unwrap_or(false) {
+        selection
+            .fixtures
+            .iter()
+            .map(|fx| {
+                let fl = format!("{} vs {}", fx.home_team, fx.away_team);
+                forecast_from_candidates(&candidates, &fl, &fx.home_team, &fx.away_team)
+            })
+            .collect()
+    } else {
+        vec![]
+    };
     let shortlist = features::shortlist(candidates, pool_n, &strategy, market_cap);
     let table = features::compact_table_json(&shortlist);
     let opts = llm::PromptOpts {
@@ -2011,6 +2320,8 @@ pub async fn build_tickets(
     det_notes.extend(result.data_quality_notes.drain(..));
     result.data_quality_notes = det_notes;
     result.context_notes = pred_notes;
+    result.forecast = forecast;
+    result.forecasts = simple_forecasts;
 
     // Paper-trading ledger: record each unique generated ticket by strategy +
     // grok flag, so we can later settle them all and see which approach wins.
@@ -2262,8 +2573,20 @@ fn make_ladder_ticket(cands: &[Candidate], title: &str) -> Ticket {
     } else {
         None
     };
-    let fixtures: HashSet<&String> = cands.iter().map(|c| &c.fixture).collect();
-    let kind = if cands.len() <= 1 { "Single" } else if fixtures.len() <= 1 { "SGP" } else { "SGP+" };
+    let mut per_fix: HashMap<&String, usize> = HashMap::new();
+    for c in cands.iter() {
+        *per_fix.entry(&c.fixture).or_insert(0) += 1;
+    }
+    let max_per_fix = per_fix.values().copied().max().unwrap_or(0);
+    let kind = if cands.len() <= 1 {
+        "Single"
+    } else if per_fix.len() <= 1 {
+        "SGP"
+    } else if max_per_fix >= 2 {
+        "SGP+"
+    } else {
+        "Acca"
+    };
     Ticket {
         kind: kind.to_string(),
         title: title.to_string(),
@@ -2521,7 +2844,7 @@ pub async fn build_ladder(
     let mut legs: Vec<Candidate> = legs
         .into_iter()
         .filter(|c| !excl_subj.contains(&crate::odds::fold(&c.subject)))
-        .filter(|c| !band_active || matches!(c.book_odds, Some(o) if o >= odds_lo && o <= odds_hi))
+        .filter(|c| !band_active || c.book_odds.map_or(true, |o| o >= odds_lo && o <= odds_hi))
         .collect();
     if legs.is_empty() {
         return Err("No usable lines for the selected markets and matches.".to_string());
@@ -2675,6 +2998,8 @@ pub async fn build_ladder(
     }
     Ok(BuildResult {
         tickets,
+        forecast: None,
+        forecasts: vec![],
         data_quality_notes: notes,
         context_notes: vec![],
         from_cache: false,
@@ -3126,29 +3451,39 @@ pub fn generated_report_by_kind(state: State<AppState>) -> Result<Vec<GenReportR
 #[tauri::command]
 pub fn generated_report_by_market(state: State<AppState>) -> Result<Vec<MarketReportRow>, String> {
     let conn = state.db.lock().map_err(|_| "db lock")?;
-    let mut agg: HashMap<String, (i64, i64, f64)> = HashMap::new(); // market -> (settled, won, pred_sum)
+    // market -> (settled, won, pred_sum, margin_sum, margin_n, near_miss_losses)
+    let mut agg: HashMap<String, (i64, i64, f64, f64, i64, i64)> = HashMap::new();
     for (tj, lrj) in db::gen_settled(&conn)? {
         let legs = serde_json::from_str::<Ticket>(&tj).map(|t| t.legs).unwrap_or_default();
         let results: Vec<crate::models::LegResult> = serde_json::from_str(&lrj).unwrap_or_default();
         for (leg, res) in legs.iter().zip(results.iter()) {
             if let Some(won) = res.won {
-                let e = agg.entry(leg.market.clone()).or_insert((0, 0, 0.0));
+                let e = agg.entry(leg.market.clone()).or_insert((0, 0, 0.0, 0.0, 0, 0));
                 e.0 += 1;
                 if won {
                     e.1 += 1;
                 }
                 e.2 += leg.est_prob.unwrap_or(0.0);
+                if let Some(m) = res.margin {
+                    e.3 += m;
+                    e.4 += 1;
+                    if !won && m > -1.0 {
+                        e.5 += 1; // a near-miss loss (within 1 of the line)
+                    }
+                }
             }
         }
     }
     let mut out: Vec<MarketReportRow> = agg
         .into_iter()
-        .map(|(market, (settled, won, psum))| MarketReportRow {
+        .map(|(market, (settled, won, psum, msum, mn, near))| MarketReportRow {
             market,
             settled,
             won,
             hit_rate: if settled > 0 { round4(won as f64 / settled as f64) } else { 0.0 },
             predicted: if settled > 0 { round4(psum / settled as f64) } else { 0.0 },
+            avg_margin: if mn > 0 { Some((msum / mn as f64 * 100.0).round() / 100.0) } else { None },
+            near_misses: near,
         })
         .collect();
     out.sort_by(|a, b| b.settled.cmp(&a.settled));
@@ -3490,13 +3825,56 @@ pub async fn live_ticket(state: State<'_, AppState>, fixture: LiveFixture, model
         ));
         menu.push(LiveLeg { label: e.label.clone(), prob: e.prob, odds, source: "model".into(), why: String::new() });
     }
-    for o in snap.odds.iter().take(22) {
+    for o in snap.odds.iter().take(16) {
         lines.push(format!(
             "[{}] {} — {} @ {:.2} ({}% implied)",
             menu.len(), o.market, o.selection, o.odds, (o.implied * 100.0).round() as i64
         ));
         menu.push(LiveLeg { label: format!("{} — {}", o.market, o.selection), prob: o.implied, odds: Some(o.odds), source: "book".into(), why: String::new() });
     }
+
+    // Live PLAYER props — it's a numbers game: who's actually shooting/attempting
+    // right now is most likely to do more. Pace-extrapolate each player's live
+    // shots over the time remaining.
+    let elapsed = snap.fixture.elapsed.max(1);
+    let frac = ((90 - snap.fixture.elapsed).clamp(0, 90) as f64) / elapsed as f64;
+    if let Ok(pj) = af::cached_get(&state, "/fixtures/players", vec![("fixture", fixture.fixture_id.to_string())], TTL_LIVE_SHORT).await {
+        let mut players: Vec<(String, String, f64, f64, f64)> = Vec::new(); // name, team, mins, shots, sot
+        for team in response_array(&pj) {
+            let tname = team.get("team").and_then(|t| t.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if let Some(arr) = team.get("players").and_then(|x| x.as_array()) {
+                for p in arr {
+                    let name = p.get("player").and_then(|x| x.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let st = p.get("statistics").and_then(|a| a.as_array()).and_then(|a| a.first());
+                    let mins = st.and_then(|s| s.get("games")).and_then(|g| g.get("minutes")).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let shots = st.and_then(|s| s.get("shots")).and_then(|g| g.get("total")).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let sot = st.and_then(|s| s.get("shots")).and_then(|g| g.get("on")).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    if mins >= 1.0 && !name.is_empty() {
+                        players.push((name, tname.clone(), mins, shots, sot));
+                    }
+                }
+            }
+        }
+        // Prioritise the live shooters, then high-minute regulars.
+        players.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal).then(b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal)));
+        for (name, _team, _mins, shots, sot) in players.into_iter().take(8) {
+            // Shots: P(≥1 more) over remaining time, pace from shots-so-far.
+            let more_shots = shots * frac;
+            let p_shot = 1.0 - (-more_shots).exp();
+            if p_shot > 0.15 {
+                let next = (shots as i64) + 1;
+                lines.push(format!("[{}] {} — {}+ shots (has {} so far) — our {}%", menu.len(), name, next, shots as i64, (p_shot * 100.0).round() as i64));
+                menu.push(LiveLeg { label: format!("{} {}+ shots", name, next), prob: round4(p_shot), odds: None, source: "model".into(), why: String::new() });
+            }
+            // To score from here, from SOT pace × ~0.3 conversion.
+            let p_score = 1.0 - (-(sot * frac * 0.30)).exp();
+            if p_score > 0.08 {
+                lines.push(format!("[{}] {} — to score from here ({} SOT so far) — our {}%", menu.len(), name, sot as i64, (p_score * 100.0).round() as i64));
+                menu.push(LiveLeg { label: format!("{} to score from here", name), prob: round4(p_score), odds: None, source: "model".into(), why: String::new() });
+            }
+        }
+    }
+
     if menu.is_empty() {
         return Err("no live markets or estimates to build from yet".into());
     }
@@ -3522,9 +3900,9 @@ pub async fn live_ticket(state: State<'_, AppState>, fixture: LiveFixture, model
 
     let menu_block = lines.join("\n");
     let ingest_block = if ingest_notes.is_empty() { "(none)".to_string() } else { ingest_notes };
-    let system = "You are a sharp in-play football trader. From the supplied MENU you assemble ONE coherent live ticket for the current game state. RULES: pick only indices that exist; never invent or alter a probability (the menu % is fixed and authoritative); prefer 2-5 legs that are positively correlated with how this match is unfolding; never combine contradictory legs. Output strict JSON only, no prose.";
+    let system = "You are a sharp in-play football trader. From the supplied MENU you surface the BEST INDIVIDUAL bets (SINGLES) for the current game state — a POOL the user cherry-picks from, NOT one combined ticket. RULES: pick only indices that exist; never invent or alter a probability (the menu % is fixed and authoritative); the picks may point different ways or even mildly conflict — that's fine, they are separate singles, not a parlay; avoid near-duplicates (don't pick both '2+ shots' and 'to score' for the same player unless both are strong). Lean on who is ACTUALLY attempting/shooting (it's a numbers game) and the live momentum. Output strict JSON only, no prose.";
     let user = format!(
-        "LIVE MATCH: {} {}-{} {} ({}', {} | {})\n\nLIVE STATS: {}\nEVENTS: {}\n\nINGESTED PAGE NOTES (your own clipped pages — soft context, don't trust blindly):\n{}\n\nMENU (pick by index — the ONLY legs you may use; the % is fixed, never change it):\n{}\n\nBuild ONE in-play ticket of 2-5 legs that fit THIS game state right now. Prefer legs pointing the same way (a side on top → that side to score + match over + their corners). Avoid contradictions. Output STRICT JSON only: {{\"legs\":[{{\"i\":<index>,\"why\":\"<6-12 words>\"}}],\"rationale\":\"<1 sentence>\",\"confidence\":\"low|medium|high\"}}",
+        "LIVE MATCH: {} {}-{} {} ({}', {} | {})\n\nLIVE STATS: {}\nEVENTS: {}\n\nINGESTED PAGE NOTES (your own clipped pages — soft context, don't trust blindly):\n{}\n\nMENU (pick by index — the ONLY picks you may use; the % is fixed, never change it):\n{}\n\nSurface the 5-8 BEST SINGLES for THIS game state right now — a pool to build from. Favour live shooters likely to do more, value vs the live odds, and any quiet threat the numbers say is due. Each is a STANDALONE single; do NOT try to make them combine. Output STRICT JSON only: {{\"legs\":[{{\"i\":<index>,\"why\":\"<6-12 words>\"}}],\"rationale\":\"<1 sentence on how the game is unfolding>\",\"confidence\":\"low|medium|high\"}}",
         f.home_team, f.home_goals, f.away_goals, f.away_team, f.elapsed, f.status, f.league_name,
         if stat_str.is_empty() { "(none)" } else { &stat_str },
         if ev_str.is_empty() { "(none)" } else { &ev_str },

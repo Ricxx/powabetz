@@ -55,6 +55,7 @@ pub fn is_scoreline_market(market: &str) -> bool {
         || m.contains("double chance")
         || m == "btts"
         || m.contains("both teams")
+        || m.contains("first team to score")
         || m.contains("asian handicap")
         || m.contains("correct score")
         || m.contains("goals range")

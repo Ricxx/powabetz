@@ -22,6 +22,9 @@ function stratLabel(s: string): string {
   if (s === "oracle") return "Oracle ✦";
   if (s === "power") return "Power Stacker ⚡";
   if (s === "bankers") return "Anchors ⚓";
+  if (s === "jackpot") return "Jackpot 🎰";
+  if (s === "predictor") return "Match Predictor 🔮";
+  if (s === "live") return "Live 🔴";
   if (s === "custom") return "Cherry-picked 🍒";
   if (s === "ladder") return "Acca ladder";
   if (s === "board") return "Board";
@@ -67,7 +70,14 @@ function BetCard({ bet, onSettle, onDelete }: { bet: PlacedBet; onSettle: () => 
                 {l.selection} · {l.market}
                 {l.line ? ` ${l.line}` : ""}
               </span>
-              {r?.detail && <span className="text-slate-500 shrink-0 ml-2">{r.detail}</span>}
+              {r?.detail && (
+                <span className="text-slate-500 shrink-0 ml-2">
+                  {r.detail}
+                  {won === false && r?.margin != null && r.margin > -1 && (
+                    <span className="text-warn ml-1" title="Near-miss — lost by less than 1">· off by {Math.abs(r.margin).toFixed(1)}</span>
+                  )}
+                </span>
+              )}
             </div>
           );
         })}
@@ -172,7 +182,7 @@ export default function Tracker({ onClose }: { onClose: () => void }) {
   const noGrok = split(bets.filter((b) => !b.grok_used));
 
   // ROI split by the strategy each ticket came from.
-  const strategies = ["value", "favorites", "likely", "oracle", "power", "bankers", "custom", "ladder", "board"].filter((s) =>
+  const strategies = ["value", "favorites", "likely", "oracle", "power", "bankers", "jackpot", "predictor", "live", "custom", "ladder", "board"].filter((s) =>
     bets.some((b) => b.strategy === s && b.settled)
   );
 

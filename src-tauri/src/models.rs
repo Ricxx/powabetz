@@ -177,8 +177,35 @@ pub struct Ticket {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForecastLine {
+    pub label: String,
+    pub pct: f64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForecastSection {
+    pub title: String,
+    pub lines: Vec<ForecastLine>,
+}
+/// A deterministic single-match forecast — likely result, scorelines, goals,
+/// cards/corners and key players, each with a % — read straight off our computed
+/// candidate probabilities. Surfaced by the Match Predictor mode.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatchForecast {
+    pub home: String,
+    pub away: String,
+    pub headline: String,
+    pub sections: Vec<ForecastSection>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildResult {
     pub tickets: Vec<Ticket>,
+    /// Single-match forecast (Match Predictor mode only).
+    #[serde(default)]
+    pub forecast: Option<MatchForecast>,
+    /// Per-fixture forecasts (Simple mode — one per selected match).
+    #[serde(default)]
+    pub forecasts: Vec<MatchForecast>,
     #[serde(default)]
     pub data_quality_notes: Vec<String>,
     /// Match context fed to the model (predictions, standings, H2H, weather,
@@ -317,6 +344,9 @@ pub struct BuildSelection {
     /// Feed matched browser-ingested page data into the build as labeled context.
     #[serde(default)]
     pub use_ingest: Option<bool>,
+    /// Simple mode: compute a forecast for EVERY selected fixture (not just one).
+    #[serde(default)]
+    pub simple: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -361,6 +391,11 @@ pub struct UsageBreakdown {
 pub struct LegResult {
     pub won: Option<bool>, // None = not yet gradeable
     pub detail: String,
+    /// For O/U-style legs: signed gap to the line in the bet's favour (actual −
+    /// line for an over, line − actual for an under). +0.5 = won by half a unit;
+    /// −0.5 = a near-miss loss. None for non-O/U markets.
+    #[serde(default)]
+    pub margin: Option<f64>,
 }
 
 // ---------- in-play / live ----------
@@ -504,6 +539,13 @@ pub struct MarketReportRow {
     pub won: i64,
     pub hit_rate: f64,  // actual
     pub predicted: f64, // mean model est_prob for this market
+    /// O/U markets only: mean signed gap to the line (+ = cleared comfortably,
+    /// − = lost/landed tight). None for non-O/U markets.
+    #[serde(default)]
+    pub avg_margin: Option<f64>,
+    /// O/U losses that missed the line by less than 1 unit (near-misses).
+    #[serde(default)]
+    pub near_misses: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]

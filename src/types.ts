@@ -145,8 +145,18 @@ export interface Ticket {
   why?: string | null;
 }
 
+export interface ForecastLine { label: string; pct: number }
+export interface ForecastSection { title: string; lines: ForecastLine[] }
+export interface MatchForecast {
+  home: string;
+  away: string;
+  headline: string;
+  sections: ForecastSection[];
+}
 export interface BuildResult {
   tickets: Ticket[];
+  forecast?: MatchForecast | null;
+  forecasts?: MatchForecast[];
   data_quality_notes: string[];
   context_notes?: string[];
   from_cache: boolean;
@@ -208,6 +218,8 @@ export interface MarketReportRow {
   won: number;
   hit_rate: number; // actual
   predicted: number; // model's mean predicted prob
+  avg_margin?: number | null; // O/U: mean signed gap to the line
+  near_misses?: number; // O/U losses within 1 of the line
 }
 
 export interface IngestKV {
@@ -318,6 +330,7 @@ export interface UsageBreakdown {
 export interface LegResult {
   won: boolean | null;
   detail: string;
+  margin?: number | null; // O/U: signed gap to the line (+ = cleared, − = missed by)
 }
 
 export interface PlacedBet {
@@ -399,6 +412,7 @@ export interface BuildSelection {
   max_odds: number | null;
   max_per_subject: number | null;
   use_plausibility: boolean;
+  simple?: boolean;
 }
 
 export const TICKET_TYPES = ["Single", "SGP", "SGP+"];
@@ -564,7 +578,8 @@ export const MARKETS: MarketDef[] = [
   { key: "h1goals", label: "1st-half Goals O/U", group: "team", sub: "Goals" },
   { key: "h2goals", label: "2nd-half Goals O/U", group: "team", sub: "Goals" },
   { key: "exactscore", label: "Correct Score", group: "team", sub: "Goals" },
-  { key: "goalsrange", label: "Goals Range (0-1 / 2-3 / 4-6)", group: "team", sub: "Goals" },
+  { key: "goalsrange", label: "Goals Range (2-4, 1-6, …)", group: "team", sub: "Goals" },
+  { key: "firstscore", label: "First Team to Score", group: "team", sub: "Goals" },
   { key: "tgoals", label: "Team Total Goals", group: "team", sub: "Goals" },
   { key: "btts", label: "BTTS", group: "team", sub: "Goals" },
   { key: "tcorners", label: "Team Corners (recent form)", group: "team", sub: "Goals" },
