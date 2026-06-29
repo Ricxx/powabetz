@@ -9,6 +9,7 @@ mod grok;
 mod ingest;
 mod llm;
 mod models;
+mod montecarlo;
 mod odds;
 mod settle;
 mod weather;
@@ -204,6 +205,11 @@ pub fn run() {
             commands::export_data,
             commands::import_data,
             commands::reset_data,
+            commands::live_fixtures,
+            commands::live_snapshot,
+            commands::live_ticket,
+            commands::price_sgp,
+            commands::get_bankers,
             commands::usage_by_purpose,
             commands::export_extension,
             commands::ingest_info,

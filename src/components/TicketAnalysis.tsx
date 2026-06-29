@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { api } from "../api";
 import Spinner from "./Spinner";
+import Hint from "./Hint";
 import { ANALYSIS_MODELS, type Ticket, type TicketEval } from "../types";
 
 function verdictColor(v: string): string {
@@ -70,6 +71,7 @@ export default function TicketAnalysis({
         <div className="mt-1.5 rounded-lg bg-ink border border-edge px-2.5 py-2 text-xs space-y-2">
           <div className="flex items-center gap-1.5 flex-wrap">
             <span className="text-[10px] text-slate-500">model:</span>
+            <Hint text="Spends one cached model call (free to re-open at the same ticket). Cost order: GPT-5 nano cheapest, then Haiku, then GPT-5 mini (~15× nano). GPT models need an OpenAI key." />
             {ANALYSIS_MODELS.map((m) => (
               <button
                 key={m.id}
@@ -82,7 +84,7 @@ export default function TicketAnalysis({
               </button>
             ))}
             {usedModel && (
-              <span className="text-[10px] text-slate-600">
+              <span className="text-[10px] text-slate-500">
                 · read by {ANALYSIS_MODELS.find((x) => x.id === usedModel)?.label || usedModel}
               </span>
             )}

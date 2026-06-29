@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
+import { errMsg, toast } from "../toast";
 import { api } from "../api";
 import Spinner from "./Spinner";
+import Hint from "./Hint";
 import type { BankrollView, CalibrationReport, PlacedBet } from "../types";
 
 function statusBadge(s: string): string {
@@ -19,6 +21,7 @@ function stratLabel(s: string): string {
   if (s === "favorites") return "Form faves";
   if (s === "oracle") return "Oracle ✦";
   if (s === "power") return "Power Stacker ⚡";
+  if (s === "bankers") return "Anchors ⚓";
   if (s === "custom") return "Cherry-picked 🍒";
   if (s === "ladder") return "Acca ladder";
   if (s === "board") return "Board";
@@ -59,7 +62,7 @@ function BetCard({ bet, onSettle, onDelete }: { bet: PlacedBet; onSettle: () => 
           const color = won === true ? "text-accent" : won === false ? "text-bad" : "text-slate-500";
           return (
             <div key={i} className="flex items-center justify-between text-xs">
-              <span className="truncate">
+              <span className="break-words min-w-0">
                 <span className={`${color} font-bold mr-1`}>{mark}</span>
                 {l.selection} · {l.market}
                 {l.line ? ` ${l.line}` : ""}
@@ -105,7 +108,7 @@ export default function Tracker({ onClose }: { onClose: () => void }) {
   const [err, setErr] = useState<string | null>(null);
 
   function refresh() {
-    api.listBets().then(setBets).catch((e) => setErr(String(e)));
+    api.listBets().then(setBets).catch((e) => setErr(errMsg(e)));
     api.getBankroll().then(setBank).catch(() => {});
     api.calibration().then(setCalib).catch(() => {});
   }
@@ -131,7 +134,7 @@ export default function Tracker({ onClose }: { onClose: () => void }) {
       setBets(updated);
       setBank(await api.getBankroll());
     } catch (e) {
-      setErr(String(e));
+      setErr(errMsg(e));
     } finally {
       setBusy(false);
     }
@@ -142,12 +145,19 @@ export default function Tracker({ onClose }: { onClose: () => void }) {
       await api.settleBet(id);
       refresh();
     } catch (e) {
-      setErr(String(e));
+      setErr(errMsg(e));
     }
   }
-  async function del(id: number) {
-    await api.deleteBet(id).catch(() => {});
-    refresh();
+  function del(id: number) {
+    // Optimistic remove + deferred delete, so it's undoable for 5s.
+    setBets((prev) => prev.filter((b) => b.id !== id));
+    const timer = setTimeout(() => {
+      api.deleteBet(id).then(refresh).catch(toast.error);
+    }, 5000);
+    toast.undo("Bet removed", () => {
+      clearTimeout(timer);
+      refresh();
+    });
   }
 
   // Grok attribution: win rate + ROI split by whether Grok was used.
@@ -162,7 +172,7 @@ export default function Tracker({ onClose }: { onClose: () => void }) {
   const noGrok = split(bets.filter((b) => !b.grok_used));
 
   // ROI split by the strategy each ticket came from.
-  const strategies = ["value", "favorites", "likely", "oracle", "power", "custom", "ladder", "board"].filter((s) =>
+  const strategies = ["value", "favorites", "likely", "oracle", "power", "bankers", "custom", "ladder", "board"].filter((s) =>
     bets.some((b) => b.strategy === s && b.settled)
   );
 
@@ -210,7 +220,10 @@ export default function Tracker({ onClose }: { onClose: () => void }) {
       {calib && calib.n > 0 && (
         <div className="card space-y-1.5">
           <div className="flex items-center justify-between">
-            <div className="text-xs font-semibold text-slate-400">Model calibration</div>
+            <div className="text-xs font-semibold text-slate-400">
+              Model calibration
+              <Hint text="λ measures how well our probabilities match reality, learned from your settled bets. λ<1 = overconfident, so new builds shrink edges toward 50/50; λ≈1 = well calibrated. It's weighted by how many legs have settled, so it eases in as evidence grows." />
+            </div>
             <span className={`badge ${calib.applied ? "bg-accent/20 text-accent" : "bg-edge text-slate-300"}`}>
               λ {calib.lambda.toFixed(2)}
               {calib.applied ? " · live" : ""}

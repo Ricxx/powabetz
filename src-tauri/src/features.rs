@@ -27,10 +27,6 @@ fn clampp(p: f64) -> f64 {
 fn pois_ge1(l: f64) -> f64 {
     1.0 - (-l).exp()
 }
-/// P(X >= 2) for Poisson(l).
-fn pois_ge2(l: f64) -> f64 {
-    1.0 - (-l).exp() * (1.0 + l)
-}
 /// P(X = k) for Poisson(l), small k.
 fn pois_pmf(k: u32, l: f64) -> f64 {
     let mut term = (-l).exp();
@@ -49,8 +45,132 @@ fn pois_cdf(k: u32, l: f64) -> f64 {
     }
     sum
 }
-fn sigmoid(x: f64) -> f64 {
-    1.0 / (1.0 + (-x).exp())
+
+/// Overdispersion (variance ÷ mean) for football count markets. Cards, corners,
+/// shots and offsides are OVERDISPERSED — their real variance exceeds the mean,
+/// so a Poisson (which assumes var = mean) understates the tails (the high-count
+/// games you bet "over" on). Negative-Binomial with these factors fixes that.
+/// Values follow the empirical literature: corners ~mild, cards the most spread
+/// (refs/fixtures vary a lot), shots moderate. (Karlis & Ntzoufras 2000 on count
+/// models for football; corners/cards overdispersion is well documented.)
+const PHI_CORNERS: f64 = 1.18;
+const PHI_CARDS: f64 = 1.30;
+const PHI_SHOTS: f64 = 1.20;
+const PHI_OFFSIDES: f64 = 1.15;
+// Per-PLAYER count props are overdispersed too — a player's shots/tackles vary
+// game to game with role, opponent and game state. Same NB treatment, slightly
+// milder factors (single-player counts are lower).
+const PHI_P_SHOTS: f64 = 1.20;
+const PHI_P_SOT: f64 = 1.15;
+const PHI_P_TACKLES: f64 = 1.20;
+const PHI_P_FOULS: f64 = 1.15;
+const PHI_P_SAVES: f64 = 1.20;
+
+/// NB P(X≥1) and P(X≥2) for mean `mu`, dispersion `phi` — convenience wrappers.
+fn nb_ge1(mu: f64, phi: f64) -> f64 {
+    nb_over(0, mu, phi)
+}
+fn nb_ge2(mu: f64, phi: f64) -> f64 {
+    nb_over(1, mu, phi)
+}
+
+/// Negative-Binomial P(X > k) for mean `mu` with overdispersion `phi` (var/mean).
+/// Reduces to Poisson when phi ≈ 1. Parameterized by mean + dispersion:
+/// r = mu/(phi−1), p = r/(r+mu); pmf via the standard NB recurrence.
+fn nb_over(k: u32, mu: f64, phi: f64) -> f64 {
+    if phi <= 1.0001 || mu <= 1e-6 {
+        return (1.0 - pois_cdf(k, mu)).clamp(0.0, 1.0);
+    }
+    let r = mu / (phi - 1.0);
+    let p = r / (r + mu);
+    let mut term = p.powf(r); // pmf(0)
+    let mut cdf = term;
+    for i in 1..=k {
+        term *= (r + i as f64 - 1.0) / i as f64 * (1.0 - p);
+        cdf += term;
+    }
+    (1.0 - cdf).clamp(0.0, 1.0)
+}
+
+/// Dixon-Coles (1997) low-score dependence factor τ. With ρ<0 it lifts 0-0 and
+/// 1-1 and trims 1-0 / 0-1 — correcting independent Poisson's well-known
+/// under-weighting of draws and tight games. ρ is a fixed literature-typical
+/// value (we can't fit it per match without more data), so this is a principled
+/// CORRECTION, not a measured per-match quantity.
+const DC_RHO: f64 = -0.08;
+fn dc_tau(x: u32, y: u32, lh: f64, la: f64, rho: f64) -> f64 {
+    match (x, y) {
+        (0, 0) => 1.0 - lh * la * rho,
+        (0, 1) => 1.0 + lh * rho,
+        (1, 0) => 1.0 + la * rho,
+        (1, 1) => 1.0 - rho,
+        _ => 1.0,
+    }
+}
+/// Home advantage as a multiplicative tilt on goal expectation. Home sides
+/// reliably score more and concede less; classic estimates put the edge near
+/// 0.3-0.4 goals (Pollard 1986; Dixon & Coles 1997 use a home factor γ≈1.35),
+/// though it has eased since ~2020. We apply a CONSERVATIVE tilt because some of
+/// the edge is already baked into overall scoring rates. Makes every goal-derived
+/// market home-aware and consistent.
+const HOME_ADV: f64 = 1.10;
+const AWAY_ADJ: f64 = 0.95;
+/// Typical per-team goals/game baseline that normalizes the Maher attack×defence
+/// interaction (so an average attack vs an average defence returns the average).
+const LEAGUE_AVG_GOALS: f64 = 1.35;
+
+/// (home win, draw, away win) read straight off a score grid. The difference of
+/// two independent Poissons is the Skellam distribution — summing the grid below
+/// / on / above the diagonal gives exact 1X2 probabilities (and, with the DC τ
+/// baked into the grid, the low-score correction comes along for free). This
+/// replaces a hand-tuned sigmoid + a constant 27% draw.
+fn wdl_from_matrix(m: &[Vec<f64>]) -> (f64, f64, f64) {
+    let (mut ph, mut pd, mut pa) = (0.0, 0.0, 0.0);
+    for (h, row) in m.iter().enumerate() {
+        for (a, p) in row.iter().enumerate() {
+            if h > a {
+                ph += p;
+            } else if h == a {
+                pd += p;
+            } else {
+                pa += p;
+            }
+        }
+    }
+    (ph, pd, pa)
+}
+/// P(home goals − away goals ≥ k) from a score grid — for Asian handicap lines.
+fn margin_ge_from_matrix(m: &[Vec<f64>], k: i64) -> f64 {
+    let mut s = 0.0;
+    for (h, row) in m.iter().enumerate() {
+        for (a, p) in row.iter().enumerate() {
+            if (h as i64 - a as i64) >= k {
+                s += p;
+            }
+        }
+    }
+    s.clamp(0.0, 1.0)
+}
+
+/// DC-corrected, renormalized joint score matrix m[home][away] up to `max` each.
+fn dc_score_matrix(lh: f64, la: f64, max: usize) -> Vec<Vec<f64>> {
+    let mut m = vec![vec![0.0f64; max + 1]; max + 1];
+    let mut sum = 0.0;
+    for h in 0..=max {
+        for a in 0..=max {
+            let p = (dc_tau(h as u32, a as u32, lh, la, DC_RHO) * pois_pmf(h as u32, lh) * pois_pmf(a as u32, la)).max(0.0);
+            m[h][a] = p;
+            sum += p;
+        }
+    }
+    if sum > 1e-12 {
+        for row in m.iter_mut() {
+            for v in row.iter_mut() {
+                *v /= sum;
+            }
+        }
+    }
+    m
 }
 /// Standard normal CDF via erf approximation (Abramowitz & Stegun 7.1.26).
 fn norm_cdf(x: f64) -> f64 {
@@ -212,6 +332,92 @@ pub struct FixtureCtx {
     pub availability: String,
 }
 
+/// Per-player recent-match CONSISTENCY: how OFTEN (over recent appearances) a
+/// player actually hit each line — the "does this happen most games" signal that
+/// a season average misses. Rates are fraction-of-appearances in [0,1].
+#[derive(Default, Clone)]
+pub struct Consistency {
+    pub apps: u32,
+    pub card_rate: f64,
+    pub shot1_rate: f64,
+    pub shot2_rate: f64,
+    pub sot1_rate: f64,
+    pub sot2_rate: f64,
+    pub goal_rate: f64,
+    pub assist_rate: f64,
+    pub tackle2_rate: f64,
+    pub foul1_rate: f64,
+}
+
+/// Blend a season-average Poisson probability with the observed recent hit-rate.
+/// With enough appearances we lean on what ACTUALLY happens; otherwise we keep
+/// the model estimate. Returns (blended_prob, optional "N/M recent" note).
+fn blend_consistency(poisson: f64, rate: f64, apps: u32) -> (f64, Option<String>) {
+    if apps < 3 {
+        return (poisson, None);
+    }
+    // Shrinkage / empirical-Bayes: treat the season-average Poisson estimate as a
+    // prior worth ~K pseudo-games, and weight the observed recent hit-rate by its
+    // sample size. More appearances → trust what actually happened more. This is
+    // the Beta-Binomial-style shrink that beats either pure estimate alone.
+    const K: f64 = 4.0;
+    let w = apps as f64 / (apps as f64 + K);
+    let blended = (1.0 - w) * poisson + w * rate;
+    let hits = (rate * apps as f64).round() as u32;
+    (clampp(blended), Some(format!("hit {hits}/{apps} recent")))
+}
+
+// ---------- position-group baselines (empirical-Bayes prior) ----------
+
+/// 0=GK, 1=DEF, 2=MID, 3=FWD — used to shrink small-sample player rates toward
+/// the right peer group (a striker's tackle rate should regress toward strikers,
+/// not toward the whole squad).
+fn pos_group(p: &str) -> usize {
+    let p = p.to_lowercase();
+    if p.contains("goalkeeper") || p == "g" {
+        0
+    } else if p.contains("defend") || p == "d" {
+        1
+    } else if p.contains("midfield") || p == "m" {
+        2
+    } else {
+        3
+    }
+}
+
+/// Minutes-weighted per-90 baseline per position group for the props that have
+/// no recent-hit-rate consistency signal. baseline[stat][group], stat order:
+/// 0 tackles, 1 fouls, 2 assists, 3 saves.
+pub type PosBaseline = [[f64; 4]; 4];
+
+/// Pseudo-games of prior weight for the squad-baseline shrink (James-Stein style).
+const SHRINK_K: f64 = 3.0;
+
+pub fn squad_baselines(entries: &[Value], league_id: i64) -> PosBaseline {
+    let mut sums: PosBaseline = [[0.0; 4]; 4];
+    let mut nineties = [0.0f64; 4];
+    for e in entries {
+        if let Some(s) = parse_season_entry(e, league_id) {
+            if s.minutes < 90.0 {
+                continue; // need ~a full game before a player informs the baseline
+            }
+            let g = pos_group(&s.position);
+            sums[0][g] += s.tackles;
+            sums[1][g] += s.fouls_for;
+            sums[2][g] += s.assists;
+            sums[3][g] += s.saves;
+            nineties[g] += s.minutes / 90.0;
+        }
+    }
+    let mut out: PosBaseline = [[0.0; 4]; 4];
+    for stat in 0..4 {
+        for g in 0..4 {
+            out[stat][g] = if nineties[g] > 0.0 { sums[stat][g] / nineties[g] } else { 0.0 };
+        }
+    }
+    out
+}
+
 // ---------- player candidate generation ----------
 
 /// Build candidates from a single `/players` entry. `groups` are the selected
@@ -222,12 +428,15 @@ pub fn build_player_candidates_entry(
     ctx: &FixtureCtx,
     groups: &[String],
     in_form: &std::collections::HashSet<String>,
+    consistency: &std::collections::HashMap<String, Consistency>,
+    baselines: &PosBaseline,
 ) -> Vec<Candidate> {
     let s = match parse_season_entry(entry, league_id) {
         Some(s) => s,
         None => return Vec::new(),
     };
     let hot = in_form.contains(&crate::odds::fold(&s.name));
+    let con = consistency.get(&crate::odds::fold(&s.name)).cloned().unwrap_or_default();
     let mut out = Vec::new();
 
     let gp = s.apps.max(1.0);
@@ -238,16 +447,28 @@ pub fn build_player_candidates_entry(
     let nineties = s.minutes / 90.0;
     let per90 = |total: f64| if nineties > 0.0 { total / nineties } else { 0.0 };
 
+    // Empirical-Bayes shrink toward the player's position-group baseline, weighted
+    // by sample size: few games → lean on peers; many games → trust the player.
+    // Applied to the props with NO recent-hit-rate signal (tackles/fouls/assists/
+    // saves); scorer/shots/SOT/cards already shrink via the consistency blend.
+    let g = pos_group(&s.position);
+    let shrink = |rate: f64, prior: f64| -> f64 {
+        if prior <= 0.0 {
+            return rate;
+        }
+        (s.apps * rate + SHRINK_K * prior) / (s.apps + SHRINK_K)
+    };
+
     let goals_p90 = per90(s.goals);
     let shots_p90 = per90(s.shots);
     let sot_p90 = per90(s.sot);
-    let tackles_p90 = per90(s.tackles);
-    let fouls_p90 = per90(s.fouls_for);
+    let tackles_p90 = shrink(per90(s.tackles), baselines[0][g]);
+    let fouls_p90 = shrink(per90(s.fouls_for), baselines[1][g]);
     let fdrawn_p90 = per90(s.fouls_drawn);
     let cards_p90 = per90(s.cards);
     let passes_p90 = per90(s.passes);
-    let assists_p90 = per90(s.assists);
-    let saves_p90 = per90(s.saves);
+    let assists_p90 = shrink(per90(s.assists), baselines[2][g]);
+    let saves_p90 = shrink(per90(s.saves), baselines[3][g]);
     let min_scale = exp_min / 90.0;
     let is_keeper = s.position.to_lowercase().contains("goalkeeper") || s.position.eq_ignore_ascii_case("g");
 
@@ -311,12 +532,17 @@ pub fn build_player_candidates_entry(
                     "due_regression" => flags.push("due: healthy chances despite drought".to_string()),
                     _ => {}
                 }
+                let (est_b, gnote) = blend_consistency(est, con.goal_rate, con.apps);
+                est = est_b;
                 let mut sup = vec![
                     format!("goals/90 {:.2}", goals_p90),
                     format!("sot/90 {:.2}", sot_p90),
                     format!("proxy_xg/90 {:.2}", proxy_xg_p90),
                     format!("exp_min {:.0}", exp_min),
                 ];
+                if let Some(n) = gnote {
+                    sup.push(n);
+                }
                 // Honest context only (no probability change): tall players carry an
                 // aerial/set-piece edge the model can weigh.
                 if s.height_cm >= 188.0 {
@@ -337,27 +563,24 @@ pub fn build_player_candidates_entry(
             }
             "sot" => {
                 let lambda = sot_p90 * min_scale;
-                let (line, est) = if pois_ge2(lambda) >= 0.5 {
-                    ("2+ shots on target", pois_ge2(lambda))
+                let (line, base_est, rate) = if nb_ge2(lambda, PHI_P_SOT) >= 0.5 {
+                    ("2+ shots on target", nb_ge2(lambda, PHI_P_SOT), con.sot2_rate)
                 } else {
-                    ("1+ shot on target", pois_ge1(lambda))
+                    ("1+ shot on target", nb_ge1(lambda, PHI_P_SOT), con.sot1_rate)
                 };
-                out.push(base(
-                    "Shots on Target",
-                    "sot",
-                    line,
-                    sot_p90,
-                    est,
-                    vec![format!("sot/90 {:.2}", sot_p90), format!("exp_min {:.0}", exp_min)],
-                    vec![],
-                ));
+                let (est, note) = blend_consistency(base_est, rate, con.apps);
+                let mut sup = vec![format!("sot/90 {:.2}", sot_p90), format!("exp_min {:.0}", exp_min)];
+                if let Some(n) = note {
+                    sup.push(n);
+                }
+                out.push(base("Shots on Target", "sot", line, sot_p90, est, sup, vec![]));
             }
             "tackles" => {
                 let lambda = tackles_p90 * workload * min_scale;
-                let (line, est) = if pois_ge2(lambda) >= 0.45 {
-                    ("2+ tackles", pois_ge2(lambda))
+                let (line, est) = if nb_ge2(lambda, PHI_P_TACKLES) >= 0.45 {
+                    ("2+ tackles", nb_ge2(lambda, PHI_P_TACKLES))
                 } else {
-                    ("1+ tackle", pois_ge1(lambda))
+                    ("1+ tackle", nb_ge1(lambda, PHI_P_TACKLES))
                 };
                 out.push(base(
                     "Tackles",
@@ -374,10 +597,10 @@ pub fn build_player_candidates_entry(
             }
             "fouls" => {
                 let lf = fouls_p90 * workload * min_scale;
-                let (cline, cest) = if pois_ge2(lf) >= 0.4 {
-                    ("2+ fouls committed", pois_ge2(lf))
+                let (cline, cest) = if nb_ge2(lf, PHI_P_FOULS) >= 0.4 {
+                    ("2+ fouls committed", nb_ge2(lf, PHI_P_FOULS))
                 } else {
-                    ("1+ foul committed", pois_ge1(lf))
+                    ("1+ foul committed", nb_ge1(lf, PHI_P_FOULS))
                 };
                 out.push(base(
                     "Fouls Committed",
@@ -401,15 +624,19 @@ pub fn build_player_candidates_entry(
             }
             "cards" => {
                 let lambda = cards_p90 * workload * min_scale;
-                out.push(base(
-                    "To Be Carded",
-                    "cards",
-                    "1+ card",
-                    cards_p90,
-                    pois_ge1(lambda),
-                    vec![format!("cards/90 {:.2}", cards_p90)],
-                    vec!["card rate is noisy season-wide".to_string()],
-                ));
+                let (est, note) = blend_consistency(pois_ge1(lambda), con.card_rate, con.apps);
+                let mut sup = vec![format!("cards/90 {:.2}", cards_p90)];
+                let mut flags = vec![];
+                match note {
+                    Some(n) => {
+                        sup.push(n);
+                        if con.card_rate >= 0.5 && con.apps >= 3 {
+                            flags.push("consistent booking — carded most recent games".to_string());
+                        }
+                    }
+                    None => flags.push("card rate is noisy season-wide".to_string()),
+                }
+                out.push(base("To Be Carded", "cards", "1+ card", cards_p90, est, sup, flags));
             }
             "passes" => {
                 let expected = passes_p90 * min_scale;
@@ -435,10 +662,10 @@ pub fn build_player_candidates_entry(
                     continue;
                 }
                 let lambda = saves_p90 * min_scale;
-                let (line, est) = if pois_ge2(lambda * 1.5) >= 0.5 {
-                    ("3+ saves", 1.0 - pois_cdf(2, lambda))
+                let (line, est) = if nb_over(2, lambda, PHI_P_SAVES) >= 0.5 {
+                    ("3+ saves", nb_over(2, lambda, PHI_P_SAVES))
                 } else {
-                    ("2+ saves", 1.0 - pois_cdf(1, lambda))
+                    ("2+ saves", nb_over(1, lambda, PHI_P_SAVES))
                 };
                 out.push(base(
                     "Goalkeeper Saves",
@@ -472,18 +699,23 @@ pub fn build_player_candidates_entry(
             }
             "pshots" => {
                 let lambda = shots_p90 * min_scale;
-                let (line, est) = if pois_ge2(lambda) >= 0.5 {
-                    ("2+ shots", pois_ge2(lambda))
+                let (line, base_est, rate) = if nb_ge2(lambda, PHI_P_SHOTS) >= 0.5 {
+                    ("2+ shots", nb_ge2(lambda, PHI_P_SHOTS), con.shot2_rate)
                 } else {
-                    ("1+ shot", pois_ge1(lambda))
+                    ("1+ shot", nb_ge1(lambda, PHI_P_SHOTS), con.shot1_rate)
                 };
+                let (est, note) = blend_consistency(base_est, rate, con.apps);
+                let mut sup = vec![format!("shots/90 {:.2}", shots_p90), format!("exp_min {:.0}", exp_min)];
+                if let Some(n) = note {
+                    sup.push(n);
+                }
                 out.push(base(
                     "Player Shots",
                     "pshots",
                     line,
                     shots_p90,
                     est,
-                    vec![format!("shots/90 {:.2}", shots_p90), format!("exp_min {:.0}", exp_min)],
+                    sup,
                     vec![],
                 ));
             }
@@ -534,6 +766,12 @@ pub struct TeamStats {
     pub outbox_for: Option<f64>,
     pub inbox_for: Option<f64>,
     pub offsides_for: Option<f64>,
+    /// Recent card model: avg cards this team / the opponent per game, the rate
+    /// BOTH teams got a card, and the rate this team had the MOST cards.
+    pub cards_for: Option<f64>,
+    pub cards_against: Option<f64>,
+    pub both_card_rate: Option<f64>,
+    pub most_card_rate: Option<f64>,
 }
 
 pub fn parse_team_stats(json: &Value, name: &str) -> Option<TeamStats> {
@@ -595,6 +833,10 @@ pub fn parse_team_stats(json: &Value, name: &str) -> Option<TeamStats> {
         xg_against: None,
         corners_for: None,
         offsides_for: None,
+        cards_for: None,
+        cards_against: None,
+        both_card_rate: None,
+        most_card_rate: None,
         corners_against: None,
         shots_for: None,
         shots_against: None,
@@ -618,8 +860,17 @@ pub fn build_team_candidates(
     let h_against = home.xg_against.unwrap_or(home.ga_avg);
     let a_for = away.xg_for.unwrap_or(away.gf_avg);
     let a_against = away.xg_against.unwrap_or(away.ga_avg);
-    let lambda_home = ((h_for + a_against) / 2.0).max(0.05);
-    let lambda_away = ((a_for + h_against) / 2.0).max(0.05);
+    // Maher (1982) attack×defence interaction: a side's goal expectation is its
+    // attack rate times the opponent's conceded rate, normalized by a league
+    // baseline — so a strong attack against a leaky defence COMPOUNDS instead of
+    // averaging out. We damp 50/50 toward the plain mean to avoid over-
+    // extrapolating extreme mismatches from small samples.
+    let maher = |atk: f64, opp_conceded: f64| -> f64 {
+        let m = atk * opp_conceded / LEAGUE_AVG_GOALS;
+        0.5 * m + 0.5 * (atk + opp_conceded) / 2.0
+    };
+    let lambda_home = (maher(h_for, a_against) * HOME_ADV).max(0.05);
+    let lambda_away = (maher(a_for, h_against) * AWAY_ADJ).max(0.05);
     let xg_used = home.xg_for.is_some() && away.xg_for.is_some();
     let crude = if xg_used {
         "team line: real xG (recent form)".to_string()
@@ -651,31 +902,50 @@ pub fn build_team_candidates(
         plausibility: None,
     };
 
+    // Dixon-Coles-corrected joint score matrix, shared by every scoreline-derived
+    // market (BTTS / totals / correct score / goals range) so they're mutually
+    // consistent and account for low-score dependence.
+    let dc = dc_score_matrix(lambda_home, lambda_away, 8);
+    let p_total_le = |k: i64| -> f64 {
+        let mut s = 0.0;
+        for (h, row) in dc.iter().enumerate() {
+            for (a, p) in row.iter().enumerate() {
+                if (h + a) as i64 <= k {
+                    s += p;
+                }
+            }
+        }
+        s.clamp(0.0, 1.0)
+    };
+    let dc_note = format!("Dixon-Coles corrected (ρ {DC_RHO:+.2})");
+
     for g in groups {
         match g.as_str() {
             "btts" => {
-                let p_home = pois_ge1(lambda_home);
-                let p_away = pois_ge1(lambda_away);
+                let mut btts_yes = 0.0;
+                for row in dc.iter().skip(1) {
+                    for p in row.iter().skip(1) {
+                        btts_yes += p;
+                    }
+                }
+                btts_yes = btts_yes.clamp(0.0, 1.0);
                 out.push(mk(
                     "Both Teams",
                     "BTTS",
                     "btts",
                     "Yes",
-                    (p_home * p_away) * 100.0,
-                    p_home * p_away,
-                    vec![
-                        format!("xg_home {:.2}", lambda_home),
-                        format!("xg_away {:.2}", lambda_away),
-                    ],
+                    btts_yes * 100.0,
+                    btts_yes,
+                    vec![format!("xg_home {:.2}", lambda_home), format!("xg_away {:.2}", lambda_away), dc_note.clone()],
                 ));
             }
             "ou25" => {
                 let total = lambda_home + lambda_away;
                 // Both sides of each goal line so the user can isolate over OR under.
-                for thresh in [1u32, 2, 3] {
+                for thresh in [1i64, 2, 3] {
                     let line_val = thresh as f64 + 0.5;
-                    let over = 1.0 - pois_cdf(thresh, total);
-                    let sup = vec![format!("exp_goals {:.2}", total)];
+                    let over = (1.0 - p_total_le(thresh)).clamp(0.0, 1.0);
+                    let sup = vec![format!("exp_goals {:.2}", total), dc_note.clone()];
                     out.push(mk("Match", &format!("Over {line_val:.1} Goals"), "ou25", &format!("Over {line_val:.1}"), total, over, sup.clone()));
                     out.push(mk("Match", &format!("Under {line_val:.1} Goals"), "ou25", &format!("Under {line_val:.1}"), total, 1.0 - over, sup));
                 }
@@ -695,11 +965,11 @@ pub fn build_team_candidates(
                 }
             }
             "exactscore" => {
-                // Most-likely correct scores from the independent-Poisson grid.
-                let mut scores: Vec<((u32, u32), f64)> = Vec::new();
-                for h in 0u32..=5 {
-                    for a in 0u32..=5 {
-                        scores.push(((h, a), pois_pmf(h, lambda_home) * pois_pmf(a, lambda_away)));
+                // Most-likely correct scores from the DC-corrected score grid.
+                let mut scores: Vec<((usize, usize), f64)> = Vec::new();
+                for h in 0..=5usize {
+                    for a in 0..=5usize {
+                        scores.push(((h, a), dc[h][a]));
                     }
                 }
                 scores.sort_by(|x, y| y.1.partial_cmp(&x.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -712,18 +982,16 @@ pub fn build_team_candidates(
                         &line,
                         p,
                         clampp(p),
-                        vec![format!("xg {lambda_home:.2}-{lambda_away:.2}")],
+                        vec![format!("xg {lambda_home:.2}-{lambda_away:.2}"), dc_note.clone()],
                     ));
                 }
             }
             "goalsrange" => {
                 let total = lambda_home + lambda_away;
-                let sup = vec![format!("exp_goals {total:.2}")];
-                // (lo, hi) inclusive total-goals bands.
-                for (lo, hi) in [(0u32, 1u32), (2, 3), (4, 6)] {
-                    let p_hi = pois_cdf(hi, total);
-                    let p_lo = if lo == 0 { 0.0 } else { pois_cdf(lo - 1, total) };
-                    let p = (p_hi - p_lo).clamp(0.0, 1.0);
+                let sup = vec![format!("exp_goals {total:.2}"), dc_note.clone()];
+                // (lo, hi) inclusive total-goals bands, from the DC score grid.
+                for (lo, hi) in [(0i64, 1i64), (2, 3), (4, 6)] {
+                    let p = (p_total_le(hi) - p_total_le(lo - 1)).clamp(0.0, 1.0);
                     out.push(mk("Match", "Goals Range", "goalsrange", &format!("{lo}-{hi} goals"), total, clampp(p), sup.clone()));
                 }
             }
@@ -732,11 +1000,46 @@ pub fn build_team_candidates(
                     if let Some(lam) = cf {
                         for line in [2.5_f64, 3.5, 4.5, 5.5] {
                             let thr = line.floor() as u32;
-                            let over = 1.0 - pois_cdf(thr, lam);
-                            let sup = vec![format!("corners/g {lam:.1}")];
+                            let over = nb_over(thr, lam, PHI_CORNERS);
+                            let sup = vec![format!("corners/g {lam:.1}"), "Neg-Binomial".into()];
                             out.push(mk(team, "Team Corners", "tcorners", &format!("Over {line:.1}"), lam, over, sup.clone()));
                             out.push(mk(team, "Team Corners", "tcorners", &format!("Under {line:.1}"), lam, 1.0 - over, sup));
                         }
+                    }
+                }
+            }
+            "tcards" => {
+                // Team total cards O/U, from recent per-game card counts.
+                for (team, cf) in [(&home.name, home.cards_for), (&away.name, away.cards_for)] {
+                    if let Some(lam) = cf {
+                        for line in [1.5_f64, 2.5] {
+                            let thr = line.floor() as u32;
+                            let over = nb_over(thr, lam, PHI_CARDS);
+                            let sup = vec![format!("cards/g {lam:.1}"), "Neg-Binomial".into()];
+                            out.push(mk(team, "Team Total Cards", "tcards", &format!("Over {line:.1}"), lam, over, sup.clone()));
+                            out.push(mk(team, "Team Total Cards", "tcards", &format!("Under {line:.1}"), lam, 1.0 - over, sup));
+                        }
+                    }
+                }
+            }
+            "bothcards" => {
+                // Both teams to receive a card. Prefer the empirical recent rate;
+                // fall back to independent Poisson on each side's card rate.
+                let rate = home.both_card_rate.or(away.both_card_rate).or_else(|| {
+                    match (home.cards_for, away.cards_for) {
+                        (Some(h), Some(a)) => Some(pois_ge1(h) * pois_ge1(a)),
+                        _ => None,
+                    }
+                });
+                if let Some(p) = rate {
+                    out.push(mk("Both Teams", "Both Teams Carded", "bothcards", "Yes", p, clampp(p), vec!["recent card rate".to_string()]));
+                }
+            }
+            "mostcards" => {
+                // Which team picks up the most cards (cards 1x2).
+                for (team, mr) in [(&home.name, home.most_card_rate), (&away.name, away.most_card_rate)] {
+                    if let Some(p) = mr {
+                        out.push(mk(team, "Most Cards", "mostcards", "most cards", p, clampp(p), vec!["recent card edge".to_string()]));
                     }
                 }
             }
@@ -745,8 +1048,8 @@ pub fn build_team_candidates(
                     if let Some(lam) = of {
                         for line in [0.5_f64, 1.5, 2.5] {
                             let thr = line.floor() as u32;
-                            let over = 1.0 - pois_cdf(thr, lam);
-                            let sup = vec![format!("offsides/g {lam:.1}")];
+                            let over = nb_over(thr, lam, PHI_OFFSIDES);
+                            let sup = vec![format!("offsides/g {lam:.1}"), "Neg-Binomial".into()];
                             out.push(mk(team, "Team Offsides", "toffsides", &format!("Over {line:.1}"), lam, over, sup.clone()));
                             out.push(mk(team, "Team Offsides", "toffsides", &format!("Under {line:.1}"), lam, 1.0 - over, sup));
                         }
@@ -760,8 +1063,8 @@ pub fn build_team_candidates(
                         for off in [-2.5_f64, -0.5, 1.5] {
                             let line = (base + off).max(2.5);
                             let thr = line.floor() as u32;
-                            let over = 1.0 - pois_cdf(thr, lam);
-                            let sup = vec![format!("shots/g {lam:.1}")];
+                            let over = nb_over(thr, lam, PHI_SHOTS);
+                            let sup = vec![format!("shots/g {lam:.1}"), "Neg-Binomial".into()];
                             out.push(mk(team, "Team Shots", "tshots", &format!("Over {line:.1}"), lam, over, sup.clone()));
                             out.push(mk(team, "Team Shots", "tshots", &format!("Under {line:.1}"), lam, 1.0 - over, sup));
                         }
@@ -809,72 +1112,41 @@ pub fn build_team_candidates(
                 }
             }
             "win" => {
-                let diff = (home.ppg - away.ppg) + 0.3;
-                let raw_home = sigmoid(0.9 * diff);
-                let p_draw = 0.27;
-                let p_home = raw_home * (1.0 - p_draw);
-                let p_away = (1.0 - raw_home) * (1.0 - p_draw);
-                let sup = vec![format!("ppg {:.2} vs {:.2}", home.ppg, away.ppg)];
-                out.push(mk(&home.name, "Match Result", "win", "to win", p_home * 100.0, p_home, sup.clone()));
-                out.push(mk(&away.name, "Match Result", "win", "to win", p_away * 100.0, p_away, sup));
+                // Exact 1X2 from the Skellam difference of the two Poissons.
+                let (ph, pd, pa) = wdl_from_matrix(&dc);
+                let sup = vec![format!("xg {:.2} vs {:.2}", lambda_home, lambda_away), format!("draw {:.0}%", pd * 100.0), "Skellam (DC grid)".into()];
+                out.push(mk(&home.name, "Match Result", "win", "to win", ph * 100.0, ph, sup.clone()));
+                out.push(mk(&away.name, "Match Result", "win", "to win", pa * 100.0, pa, sup));
             }
             "dc" => {
-                let diff = (home.ppg - away.ppg) + 0.3;
-                let raw_home = sigmoid(0.9 * diff);
-                let p_draw = 0.27;
-                let p_home = raw_home * (1.0 - p_draw);
-                let p_away = (1.0 - raw_home) * (1.0 - p_draw);
-                let sup = vec![format!("ppg {:.2} vs {:.2}", home.ppg, away.ppg)];
-                out.push(mk(
-                    &format!("{} or draw", home.name),
-                    "Double Chance",
-                    "dc",
-                    "draw no bet-ish",
-                    (p_home + p_draw) * 100.0,
-                    p_home + p_draw,
-                    sup.clone(),
-                ));
-                out.push(mk(
-                    &format!("{} or draw", away.name),
-                    "Double Chance",
-                    "dc",
-                    "draw no bet-ish",
-                    (p_away + p_draw) * 100.0,
-                    p_away + p_draw,
-                    sup,
-                ));
+                let (ph, pd, pa) = wdl_from_matrix(&dc);
+                let sup = vec![format!("xg {:.2} vs {:.2}", lambda_home, lambda_away), "Skellam (DC grid)".into()];
+                out.push(mk(&format!("{} or draw", home.name), "Double Chance", "dc", "1X", (ph + pd) * 100.0, ph + pd, sup.clone()));
+                out.push(mk(&format!("{} or draw", away.name), "Double Chance", "dc", "X2", (pa + pd) * 100.0, pa + pd, sup));
             }
             "half1" => {
                 let lh = lambda_home * home.first_half_share;
                 let la = lambda_away * away.first_half_share;
-                let p_home = sigmoid(1.3 * (lh - la));
-                let (team, line, est) = if p_home >= 0.5 {
-                    (home.name.as_str(), "to win 1st half", p_home)
-                } else {
-                    (away.name.as_str(), "to win 1st half", 1.0 - p_home)
-                };
-                out.push(mk(team, "Win 1st Half", "half1", line, est * 100.0, est, vec![format!("1H xg {:.2} vs {:.2}", lh, la)]));
+                let (ph, _pd, pa) = wdl_from_matrix(&dc_score_matrix(lh, la, 6));
+                let (team, line, est) = if ph >= pa { (home.name.as_str(), "to win 1st half", ph) } else { (away.name.as_str(), "to win 1st half", pa) };
+                out.push(mk(team, "Win 1st Half", "half1", line, est * 100.0, est, vec![format!("1H xg {:.2} vs {:.2}", lh, la), "Skellam".into()]));
             }
             "half2" => {
                 let lh = lambda_home * (1.0 - home.first_half_share);
                 let la = lambda_away * (1.0 - away.first_half_share);
-                let p_home = sigmoid(1.3 * (lh - la));
-                let (team, line, est) = if p_home >= 0.5 {
-                    (home.name.as_str(), "to win 2nd half", p_home)
-                } else {
-                    (away.name.as_str(), "to win 2nd half", 1.0 - p_home)
-                };
-                out.push(mk(team, "Win 2nd Half", "half2", line, est * 100.0, est, vec![format!("2H xg {:.2} vs {:.2}", lh, la)]));
+                let (ph, _pd, pa) = wdl_from_matrix(&dc_score_matrix(lh, la, 6));
+                let (team, line, est) = if ph >= pa { (home.name.as_str(), "to win 2nd half", ph) } else { (away.name.as_str(), "to win 2nd half", pa) };
+                out.push(mk(team, "Win 2nd Half", "half2", line, est * 100.0, est, vec![format!("2H xg {:.2} vs {:.2}", lh, la), "Skellam".into()]));
             }
             "ahandicap" => {
-                let diff = (home.ppg - away.ppg) + 0.3; // home advantage
-                let p_home = sigmoid(0.9 * diff);
-                let (team, line, est) = if p_home >= 0.5 {
-                    (home.name.as_str(), "-0.5 (to win)", p_home)
-                } else {
-                    (away.name.as_str(), "+0.5 (draw/win)", 1.0 - p_home + 0.10)
-                };
-                out.push(mk(team, "Asian Handicap", "ahandicap", line, est * 100.0, clampp(est), vec![format!("ppg {:.2} vs {:.2}", home.ppg, away.ppg)]));
+                // Exact Asian-handicap lines from the goal-margin distribution.
+                let sup = vec![format!("xg {:.2} vs {:.2}", lambda_home, lambda_away), "Skellam margin".into()];
+                let home_2 = margin_ge_from_matrix(&dc, 2); // home wins by 2+
+                let home_1 = margin_ge_from_matrix(&dc, 1); // home wins
+                out.push(mk(&home.name, "Asian Handicap", "ahandicap", "-0.5 (to win)", home_1 * 100.0, clampp(home_1), sup.clone()));
+                out.push(mk(&home.name, "Asian Handicap", "ahandicap", "-1.5 (win by 2+)", home_2 * 100.0, clampp(home_2), sup.clone()));
+                out.push(mk(&away.name, "Asian Handicap", "ahandicap", "+0.5 (draw/win)", (1.0 - home_1) * 100.0, clampp(1.0 - home_1), sup.clone()));
+                out.push(mk(&away.name, "Asian Handicap", "ahandicap", "+1.5 (lose by ≤1)", (1.0 - home_2) * 100.0, clampp(1.0 - home_2), sup));
             }
             _ => {}
         }
@@ -934,6 +1206,23 @@ pub fn attach_odds(
             } else {
                 "dc|awaydraw"
             })),
+            "h1goals" => Some(odds.get(&format!("h1ou|{ou_side}|{ou_num}"))),
+            "h2goals" => Some(odds.get(&format!("h2ou|{ou_side}|{ou_num}"))),
+            "tcards" => {
+                let side = if is_home { "tcards_home" } else { "tcards_away" };
+                Some(odds.get(&format!("{side}|{ou_side}|{ou_num}")))
+            }
+            "toffsides" => {
+                let side = if is_home { "toffsides_home" } else { "toffsides_away" };
+                Some(odds.get(&format!("{side}|{ou_side}|{ou_num}")))
+            }
+            "bothcards" => Some(odds.get("bothcards|yes")),
+            "mostcards" => Some(odds.get(if is_home { "mostcards|home" } else { "mostcards|away" })),
+            "saves" => Some(odds.prop("saves", &c.subject, thr)),
+            "exactscore" => {
+                let score: String = c.line.chars().filter(|ch| ch.is_ascii_digit() || *ch == '-').collect();
+                Some(odds.get(&format!("exact|{score}")))
+            }
             _ => None,
         };
         if let Some((pin, book)) = priced {
@@ -1070,6 +1359,48 @@ fn power_score(c: &Candidate) -> f64 {
     }
 }
 
+/// "Banker" score: the safest, most repeatable legs to anchor an accumulator.
+/// Rewards high likelihood (sharp-blended), recurring event markets that happen
+/// most games, observed recency/consistency ("hit X/Y recent"), and a sane price
+/// band — and fades availability risk hard, because a banker has to actually play.
+pub fn banker_score(c: &Candidate) -> f64 {
+    let p = c.pinnacle_prob.map(|ps| 0.5 * ps + 0.5 * c.est_prob).unwrap_or(c.est_prob);
+    let mut s = p; // likelihood is the core
+    let recurring = matches!(
+        c.market_group.as_str(),
+        "cards" | "sot" | "pshots" | "fouls" | "tackles" | "passes" | "tcorners" | "tcards" | "saves" | "win" | "dc" | "ou25" | "btts"
+    );
+    if recurring {
+        s += 0.05;
+    }
+    if c.support.iter().any(|x| x.starts_with("hit ")) {
+        s += 0.12; // observed to happen most recent games → a trustworthy banker
+    }
+    if c.support.iter().any(|x| x.contains("consisten")) {
+        s += 0.05;
+    }
+    if let Some(o) = c.book_odds {
+        if o < 1.2 {
+            s -= 0.15; // too short to matter
+        } else if o > 2.4 {
+            s -= 0.25; // not a banker
+        } else if (1.3..=1.9).contains(&o) {
+            s += 0.05; // the sweet banker band
+        }
+    }
+    let has = |needle: &str| c.flags.iter().any(|f| f.contains(needle));
+    if has("unlikely to feature") {
+        s -= 0.6;
+    }
+    if has("minutes at risk") {
+        s -= 0.1;
+    }
+    if matches!(c.form_state.as_deref(), Some("cold_falling_off")) {
+        s -= 0.1;
+    }
+    s
+}
+
 // ---------- shortlist + compact table ----------
 
 /// Pre-filter for tokens: rank by likelihood boosted by +EV, capping each market
@@ -1089,6 +1420,26 @@ pub fn shortlist(mut cands: Vec<Candidate>, n: usize, mode: &str, per_market_cap
         "value" => c.est_prob + c.ev.unwrap_or(0.0).max(0.0) * 1.5,
         "oracle" => oracle_score(c),
         "power" => power_score(c),
+        "bankers" => {
+            // Reliable RECURRING events: high probability, bonus for markets that
+            // repeat game-to-game, extra for a real recent hit-rate (consistency).
+            let recurring = matches!(
+                c.market_group.as_str(),
+                "cards" | "sot" | "pshots" | "fouls" | "tackles" | "passes" | "scorer" | "tcorners" | "tcards" | "tshots"
+            );
+            let has_recent = c.support.iter().any(|s| s.starts_with("hit "));
+            let mut s = c.est_prob;
+            if recurring {
+                s += 0.05;
+            }
+            if has_recent {
+                s += 0.12; // observed to happen most recent games → a trustworthy banker
+            }
+            if c.flags.iter().any(|f| f.contains("unlikely to feature")) {
+                s -= 0.5;
+            }
+            s
+        }
         "favorites" => {
             // Reward a useful odds band; penalise odds-on chalk; weigh form.
             let band = match c.book_odds {

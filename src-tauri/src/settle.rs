@@ -43,6 +43,8 @@ struct FixtureResult {
     away_inbox: Option<f64>,
     home_offsides: Option<f64>,
     away_offsides: Option<f64>,
+    home_cards: f64,
+    away_cards: f64,
     players: HashMap<String, PlayerLine>,
 }
 
@@ -145,8 +147,10 @@ async fn fetch_result(state: &AppState, fixture_id: i64) -> Option<FixtureResult
         af::cached_get(state, "/fixtures/players", players_params, TTL_RESULT).await
     };
     let mut players = HashMap::new();
+    let mut cards_by_team: HashMap<i64, f64> = HashMap::new();
     if let Ok(pj) = pj_res {
         for team in response_array(&pj) {
+            let tid = team.get("team").and_then(|t| t.get("id")).and_then(|v| v.as_i64()).unwrap_or(-1);
             if let Some(arr) = team.get("players").and_then(|p| p.as_array()) {
                 for p in arr {
                     let name = crate::odds::fold(
@@ -162,6 +166,8 @@ async fn fetch_result(state: &AppState, fixture_id: i64) -> Option<FixtureResult
                     let g = |a: &str, b: &str| {
                         s.and_then(|st| st.get(a)).and_then(|x| x.get(b)).map(num).unwrap_or(0.0)
                     };
+                    let cards = g("cards", "yellow") + g("cards", "red");
+                    *cards_by_team.entry(tid).or_insert(0.0) += cards;
                     players.insert(
                         name,
                         PlayerLine {
@@ -172,7 +178,7 @@ async fn fetch_result(state: &AppState, fixture_id: i64) -> Option<FixtureResult
                             tackles: g("tackles", "total"),
                             fouls_committed: g("fouls", "committed"),
                             fouls_drawn: g("fouls", "drawn"),
-                            cards: g("cards", "yellow") + g("cards", "red"),
+                            cards,
                             passes: g("passes", "total"),
                             saves: g("goals", "saves"),
                         },
@@ -184,6 +190,9 @@ async fn fetch_result(state: &AppState, fixture_id: i64) -> Option<FixtureResult
 
     // Team corners / shots from fixture statistics (covered leagues).
     let home_id = teams.and_then(|t| t.get("home")).and_then(|h| h.get("id")).and_then(|v| v.as_i64());
+    let away_id = teams.and_then(|t| t.get("away")).and_then(|h| h.get("id")).and_then(|v| v.as_i64());
+    let home_cards = home_id.and_then(|id| cards_by_team.get(&id).copied()).unwrap_or(0.0);
+    let away_cards = away_id.and_then(|id| cards_by_team.get(&id).copied()).unwrap_or(0.0);
     let (mut home_corners, mut away_corners, mut home_shots, mut away_shots) = (None, None, None, None);
     let (mut home_outbox, mut away_outbox, mut home_inbox, mut away_inbox) = (None, None, None, None);
     let (mut home_offsides, mut away_offsides) = (None, None);
@@ -237,6 +246,8 @@ async fn fetch_result(state: &AppState, fixture_id: i64) -> Option<FixtureResult
         away_inbox,
         home_offsides,
         away_offsides,
+        home_cards,
+        away_cards,
         players,
     })
 }
@@ -307,6 +318,24 @@ fn grade_leg(leg: &TicketLeg, r: &FixtureResult) -> LegResult {
             r.home_goals > 0.0 && r.away_goals > 0.0,
             format!("FT {}-{}", r.home_goals as i64, r.away_goals as i64),
         ),
+        "Both Teams Carded" => won(
+            r.home_cards >= 1.0 && r.away_cards >= 1.0,
+            format!("cards {}-{}", r.home_cards as i64, r.away_cards as i64),
+        ),
+        "Most Cards" => {
+            let sel = leg.selection.to_lowercase();
+            let is_home = r.home_name.to_lowercase().contains(&sel) || sel.contains(&r.home_name.to_lowercase());
+            let (mine, theirs) = if is_home { (r.home_cards, r.away_cards) } else { (r.away_cards, r.home_cards) };
+            won(mine > theirs, format!("cards {}-{}", r.home_cards as i64, r.away_cards as i64))
+        }
+        "Team Total Cards" => {
+            let sel = leg.selection.to_lowercase();
+            let is_home = r.home_name.to_lowercase().contains(&sel) || sel.contains(&r.home_name.to_lowercase());
+            let val = if is_home { r.home_cards } else { r.away_cards };
+            let thr: f64 = line.chars().filter(|c| c.is_ascii_digit() || *c == '.').collect::<String>().parse().unwrap_or(1.5);
+            let hit = if line.to_lowercase().contains("over") { val > thr } else { val < thr };
+            won(hit, format!("{} {} cards", leg.selection, val as i64))
+        }
         "Correct Score" => {
             let p: Vec<i64> = line.split('-').filter_map(|s| s.trim().parse().ok()).collect();
             if p.len() == 2 {
@@ -366,19 +395,22 @@ fn grade_leg(leg: &TicketLeg, r: &FixtureResult) -> LegResult {
             }
         }
         "Asian Handicap" => {
-            // "-0.5 (to win)" — the named team must win outright.
+            // Line carries the signed handicap, e.g. "-1.5 (win by 2+)" → -1.5.
+            // The named team covers iff (its margin) + handicap > 0. Works for any
+            // half-line (-0.5/+0.5/-1.5/+1.5…) and is backward-compatible.
             let is_home = leg.selection.eq_ignore_ascii_case(&r.home_name);
             let (gf, ga) = if is_home {
                 (r.home_goals, r.away_goals)
             } else {
                 (r.away_goals, r.home_goals)
             };
-            if line.contains("to win") {
-                won(gf > ga, format!("FT {}-{}", r.home_goals as i64, r.away_goals as i64))
-            } else {
-                // "+0.5 (draw/win)" — not lose
-                won(gf >= ga, format!("FT {}-{}", r.home_goals as i64, r.away_goals as i64))
-            }
+            let hcap: f64 = line
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-' || *c == '+')
+                .collect::<String>()
+                .parse()
+                .unwrap_or(0.0);
+            won((gf - ga) as f64 + hcap > 0.0, format!("FT {}-{}", r.home_goals as i64, r.away_goals as i64))
         }
         "Win 1st Half" => match (r.ht_home, r.ht_away) {
             (Some(h), Some(a)) => {

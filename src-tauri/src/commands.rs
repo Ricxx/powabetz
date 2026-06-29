@@ -660,6 +660,196 @@ async fn fetch_inform(state: &AppState, league: i64, season: i64) -> HashSet<Str
     set
 }
 
+/// Per-player CONSISTENCY (recent hit-rates) for a team — fetched from the team's
+/// recent fixtures' /fixtures/players (cached, shared across all the team's
+/// players). Keyed by folded player name. ~7 cached calls per team.
+async fn fetch_consistency(
+    state: &AppState,
+    team_id: i64,
+    _season: i64,
+) -> HashMap<String, features::Consistency> {
+    let mut acc: HashMap<String, (u32, [u32; 9])> = HashMap::new();
+    let lj = match af::cached_get(
+        state,
+        "/fixtures",
+        vec![("team", team_id.to_string()), ("last", "6".to_string())],
+        af::TTL_ODDS,
+    )
+    .await
+    {
+        Ok(j) => j,
+        Err(_) => return HashMap::new(),
+    };
+    for f in response_array(&lj) {
+        let short = f.get("fixture").and_then(|x| x.get("status")).and_then(|s| s.get("short")).and_then(|v| v.as_str()).unwrap_or("");
+        if !matches!(short, "FT" | "AET" | "PEN") {
+            continue;
+        }
+        let fid = match f.get("fixture").and_then(|x| x.get("id")).and_then(|v| v.as_i64()) {
+            Some(i) => i,
+            None => continue,
+        };
+        let pj = match af::cached_get(state, "/fixtures/players", vec![("fixture", fid.to_string())], af::TTL_PLAYERS * 7).await {
+            Ok(j) => j,
+            Err(_) => continue,
+        };
+        for team in response_array(&pj) {
+            if team.get("team").and_then(|t| t.get("id")).and_then(|v| v.as_i64()) != Some(team_id) {
+                continue;
+            }
+            let players = match team.get("players").and_then(|p| p.as_array()) {
+                Some(p) => p,
+                None => continue,
+            };
+            for p in players {
+                let name = p.get("player").and_then(|x| x.get("name")).and_then(|v| v.as_str()).unwrap_or("");
+                if name.is_empty() {
+                    continue;
+                }
+                let st = match p.get("statistics").and_then(|x| x.as_array()).and_then(|a| a.first()) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let mins = st.get("games").and_then(|g| g.get("minutes")).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                if mins <= 0.0 {
+                    continue; // didn't actually play → don't count the appearance
+                }
+                let g = |a: &str, b: &str| st.get(a).and_then(|x| x.get(b)).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let (cards, shots, sot) = (g("cards", "yellow") + g("cards", "red"), g("shots", "total"), g("shots", "on"));
+                let (goals, assists, tackles, fouls) = (g("goals", "total"), g("goals", "assists"), g("tackles", "total"), g("fouls", "committed"));
+                let e = acc.entry(crate::odds::fold(name)).or_insert((0, [0u32; 9]));
+                e.0 += 1;
+                let hit = |c: bool, slot: &mut u32| if c { *slot += 1 };
+                hit(cards >= 1.0, &mut e.1[0]);
+                hit(shots >= 1.0, &mut e.1[1]);
+                hit(shots >= 2.0, &mut e.1[2]);
+                hit(sot >= 1.0, &mut e.1[3]);
+                hit(sot >= 2.0, &mut e.1[4]);
+                hit(goals >= 1.0, &mut e.1[5]);
+                hit(assists >= 1.0, &mut e.1[6]);
+                hit(tackles >= 2.0, &mut e.1[7]);
+                hit(fouls >= 1.0, &mut e.1[8]);
+            }
+        }
+    }
+    acc.into_iter()
+        .map(|(name, (apps, h))| {
+            let r = |i: usize| if apps > 0 { h[i] as f64 / apps as f64 } else { 0.0 };
+            (
+                name,
+                features::Consistency {
+                    apps,
+                    card_rate: r(0),
+                    shot1_rate: r(1),
+                    shot2_rate: r(2),
+                    sot1_rate: r(3),
+                    sot2_rate: r(4),
+                    goal_rate: r(5),
+                    assist_rate: r(6),
+                    tackle2_rate: r(7),
+                    foul1_rate: r(8),
+                },
+            )
+        })
+        .collect()
+}
+
+/// Team card model from recent fixtures (cached /fixtures/players, shared with
+/// `fetch_consistency`): (cards_for_avg, cards_against_avg, both-carded rate,
+/// most-cards rate). None if too few games.
+async fn fetch_team_cards(
+    state: &AppState,
+    team_id: i64,
+    _season: i64,
+) -> (Option<f64>, Option<f64>, Option<f64>, Option<f64>) {
+    let lj = match af::cached_get(
+        state,
+        "/fixtures",
+        vec![("team", team_id.to_string()), ("last", "6".to_string())],
+        af::TTL_ODDS,
+    )
+    .await
+    {
+        Ok(j) => j,
+        Err(_) => return (None, None, None, None),
+    };
+    let (mut n, mut cf, mut ca, mut both, mut most) = (0u32, 0.0f64, 0.0f64, 0u32, 0u32);
+    for f in response_array(&lj) {
+        let short = f.get("fixture").and_then(|x| x.get("status")).and_then(|s| s.get("short")).and_then(|v| v.as_str()).unwrap_or("");
+        if !matches!(short, "FT" | "AET" | "PEN") {
+            continue;
+        }
+        let fid = match f.get("fixture").and_then(|x| x.get("id")).and_then(|v| v.as_i64()) {
+            Some(i) => i,
+            None => continue,
+        };
+        let pj = match af::cached_get(state, "/fixtures/players", vec![("fixture", fid.to_string())], af::TTL_PLAYERS * 7).await {
+            Ok(j) => j,
+            Err(_) => continue,
+        };
+        let (mut our, mut opp) = (0.0f64, 0.0f64);
+        for team in response_array(&pj) {
+            let is_us = team.get("team").and_then(|t| t.get("id")).and_then(|v| v.as_i64()) == Some(team_id);
+            let sum: f64 = team
+                .get("players")
+                .and_then(|p| p.as_array())
+                .map(|players| {
+                    players
+                        .iter()
+                        .map(|p| {
+                            let st = p.get("statistics").and_then(|x| x.as_array()).and_then(|a| a.first());
+                            let g = |b: &str| st.and_then(|s| s.get("cards")).and_then(|c| c.get(b)).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                            g("yellow") + g("red")
+                        })
+                        .sum()
+                })
+                .unwrap_or(0.0);
+            if is_us {
+                our += sum;
+            } else {
+                opp += sum;
+            }
+        }
+        n += 1;
+        cf += our;
+        ca += opp;
+        if our >= 1.0 && opp >= 1.0 {
+            both += 1;
+        }
+        if our > opp {
+            most += 1;
+        }
+    }
+    if n < 2 {
+        return (None, None, None, None);
+    }
+    let nf = n as f64;
+    (Some(cf / nf), Some(ca / nf), Some(both as f64 / nf), Some(most as f64 / nf))
+}
+
+/// Estimate a referee's strictness (avg cards/game) via a cheap cached Haiku call.
+/// There's no referee-stats endpoint, so this is a MODEL ESTIMATE (flagged as
+/// such on the picks) — used to nudge card markets, not presented as measured.
+async fn fetch_ref_strictness(state: &AppState, referee: &str) -> Option<f64> {
+    let key = format!("ref-cards-v1:{}", crate::odds::fold(referee));
+    if let Ok(conn) = state.db.lock() {
+        if let Ok(Some(v)) = db::ai_get(&conn, &key) {
+            return v.parse::<f64>().ok();
+        }
+    }
+    let model = "claude-haiku-4-5";
+    let sys = "You estimate a football referee's disciplinary strictness. Reply with ONLY a single number: the average total cards (yellows + reds) this referee shows per match. If you don't know the referee, reply 4.";
+    let user = format!("Referee: {referee}. Average cards per match?");
+    let (txt, gin, gout) = llm::chat_call(state, model, sys, &user, 20).await.ok()?;
+    let num: f64 = txt.chars().filter(|c| c.is_ascii_digit() || *c == '.').collect::<String>().parse().ok()?;
+    let num = num.clamp(2.0, 7.5);
+    if let Ok(conn) = state.db.lock() {
+        let _ = db::usage_add(&conn, af::now_ts(), model, gin, gout, "referee");
+        let _ = db::ai_put(&conn, &key, &num.to_string(), model, af::now_ts());
+    }
+    Some(num)
+}
+
 /// Formation per team from the (cached) lineups response.
 async fn fetch_formations(state: &AppState, fixture_id: i64) -> HashMap<i64, String> {
     let mut out = HashMap::new();
@@ -777,10 +967,10 @@ fn map_availability(kind: &str, reason: &str) -> String {
 
 // ---------- build tickets ----------
 
-const ALL_MARKETS: [&str; 24] = [
+const ALL_MARKETS: [&str; 27] = [
     "scorer", "sot", "pshots", "assists", "tackles", "fouls", "cards", "passes", "win", "dc",
     "btts", "half1", "half2", "ou25", "tgoals", "tcorners", "tshots", "ahandicap", "h1goals",
-    "h2goals", "exactscore", "goalsrange", "saves", "toffsides",
+    "h2goals", "exactscore", "goalsrange", "saves", "toffsides", "tcards", "bothcards", "mostcards",
 ];
 
 /// Fetch a team's full player list + season stats (paged), for auto candidate
@@ -1375,7 +1565,9 @@ pub async fn build_tickets(
             }
         }
         if let Some(r) = &fx.referee {
-            pred_notes.push(format!("{fixture_label}: referee {r}."));
+            pred_notes.push(format!(
+                "{fixture_label}: referee {r} — use your knowledge of this ref's card tendency when weighing card markets (a strict ref lifts to-be-carded / team-cards / both-teams-card; a lenient one lowers them).",
+            ));
         }
 
         // Coach / formation / play-style profile (cheap Haiku, cached). Helps the
@@ -1416,7 +1608,9 @@ pub async fn build_tickets(
                 (fx.home_team_id, fx.home_team.clone(), true, fx.away_team.clone()),
                 (fx.away_team_id, fx.away_team.clone(), false, fx.home_team.clone()),
             ] {
+                let consistency = fetch_consistency(&state, team_id, fx.season).await;
                 let entries = fetch_team_players(&state, team_id, fx.season).await.unwrap_or_default();
+                let baselines = features::squad_baselines(&entries, fx.league_id);
                 let team_starters = starters.get(&team_id);
                 // If lineups are out for this team, keep only confirmed starters.
                 let entries: Vec<Value> = match team_starters {
@@ -1453,6 +1647,8 @@ pub async fn build_tickets(
                         &ctx,
                         &player_groups,
                         &in_form,
+                        &consistency,
+                        &baselines,
                     ));
                 }
             }
@@ -1512,8 +1708,43 @@ pub async fn build_tickets(
                     }
                 }
             }
+            // Recent card model for the card markets (cached /fixtures/players).
+            if team_groups.iter().any(|m| matches!(m.as_str(), "tcards" | "bothcards" | "mostcards")) {
+                let hc = fetch_team_cards(&state, fx.home_team_id, fx.season).await;
+                let ac = fetch_team_cards(&state, fx.away_team_id, fx.season).await;
+                if let Some(h) = home.as_mut() {
+                    h.cards_for = hc.0;
+                    h.cards_against = hc.1;
+                    h.both_card_rate = hc.2;
+                    h.most_card_rate = hc.3;
+                }
+                if let Some(a) = away.as_mut() {
+                    a.cards_for = ac.0;
+                    a.cards_against = ac.1;
+                    a.both_card_rate = ac.2;
+                    a.most_card_rate = ac.3;
+                }
+            }
             if let (Some(h), Some(a)) = (home, away) {
                 candidates.extend(features::build_team_candidates(&h, &a, &fixture_label, fx.fixture_id, &team_groups));
+            }
+        }
+
+        // Referee-aware cards: nudge this fixture's card markets by the ref's
+        // estimated strictness (flagged as a model estimate, never as measured).
+        let card_picked = player_groups.iter().chain(team_groups.iter()).any(|m| matches!(m.as_str(), "cards" | "tcards" | "bothcards"));
+        if card_picked {
+            if let Some(r) = &fx.referee {
+                if let Some(strict) = fetch_ref_strictness(&state, r).await {
+                    let mult = (strict / 4.2).clamp(0.78, 1.3);
+                    for c in candidates[fx_start..].iter_mut() {
+                        if matches!(c.market_group.as_str(), "cards" | "tcards" | "bothcards") {
+                            let m = if c.line.to_lowercase().contains("under") { 1.0 / mult } else { mult };
+                            c.est_prob = round4((c.est_prob * m).clamp(0.02, 0.98));
+                            c.support.push(format!("referee ~{strict:.1} cards/game (model estimate)"));
+                        }
+                    }
+                }
             }
         }
 
@@ -1617,6 +1848,7 @@ pub async fn build_tickets(
         "favorites" => (70, 14),
         "oracle" => (60, 8),  // Claude's read — selective, diverse across markets
         "power" => (64, 7),   // power stacker — generous-priced bankers, tight per-market
+        "bankers" => (80, 16), // wide net of reliable recurring events
         _ => (50, 8),         // value
     };
     // Make sure the pool is big enough to actually BUILD the requested slate: with
@@ -1847,6 +2079,41 @@ pub async fn get_picks(
     Ok(candidates)
 }
 
+/// The Bankers board: the safest, most repeatable legs across the slate, ranked
+/// by `banker_score` — high likelihood, recurring events, observed recency, sane
+/// price, must-play. Deterministic, no model call. Anchor an acca with these.
+#[tauri::command]
+pub async fn get_bankers(
+    state: State<'_, AppState>,
+    fixtures: Vec<FixtureInput>,
+    markets: Vec<String>,
+) -> Result<Vec<Candidate>, String> {
+    if fixtures.is_empty() {
+        return Err("Select at least one match first.".to_string());
+    }
+    let markets: Vec<String> = if markets.is_empty() {
+        ALL_MARKETS.iter().map(|s| s.to_string()).collect()
+    } else {
+        markets
+    };
+    let books = {
+        let keys = state.keys.lock().map_err(|_| "keys lock")?;
+        keys.books.clone()
+    };
+
+    let mut candidates = gather_candidates(&state, &fixtures, &markets, &books).await;
+    let consensus = |x: &Candidate| x.pinnacle_prob.map(|p| 0.5 * p + 0.5 * x.est_prob).unwrap_or(x.est_prob);
+    // Keep only genuinely likely, must-play legs — the bar for a "banker".
+    candidates.retain(|x| consensus(x) >= 0.58 && !x.flags.iter().any(|f| f.contains("unlikely to feature")));
+    candidates.sort_by(|a, b| {
+        features::banker_score(b)
+            .partial_cmp(&features::banker_score(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    candidates.truncate(120);
+    Ok(candidates)
+}
+
 /// Build team + player candidates (with odds/EV) for the selected fixtures and
 /// markets. Shared by the picks board and the accumulator ladder.
 async fn gather_candidates(
@@ -1873,7 +2140,9 @@ async fn gather_candidates(
                 (fx.home_team_id, fx.home_team.clone(), true, fx.away_team.clone()),
                 (fx.away_team_id, fx.away_team.clone(), false, fx.home_team.clone()),
             ] {
+                let consistency = fetch_consistency(state, team_id, fx.season).await;
                 let entries = fetch_team_players(state, team_id, fx.season).await.unwrap_or_default();
+                let baselines = features::squad_baselines(&entries, fx.league_id);
                 for entry in top_players(entries, 24) {
                     let availability = entry
                         .get("player")
@@ -1889,7 +2158,7 @@ async fn gather_candidates(
                         is_home,
                         availability,
                     };
-                    candidates.extend(features::build_player_candidates_entry(&entry, fx.league_id, &ctx, &player_groups, &in_form));
+                    candidates.extend(features::build_player_candidates_entry(&entry, fx.league_id, &ctx, &player_groups, &in_form, &consistency, &baselines));
                 }
             }
         }
@@ -1915,6 +2184,22 @@ async fn gather_candidates(
                     if let Some(f) = fetch_team_form(state, fx.away_team_id).await {
                         apply(a, &f);
                     }
+                }
+            }
+            if team_groups.iter().any(|m| matches!(m.as_str(), "tcards" | "bothcards" | "mostcards")) {
+                let hc = fetch_team_cards(state, fx.home_team_id, fx.season).await;
+                let ac = fetch_team_cards(state, fx.away_team_id, fx.season).await;
+                if let Some(h) = home.as_mut() {
+                    h.cards_for = hc.0;
+                    h.cards_against = hc.1;
+                    h.both_card_rate = hc.2;
+                    h.most_card_rate = hc.3;
+                }
+                if let Some(a) = away.as_mut() {
+                    a.cards_for = ac.0;
+                    a.cards_against = ac.1;
+                    a.both_card_rate = ac.2;
+                    a.most_card_rate = ac.3;
                 }
             }
             if let (Some(h), Some(a)) = (home, away) {
@@ -1997,6 +2282,77 @@ fn ladder_prefer(new: &Candidate, cur: &Candidate, min_prob: f64) -> bool {
         (false, true) => false,
         (false, false) => new.est_prob > cur.est_prob,
     }
+}
+
+/// Goal/result markets that constrain the final scoreline — used to reject
+/// logically impossible ladder tickets.
+fn is_goal_market(g: &str) -> bool {
+    matches!(
+        g,
+        "ou25" | "tgoals" | "btts" | "win" | "dc" | "exactscore" | "goalsrange" | "h1goals" | "h2goals" | "ahandicap"
+    )
+}
+
+/// Is candidate `c` consistent with a final score of (h home, a away)? Returns
+/// true for non-goal markets (they don't constrain the score).
+fn goal_ok(c: &Candidate, home_team: &str, h: i32, a: i32) -> bool {
+    if !is_goal_market(&c.market_group) {
+        return true;
+    }
+    let is_home = c.subject == home_team || c.team == home_team;
+    let line = c.line.to_lowercase();
+    // Floor of the half-line, e.g. "over 1.5" → 1.
+    let x: i32 = line
+        .chars()
+        .filter(|ch| ch.is_ascii_digit())
+        .collect::<String>()
+        .parse::<f64>()
+        .map(|v| v as i32)
+        .unwrap_or(0);
+    let over = line.contains("over");
+    match c.market_group.as_str() {
+        "ou25" => if over { h + a >= x + 1 } else { h + a <= x },
+        "tgoals" => {
+            let g = if is_home { h } else { a };
+            if over { g >= x + 1 } else { g <= x }
+        }
+        "btts" => if line.contains("no") { h == 0 || a == 0 } else { h >= 1 && a >= 1 },
+        "win" => if is_home { h > a } else { a > h },
+        "dc" => {
+            // Named-team double chance → that team doesn't lose. (homeaway is rare; treat leniently.)
+            let (g, o) = if is_home { (h, a) } else { (a, h) };
+            g >= o
+        }
+        "ahandicap" => if line.contains("to win") { if is_home { h > a } else { a > h } } else { true },
+        "exactscore" => {
+            let p: Vec<i32> = c.line.split('-').filter_map(|s| s.trim().parse().ok()).collect();
+            p.len() == 2 && h == p[0] && a == p[1]
+        }
+        "goalsrange" => {
+            let n: Vec<i32> = c.line.split(|ch: char| !ch.is_ascii_digit()).filter_map(|s| s.parse().ok()).collect();
+            n.len() >= 2 && (h + a) >= n[0] && (h + a) <= n[1]
+        }
+        // Half goals bound the TOTAL from below on the over side only (1H/2H ≤ total).
+        "h1goals" | "h2goals" => !over || h + a >= x + 1,
+        _ => true,
+    }
+}
+
+/// Can the goal/result legs of one fixture all be true at once? Checks a small
+/// scoreline grid — false means the combination is impossible.
+fn goals_satisfiable(legs: &[Candidate], home_team: &str) -> bool {
+    let gr: Vec<&Candidate> = legs.iter().filter(|c| is_goal_market(&c.market_group)).collect();
+    if gr.len() < 2 {
+        return true;
+    }
+    for h in 0..=8 {
+        for a in 0..=8 {
+            if gr.iter().all(|c| goal_ok(c, home_team, h, a)) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Deterministic accumulator ladder: an all-match acca of the selected markets
@@ -2098,7 +2454,7 @@ pub async fn build_ladder(
     // and SOT — those are nested/correlated), and one per (match, team-market
     // family) so we never put Over 1.5 AND Over 2.5 on the same ticket.
     let mut player_best: HashMap<String, Candidate> = HashMap::new();
-    let mut team_best: HashMap<(String, String), Candidate> = HashMap::new();
+    let mut team_best: HashMap<String, Candidate> = HashMap::new();
     for c in candidates {
         if c.subject_kind == "player" {
             let k = c.subject.to_lowercase();
@@ -2109,7 +2465,10 @@ pub async fn build_ladder(
                 }
             }
         } else {
-            let k = (c.fixture.clone(), c.market_group.clone());
+            // Keep distinct lines per team (so SA's and Canada's team-goals are
+            // BOTH available, and alt goal-lines / scorelines survive) — far more
+            // pool variety. The in-ticket guards below stop conflicts.
+            let k = format!("{}||{}||{}||{}", c.fixture, c.market_group, c.subject, c.line);
             match team_best.get(&k) {
                 Some(e) if !ladder_prefer(&c, e, min_prob) => {}
                 _ => {
@@ -2167,6 +2526,12 @@ pub async fn build_ladder(
         let off = (variation.wrapping_mul(3)) % legs.len();
         legs.rotate_left(off);
     }
+
+    // fixture label → home team name, for the scoreline contradiction guard.
+    let home_by_fix: HashMap<String, String> = fixtures
+        .iter()
+        .map(|f| (format!("{} vs {}", f.home_team, f.away_team), f.home_team.clone()))
+        .collect();
 
     // Diversity key: the entity that shouldn't appear in too many tickets — a
     // player, a named team, or (for match-level BTTS/O-U) the fixture. Applied to
@@ -2226,6 +2591,17 @@ pub async fn build_ladder(
                 || *subj_used.get(&k).unwrap_or(&0) >= cap
             {
                 continue;
+            }
+            // Contradiction guard: the goal/result legs of this fixture + c must be
+            // jointly satisfiable by SOME scoreline — no impossible tickets.
+            if is_goal_market(&c.market_group) {
+                let home = home_by_fix.get(&c.fixture).map(|s| s.as_str()).unwrap_or("");
+                let mut same: Vec<Candidate> =
+                    chosen.iter().filter(|x| x.fixture == c.fixture).cloned().collect();
+                same.push(c.clone());
+                if !goals_satisfiable(&same, home) {
+                    continue;
+                }
             }
             // Fill to min_legs regardless of the target; the target only stops us
             // from adding MORE legs once the floor is met.
@@ -2604,24 +2980,33 @@ fn calibration_from_pairs(pairs: Vec<(f64, f64)>) -> CalibrationReport {
         });
     }
 
-    // Slope through origin of (outcome−0.5) on (pred−0.5).
+    // Slope through origin of (outcome−0.5) on (pred−0.5): the raw reliability.
     let (mut num, mut den) = (0.0, 0.0);
     for (p, o) in &pairs {
         let x = p - 0.5;
         num += x * (o - 0.5);
         den += x * x;
     }
-    let lambda = if den > 1e-9 { (num / den).clamp(0.3, 1.2) } else { 1.0 };
+    let raw_slope = if den > 1e-9 { (num / den).clamp(0.3, 1.2) } else { 1.0 };
+
+    // Sample-size-aware (empirical-Bayes) shrinkage of the slope toward 1.0
+    // (no adjustment): trust the measured slope more as evidence accumulates,
+    // so a handful of unlucky legs can't yank everyone's probabilities around.
+    // w = n / (n + K); at n=30 w≈0.20, at n=500 w≈0.81.
+    const CALIB_K: f64 = 120.0;
+    let w = n as f64 / (n as f64 + CALIB_K);
+    let lambda = 1.0 + w * (raw_slope - 1.0);
     let applied = n >= CALIB_MIN_N;
 
     let verdict = if n < CALIB_MIN_N {
         format!("Need more settled legs to assess calibration ({n}/{CALIB_MIN_N}).")
-    } else if lambda < 0.9 {
+    } else if raw_slope < 0.9 {
         format!(
-            "Overconfident — edges shrunk ~{}% toward 50/50 in new builds.",
-            ((1.0 - lambda) * 100.0).round()
+            "Overconfident — shrinking edges ~{}% toward 50/50 (weighted {}% to {n} legs of evidence).",
+            ((1.0 - lambda) * 100.0).round(),
+            (w * 100.0).round()
         )
-    } else if lambda > 1.1 {
+    } else if raw_slope > 1.1 {
         "Underconfident — your real edge is a touch bigger than estimated.".to_string()
     } else {
         "Well calibrated — no material adjustment needed.".to_string()
@@ -2838,6 +3223,399 @@ pub fn export_extension(app: tauri::AppHandle) -> Result<String, String> {
     };
     let _ = std::process::Command::new(opener).arg(&dir).spawn();
     Ok(dir.to_string_lossy().to_string())
+}
+
+// ---------- in-play / live ----------
+
+const TTL_LIVE_SHORT: i64 = 15; // live data: refresh after 15s, reuse within
+
+fn pois_ge(k: u32, l: f64) -> f64 {
+    let mut term = (-l).exp();
+    let mut cdf = term;
+    for i in 1..k {
+        term *= l / i as f64;
+        cdf += term;
+    }
+    (1.0 - cdf).clamp(0.0, 1.0)
+}
+
+/// First in-play odd whose market contains ALL keywords and whose selection
+/// contains `sel` (all lowercased) — for matching an estimate to a live price.
+fn find_odd<'a>(odds: &'a [LiveOdd], market_kw: &[&str], sel: &str) -> Option<&'a LiveOdd> {
+    odds.iter().find(|o| {
+        let ml = o.market.to_lowercase();
+        let sl = o.selection.to_lowercase();
+        market_kw.iter().all(|k| ml.contains(k)) && sl.contains(sel)
+    })
+}
+
+/// (edge vs the matched price, "selection @ odds") for displaying value on an estimate.
+fn edge_of(p: f64, o: Option<&LiveOdd>) -> (Option<f64>, Option<String>) {
+    match o {
+        Some(o) => (Some(((p - o.implied) * 10000.0).round() / 10000.0), Some(format!("{} @ {:.2}", o.selection, o.odds))),
+        None => (None, None),
+    }
+}
+
+/// All matches in play right now (HT first — that's where the value is). On demand.
+#[tauri::command]
+pub async fn live_fixtures(state: State<'_, AppState>) -> Result<Vec<LiveFixture>, String> {
+    let j = af::cached_get(&state, "/fixtures", vec![("live", "all".to_string())], TTL_LIVE_SHORT).await?;
+    let mut out = Vec::new();
+    for f in response_array(&j) {
+        let fx = f.get("fixture");
+        let stt = fx.and_then(|x| x.get("status"));
+        out.push(LiveFixture {
+            fixture_id: fx.and_then(|x| x.get("id")).and_then(|v| v.as_i64()).unwrap_or(0),
+            league_id: f.get("league").and_then(|l| l.get("id")).and_then(|v| v.as_i64()).unwrap_or(0),
+            league_name: f.get("league").and_then(|l| l.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            season: f.get("league").and_then(|l| l.get("season")).and_then(|v| v.as_i64()).unwrap_or(0),
+            home_team: f.get("teams").and_then(|t| t.get("home")).and_then(|h| h.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            away_team: f.get("teams").and_then(|t| t.get("away")).and_then(|h| h.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            home_team_id: f.get("teams").and_then(|t| t.get("home")).and_then(|h| h.get("id")).and_then(|v| v.as_i64()).unwrap_or(0),
+            away_team_id: f.get("teams").and_then(|t| t.get("away")).and_then(|h| h.get("id")).and_then(|v| v.as_i64()).unwrap_or(0),
+            status: stt.and_then(|s| s.get("short")).and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            elapsed: stt.and_then(|s| s.get("elapsed")).and_then(|v| v.as_i64()).unwrap_or(0),
+            home_goals: f.get("goals").and_then(|g| g.get("home")).and_then(|v| v.as_i64()).unwrap_or(0),
+            away_goals: f.get("goals").and_then(|g| g.get("away")).and_then(|v| v.as_i64()).unwrap_or(0),
+            has_stats: false,
+        });
+    }
+    // HT first (most actionable), then later games first.
+    out.sort_by(|a, b| (a.status != "HT").cmp(&(b.status != "HT")).then(b.elapsed.cmp(&a.elapsed)));
+    Ok(out)
+}
+
+/// A current-state snapshot for one live match: stats, events, our remaining-time
+/// estimates, and the in-play odds — so you can find value at half-time.
+#[tauri::command]
+pub async fn live_snapshot(state: State<'_, AppState>, fixture: LiveFixture) -> Result<LiveSnapshot, String> {
+    live_snapshot_inner(&state, fixture).await
+}
+
+async fn live_snapshot_inner(state: &AppState, fixture: LiveFixture) -> Result<LiveSnapshot, String> {
+    let fid = fixture.fixture_id;
+    // Refresh the live score/minute.
+    let (mut status, mut elapsed, mut hg, mut ag) = (fixture.status.clone(), fixture.elapsed, fixture.home_goals, fixture.away_goals);
+    if let Ok(fj) = af::cached_get(&state, "/fixtures", vec![("id", fid.to_string())], TTL_LIVE_SHORT).await {
+        if let Some(f) = response_array(&fj).into_iter().next() {
+            let stt = f.get("fixture").and_then(|x| x.get("status"));
+            status = stt.and_then(|s| s.get("short")).and_then(|v| v.as_str()).unwrap_or(&status).to_string();
+            elapsed = stt.and_then(|s| s.get("elapsed")).and_then(|v| v.as_i64()).unwrap_or(elapsed);
+            hg = f.get("goals").and_then(|g| g.get("home")).and_then(|v| v.as_i64()).unwrap_or(hg);
+            ag = f.get("goals").and_then(|g| g.get("away")).and_then(|v| v.as_i64()).unwrap_or(ag);
+        }
+    }
+
+    // Live in-match stats (big leagues only — patchy elsewhere).
+    let want = ["Shots on Goal", "Total Shots", "Ball Possession", "Corner Kicks", "Fouls", "Yellow Cards", "Offsides", "Total passes"];
+    let mut stats: Vec<LiveTeamStat> = Vec::new();
+    let mut corners_total = 0.0;
+    let (mut home_sot, mut away_sot): (Option<f64>, Option<f64>) = (None, None);
+    if let Ok(sj) = af::cached_get(&state, "/fixtures/statistics", vec![("fixture", fid.to_string())], TTL_LIVE_SHORT).await {
+        for t in response_array(&sj) {
+            let tname = t.get("team").and_then(|x| x.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let is_home = tname == fixture.home_team;
+            let mut items = Vec::new();
+            for w in want {
+                if let Some(v) = t.get("statistics").and_then(|a| a.as_array()).and_then(|arr| arr.iter().find(|s| s.get("type").and_then(|x| x.as_str()) == Some(w))).and_then(|s| s.get("value")) {
+                    let val = v.as_str().map(|s| s.to_string()).or_else(|| v.as_f64().map(|f| format!("{}", f as i64))).unwrap_or_default();
+                    if !val.is_empty() && val != "null" {
+                        items.push(LiveStatKV { label: w.to_string(), value: val.clone() });
+                        let num = val.trim_end_matches('%').parse::<f64>().ok();
+                        if w == "Corner Kicks" {
+                            corners_total += num.unwrap_or(0.0);
+                        }
+                        if w == "Shots on Goal" {
+                            if is_home { home_sot = num } else { away_sot = num }
+                        }
+                    }
+                }
+            }
+            if !items.is_empty() {
+                stats.push(LiveTeamStat { team: tname, stats: items });
+            }
+        }
+    }
+    let has_stats = !stats.is_empty();
+
+    // Events (goals + scorers, subs, cards).
+    let mut events = Vec::new();
+    if let Ok(ej) = af::cached_get(&state, "/fixtures/events", vec![("fixture", fid.to_string())], TTL_LIVE_SHORT).await {
+        for e in response_array(&ej) {
+            events.push(LiveEvent {
+                minute: e.get("time").and_then(|t| t.get("elapsed")).and_then(|v| v.as_i64()).unwrap_or(0),
+                team: e.get("team").and_then(|t| t.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                kind: e.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                player: e.get("player").and_then(|p| p.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                detail: e.get("detail").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            });
+        }
+    }
+
+    // In-play odds for goal/2nd-half/corner markets (parse first so estimates can
+    // be value-flagged against them).
+    let mut odds = Vec::new();
+    if let Ok(oj) = af::cached_get(&state, "/odds/live", vec![("fixture", fid.to_string())], TTL_LIVE_SHORT).await {
+        if let Some(r) = response_array(&oj).into_iter().next() {
+            if let Some(arr) = r.get("odds").and_then(|x| x.as_array()) {
+                for o in arr {
+                    let name = o.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    let nl = name.to_lowercase();
+                    if !(nl.contains("goal") || nl.contains("score") || nl.contains("corner") || nl.contains("over/under")) {
+                        continue;
+                    }
+                    if let Some(vals) = o.get("values").and_then(|x| x.as_array()) {
+                        for v in vals.iter().take(8) {
+                            let raw = v.get("value").and_then(|x| x.as_str()).unwrap_or("");
+                            // The line (e.g. corners "9.5") lives in `handicap`; fold it in.
+                            let hcap = v.get("handicap").and_then(|x| x.as_str()).filter(|s| !s.is_empty() && *s != "null");
+                            let sel = match hcap {
+                                Some(h) if !raw.contains(h) => format!("{raw} {h}"),
+                                _ => raw.to_string(),
+                            };
+                            let odd = v.get("odd").and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok()).or_else(|| v.get("odd").and_then(|x| x.as_f64())).unwrap_or(0.0);
+                            if odd > 1.0 {
+                                odds.push(LiveOdd { market: name.to_string(), selection: sel, odds: odd, implied: round4(1.0 / odd) });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let cur_total = (hg + ag) as f64;
+
+    // Remaining-time estimates: our pre-match rates scaled by time left, sharpened
+    // by live shot momentum where stats exist.
+    let mut estimates = Vec::new();
+    let remaining = (90 - elapsed).clamp(0, 90) as f64;
+    let frac = remaining / 90.0;
+    let home = fetch_team_stats(&state, fixture.home_team_id, &fixture.home_team, fixture.league_id, fixture.season).await.ok().flatten();
+    let away = fetch_team_stats(&state, fixture.away_team_id, &fixture.away_team, fixture.league_id, fixture.season).await.ok().flatten();
+    if let (Some(h), Some(a)) = (&home, &away) {
+        // Blend the model rate with a live shots-on-target pace (≈0.3 conversion).
+        let mom = |pre: f64, sot: Option<f64>| -> f64 {
+            match sot {
+                Some(s) if elapsed > 12 => {
+                    let pace = (s * 0.30) / elapsed as f64 * remaining;
+                    0.5 * pre + 0.5 * pace
+                }
+                _ => pre,
+            }
+        };
+        let used_mom = has_stats && (home_sot.is_some() || away_sot.is_some()) && elapsed > 12;
+        let lh = mom(((h.gf_avg + a.ga_avg) / 2.0).max(0.05) * frac, home_sot);
+        let la = mom(((a.gf_avg + h.ga_avg) / 2.0).max(0.05) * frac, away_sot);
+        let basis = if used_mom { "model + live shot momentum" } else { "model (rate × time left)" };
+
+        // Any further goal → the in-play "Over (current total + 0.5)" price.
+        let p_any = round4(1.0 - (-(lh + la)).exp());
+        let goal_sel = format!("over {:.1}", cur_total + 0.5);
+        let (e, b) = edge_of(p_any, find_odd(&odds, &["goal"], &goal_sel));
+        estimates.push(LiveEstimate { label: format!("Any goal in the remaining ~{}'", remaining as i64), prob: p_any, basis: basis.into(), edge: e, book: b });
+
+        // Each team to score from here → "{team} ... score a goal" / over 0.5.
+        let p_home = round4(1.0 - (-lh).exp());
+        let home_odd = find_odd(&odds, &["home", "score"], "yes").or_else(|| find_odd(&odds, &["home", "goal"], "over 0.5"));
+        let (eh, bh) = edge_of(p_home, home_odd);
+        estimates.push(LiveEstimate { label: format!("{} to score from here", fixture.home_team), prob: p_home, basis: basis.into(), edge: eh, book: bh });
+
+        let p_away = round4(1.0 - (-la).exp());
+        let away_odd = find_odd(&odds, &["away", "score"], "yes").or_else(|| find_odd(&odds, &["away", "goal"], "over 0.5"));
+        let (ea, ba) = edge_of(p_away, away_odd);
+        estimates.push(LiveEstimate { label: format!("{} to score from here", fixture.away_team), prob: p_away, basis: basis.into(), edge: ea, book: ba });
+    }
+    // Corner pace (live-driven): extrapolate current rate over remaining time.
+    if corners_total > 0.0 && elapsed > 5 {
+        let add = corners_total * (remaining / elapsed as f64);
+        let next = corners_total + 2.5;
+        let p_corner = round4(pois_ge(3, add));
+        let corner_sel = format!("over {:.1}", next);
+        let (ec, bc) = edge_of(p_corner, find_odd(&odds, &["corner"], &corner_sel));
+        estimates.push(LiveEstimate {
+            label: format!("Over {:.1} total corners (now {})", next, corners_total as i64),
+            prob: p_corner,
+            basis: format!("pace: ~{:.1} more expected", add),
+            edge: ec,
+            book: bc,
+        });
+    }
+
+    let note = if has_stats {
+        "Live stats available. Estimates use our pre-match rates scaled to time remaining; corners use live pace.".to_string()
+    } else {
+        "No live in-match stats for this match (common outside top leagues) — goal estimates still apply from the score, minute and our rates.".to_string()
+    };
+
+    Ok(LiveSnapshot {
+        fixture: LiveFixture { status, elapsed, home_goals: hg, away_goals: ag, has_stats, ..fixture },
+        stats,
+        events,
+        estimates,
+        odds,
+        note,
+    })
+}
+
+/// Build an IN-PLAY ticket: take the live snapshot (current stats + our
+/// remaining-time estimates + the live odds), fold in any ingested page notes
+/// for these teams, and make ONE model call to assemble a coherent ticket from
+/// that menu. The model only SELECTS and EXPLAINS — every probability is ours
+/// (our estimate) or the book's (de-vigged implied); it never invents a number.
+/// Cached by a hash of the live state + menu + model, so a refresh is free.
+#[tauri::command]
+pub async fn live_ticket(state: State<'_, AppState>, fixture: LiveFixture, model: String) -> Result<LiveTicket, String> {
+    if !llm::is_allowed_analysis_model(&model) {
+        return Err(format!("model {model} is not allowed for analysis"));
+    }
+    let snap = live_snapshot_inner(&state, fixture.clone()).await?;
+    let f = snap.fixture.clone();
+
+    // Numbered menu the model must pick from (index-aligned to `menu`).
+    let mut menu: Vec<LiveLeg> = Vec::new();
+    let mut lines: Vec<String> = Vec::new();
+    for e in &snap.estimates {
+        let odds = e.book.as_ref().and_then(|b| b.rsplit('@').next()).and_then(|s| s.trim().parse::<f64>().ok());
+        lines.push(format!(
+            "[{}] {} — our {}%{}",
+            menu.len(), e.label, (e.prob * 100.0).round() as i64,
+            e.book.as_ref().map(|b| format!("  | book: {b}")).unwrap_or_default()
+        ));
+        menu.push(LiveLeg { label: e.label.clone(), prob: e.prob, odds, source: "model".into(), why: String::new() });
+    }
+    for o in snap.odds.iter().take(22) {
+        lines.push(format!(
+            "[{}] {} — {} @ {:.2} ({}% implied)",
+            menu.len(), o.market, o.selection, o.odds, (o.implied * 100.0).round() as i64
+        ));
+        menu.push(LiveLeg { label: format!("{} — {}", o.market, o.selection), prob: o.implied, odds: Some(o.odds), source: "book".into(), why: String::new() });
+    }
+    if menu.is_empty() {
+        return Err("no live markets or estimates to build from yet".into());
+    }
+
+    let stat_str = snap.stats.iter().map(|t| {
+        format!("{}: {}", t.team, t.stats.iter().map(|s| format!("{} {}", s.label, s.value)).collect::<Vec<_>>().join(", "))
+    }).collect::<Vec<_>>().join(" | ");
+    let ev_str = snap.events.iter().rev().take(10).map(|e| format!("{}' {} {} ({})", e.minute, e.kind, e.player, e.team)).collect::<Vec<_>>().join("; ");
+
+    let ingest_notes = {
+        let conn = state.db.lock().map_err(|_| "db lock")?;
+        db::ingest_for_fixture(&conn).ok().map(|rows| {
+            rows.into_iter().filter(|r| {
+                let t = format!("{} {} {}", r.title, r.note, r.content).to_lowercase();
+                t.contains(&f.home_team.to_lowercase()) || t.contains(&f.away_team.to_lowercase())
+            }).take(4).map(|r| {
+                let body = r.note.trim();
+                let body = if body.is_empty() { r.content.chars().take(400).collect::<String>() } else { body.to_string() };
+                format!("- {}: {}", r.title, body)
+            }).collect::<Vec<_>>().join("\n")
+        }).unwrap_or_default()
+    };
+
+    let menu_block = lines.join("\n");
+    let ingest_block = if ingest_notes.is_empty() { "(none)".to_string() } else { ingest_notes };
+    let system = "You are a sharp in-play football trader. From the supplied MENU you assemble ONE coherent live ticket for the current game state. RULES: pick only indices that exist; never invent or alter a probability (the menu % is fixed and authoritative); prefer 2-5 legs that are positively correlated with how this match is unfolding; never combine contradictory legs. Output strict JSON only, no prose.";
+    let user = format!(
+        "LIVE MATCH: {} {}-{} {} ({}', {} | {})\n\nLIVE STATS: {}\nEVENTS: {}\n\nINGESTED PAGE NOTES (your own clipped pages — soft context, don't trust blindly):\n{}\n\nMENU (pick by index — the ONLY legs you may use; the % is fixed, never change it):\n{}\n\nBuild ONE in-play ticket of 2-5 legs that fit THIS game state right now. Prefer legs pointing the same way (a side on top → that side to score + match over + their corners). Avoid contradictions. Output STRICT JSON only: {{\"legs\":[{{\"i\":<index>,\"why\":\"<6-12 words>\"}}],\"rationale\":\"<1 sentence>\",\"confidence\":\"low|medium|high\"}}",
+        f.home_team, f.home_goals, f.away_goals, f.away_team, f.elapsed, f.status, f.league_name,
+        if stat_str.is_empty() { "(none)" } else { &stat_str },
+        if ev_str.is_empty() { "(none)" } else { &ev_str },
+        ingest_block, menu_block
+    );
+
+    // Cache by live state + menu + model (token-budget rule: one call, cached).
+    let mut h = Sha256::new();
+    h.update(f.fixture_id.to_le_bytes());
+    h.update(f.elapsed.to_le_bytes());
+    h.update(f.home_goals.to_le_bytes());
+    h.update(f.away_goals.to_le_bytes());
+    h.update(menu_block.as_bytes());
+    h.update(ingest_block.as_bytes());
+    h.update(model.as_bytes());
+    let key = format!("live-ticket:{:x}", h.finalize());
+
+    let mut cached = true;
+    let raw = {
+        let hit = { let conn = state.db.lock().map_err(|_| "db lock")?; db::ai_get(&conn, &key).ok().flatten() };
+        match hit {
+            Some(v) => v,
+            None => {
+                cached = false;
+                let (txt, gin, gout) = llm::chat_call(&state, &model, system, &user, 600).await?;
+                let conn = state.db.lock().map_err(|_| "db lock")?;
+                let _ = db::usage_add(&conn, af::now_ts(), &model, gin, gout, "live");
+                let _ = db::ai_put(&conn, &key, &txt, &model, af::now_ts());
+                txt
+            }
+        }
+    };
+
+    // Parse the model's JSON selection defensively; reconstruct legs from the menu.
+    let json_str = raw.find('{').and_then(|s| raw.rfind('}').map(|e| &raw[s..=e])).unwrap_or("{}");
+    let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap_or_else(|_| serde_json::json!({}));
+    let mut legs: Vec<LiveLeg> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    if let Some(arr) = parsed.get("legs").and_then(|x| x.as_array()) {
+        for item in arr {
+            let i = item.get("i").and_then(|x| x.as_i64()).unwrap_or(-1);
+            if i < 0 || i as usize >= menu.len() || !seen.insert(i) {
+                continue;
+            }
+            let mut leg = menu[i as usize].clone();
+            leg.why = item.get("why").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            legs.push(leg);
+        }
+    }
+    if legs.is_empty() {
+        return Err("model returned no usable legs — try refresh".into());
+    }
+
+    let combined_prob = round4(legs.iter().map(|l| l.prob).product::<f64>());
+    let combined_odds = if legs.iter().all(|l| l.odds.is_some()) {
+        Some(round4(legs.iter().map(|l| l.odds.unwrap()).product::<f64>()))
+    } else {
+        None
+    };
+    let rationale = parsed.get("rationale").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let confidence = parsed.get("confidence").and_then(|x| x.as_str()).unwrap_or("medium").to_string();
+
+    Ok(LiveTicket {
+        fixture: snap.fixture,
+        legs,
+        combined_prob,
+        combined_odds,
+        rationale,
+        confidence,
+        model,
+        cached,
+        note: "Combined % assumes leg independence — correlated same-game legs skew it; treat as a guide. Every probability is ours (estimate) or de-vigged book implied, never model-invented.".into(),
+    })
+}
+
+/// Correlation-aware price for a same-game (or mixed) parlay. Returns the joint
+/// probability WITH leg correlation by Monte Carlo, next to the naive
+/// independent product, so the UI can show how much the legs help each other.
+/// Marginals are our model probabilities (or sharp where that's all a leg has) —
+/// the sim only models co-occurrence, it never changes a leg's probability.
+#[tauri::command]
+pub fn price_sgp(legs: Vec<TicketLeg>) -> Result<crate::montecarlo::SgpPrice, String> {
+    let sim_legs: Vec<crate::montecarlo::SimLeg> = legs
+        .iter()
+        .map(|l| {
+            let line = l.line.clone().unwrap_or_default();
+            let prob = l.est_prob.or(l.pinnacle_prob).unwrap_or(0.5).clamp(0.001, 0.999);
+            crate::montecarlo::SimLeg {
+                fixture_id: l.fixture_id,
+                subject: crate::odds::fold(&l.selection),
+                theme: crate::montecarlo::theme_of(&l.market, &line, &l.selection),
+                prob,
+                scoreline: crate::montecarlo::is_scoreline_market(&l.market),
+            }
+        })
+        .collect();
+    Ok(crate::montecarlo::sgp_probability(&sim_legs, 20_000))
 }
 
 // ---------- browser-extension ingest ----------

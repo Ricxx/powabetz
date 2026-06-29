@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { errMsg } from "../toast";
 import { api } from "../api";
 import type { GrokLogEntry } from "../types";
 
@@ -8,7 +9,7 @@ export default function Newsfeed({ onClose }: { onClose: () => void }) {
   const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
-    api.listGrokLog().then(setLog).catch((e) => setErr(String(e)));
+    api.listGrokLog().then(setLog).catch((e) => setErr(errMsg(e)));
   }, []);
 
   return (

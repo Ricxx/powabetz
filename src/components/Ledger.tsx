@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { errMsg } from "../toast";
 import { api } from "../api";
 import type { GenReportRow, MarketReportRow, ModelPurposeRow } from "../types";
 
@@ -84,6 +85,7 @@ function stratLabel(s: string): string {
   if (s === "favorites") return "Form faves";
   if (s === "oracle") return "Oracle ✦";
   if (s === "power") return "Power Stacker ⚡";
+  if (s === "bankers") return "Anchors ⚓";
   if (s === "custom") return "Cherry-picked 🍒";
   if (s === "ladder") return "Acca ladder";
   if (s === "board") return "Board";
@@ -129,12 +131,12 @@ function ReportTable({
                     {Math.round(r.hit_rate * 100)}%
                   </b>
                 ) : (
-                  <span className="text-slate-600">—</span>
+                  <span className="text-slate-500">—</span>
                 )}
               </td>
               <td className="text-right">
                 {r.roi == null ? (
-                  <span className="text-slate-600">—</span>
+                  <span className="text-slate-500">—</span>
                 ) : (
                   <b className={r.roi >= 0 ? "text-accent" : "text-bad"}>
                     {r.roi >= 0 ? "+" : ""}
@@ -218,7 +220,7 @@ export default function Ledger({ onClose }: { onClose: () => void }) {
     api.usageByPurpose().then(setByPurpose).catch(() => {});
   }
   function load() {
-    api.generatedReport().then(setRows).catch((e) => setErr(String(e)));
+    api.generatedReport().then(setRows).catch((e) => setErr(errMsg(e)));
     loadAgg();
   }
   useEffect(load, []);
@@ -230,7 +232,7 @@ export default function Ledger({ onClose }: { onClose: () => void }) {
       setRows(await api.settleGenerated());
       loadAgg();
     } catch (e) {
-      setErr(String(e));
+      setErr(errMsg(e));
     } finally {
       setBusy(false);
     }

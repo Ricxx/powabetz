@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { errMsg } from "../toast";
 import { api } from "../api";
 import type {
   FixtureInput,
@@ -87,7 +88,7 @@ export default function Inspector({
 
   useEffect(() => {
     setShown(true);
-    api.inspectFixtures(fixtures).then(setData).catch((e) => setErr(String(e)));
+    api.inspectFixtures(fixtures).then(setData).catch((e) => setErr(errMsg(e)));
   }, []);
 
   async function openPlayer(playerId: number, leagueId: number, season: number) {
@@ -98,7 +99,7 @@ export default function Inspector({
       if (p) setPlayer(p);
       else setErr("No season stats found for this player in this league/season.");
     } catch (e) {
-      setErr(String(e));
+      setErr(errMsg(e));
     } finally {
       setLoadingPlayer(false);
     }
@@ -117,7 +118,7 @@ export default function Inspector({
           ) ?? prev
       );
     } catch (e) {
-      setErr(String(e));
+      setErr(errMsg(e));
     } finally {
       setTeamLoading((s) => {
         const n = new Set(s);

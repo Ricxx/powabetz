@@ -362,6 +362,96 @@ pub struct LegResult {
     pub detail: String,
 }
 
+// ---------- in-play / live ----------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveFixture {
+    pub fixture_id: i64,
+    pub league_id: i64,
+    pub league_name: String,
+    pub season: i64,
+    pub home_team: String,
+    pub away_team: String,
+    pub home_team_id: i64,
+    pub away_team_id: i64,
+    pub status: String, // 1H | HT | 2H | ET | …
+    pub elapsed: i64,
+    pub home_goals: i64,
+    pub away_goals: i64,
+    pub has_stats: bool, // live in-match stats available (big leagues)
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LiveStatKV {
+    pub label: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LiveTeamStat {
+    pub team: String,
+    pub stats: Vec<LiveStatKV>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LiveEvent {
+    pub minute: i64,
+    pub team: String,
+    pub kind: String, // Goal | subst | Card | Var
+    pub player: String,
+    pub detail: String,
+}
+
+/// Our estimate of a still-live outcome over the remaining time.
+#[derive(Debug, Clone, Serialize)]
+pub struct LiveEstimate {
+    pub label: String,
+    pub prob: f64,
+    pub basis: String, // "model (rate × time left)" | "+ live momentum" | "pace"
+    /// Edge vs the matching in-play odd (our prob − implied), when we found one.
+    pub edge: Option<f64>,
+    pub book: Option<String>, // the matched market/price, for display
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LiveOdd {
+    pub market: String,
+    pub selection: String,
+    pub odds: f64,
+    pub implied: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LiveSnapshot {
+    pub fixture: LiveFixture,
+    pub stats: Vec<LiveTeamStat>,
+    pub events: Vec<LiveEvent>,
+    pub estimates: Vec<LiveEstimate>,
+    pub odds: Vec<LiveOdd>,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LiveLeg {
+    pub label: String,
+    pub prob: f64,
+    pub odds: Option<f64>,
+    pub source: String, // "model" | "book"
+    pub why: String,
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct LiveTicket {
+    pub fixture: LiveFixture,
+    pub legs: Vec<LiveLeg>,
+    pub combined_prob: f64,
+    pub combined_odds: Option<f64>,
+    pub rationale: String,
+    pub confidence: String, // low | medium | high
+    pub model: String,
+    pub cached: bool,
+    pub note: String,
+}
+
 /// A page the user ingested via the browser extension (raw → Haiku-structured).
 #[derive(Debug, Clone, Serialize)]
 pub struct IngestItem {

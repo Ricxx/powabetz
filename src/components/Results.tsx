@@ -1,7 +1,8 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import TicketAnalysis from "./TicketAnalysis";
+import { api } from "../api";
 import { kellyStake, legKey, shortTeam } from "../types";
-import type { BuildResult, BuildUsage, Ticket, TicketLeg } from "../types";
+import type { BuildResult, BuildUsage, SgpPrice, Ticket, TicketLeg } from "../types";
 
 function modelLabel(id: string): string {
   if (id.includes("opus")) return "Opus 4.8";
@@ -65,7 +66,6 @@ function TicketCard({
   onToggleCartLeg?: (l: TicketLeg) => void;
 }) {
   const [open, setOpen] = useState(true);
-  const [placing, setPlacing] = useState(false);
   const [placed, setPlaced] = useState(false);
   const [removed, setRemoved] = useState<Set<number>>(new Set());
   const [stake, setStake] = useState("");
@@ -89,13 +89,30 @@ function TicketCard({
   const [odds, setOdds] = useState(t.combined_odds != null ? String(t.combined_odds) : "");
   const isLong = active.length > 1 && combinedProb != null && combinedProb >= 0.1 && combinedProb <= 0.2;
 
+  // Correlation-aware joint probability for multi-leg tickets (Monte Carlo).
+  const [sgp, setSgp] = useState<SgpPrice | null>(null);
+  useEffect(() => {
+    setSgp(null);
+    if (active.length < 2 || !allEst) return;
+    let live = true;
+    api.priceSgp(active).then((p) => { if (live) setSgp(p); }).catch(() => {});
+    return () => { live = false; };
+  }, [active.map(legKey).join("|"), allEst]);
+
+  // Prefill the stake (Kelly) and odds inline so placing is a single tap, while
+  // still letting the user edit before committing.
+  useEffect(() => {
+    if (placed) return;
+    setStake((s) => (s === "" && recStake > 0 ? String(recStake) : s));
+    setOdds((o) => (o === "" && combinedOdds != null ? combinedOdds.toFixed(2) : o));
+  }, [recStake, combinedOdds, placed]);
+
   async function confirm() {
     const s = parseFloat(stake);
     if (!Number.isFinite(s) || s <= 0 || active.length === 0) return;
     const o = parseFloat(odds);
     await onPlace?.(modified, s, Number.isFinite(o) && o > 0 ? o : null);
     setPlaced(true);
-    setPlacing(false);
   }
 
   return (
@@ -152,7 +169,7 @@ function TicketCard({
             >
               <div className="flex items-center justify-between gap-2">
                 <div className="min-w-0">
-                  <div className={`text-sm font-medium truncate ${isVoid ? "line-through" : ""}`}>
+                  <div className={`text-sm font-medium break-words ${isVoid ? "line-through" : ""}`}>
                     {l.selection}
                     {l.team && (
                       <span className="ml-1.5 text-[9px] font-semibold text-slate-400 bg-edge rounded px-1 py-0.5 align-middle">
@@ -160,7 +177,7 @@ function TicketCard({
                       </span>
                     )}
                   </div>
-                  <div className="text-[11px] text-slate-400 truncate">
+                  <div className="text-[11px] text-slate-400 break-words">
                     {l.market}
                     {l.line ? ` · ${l.line}` : ""} — {l.match}
                   </div>
@@ -224,6 +241,13 @@ function TicketCard({
           {active.length > 1 ? "Hit chance" : "Model prob"}{" "}
           <b className="text-slate-100">{pct(combinedProb)}</b>
         </span>
+        {sgp && Math.abs(sgp.lift - 1) >= 0.03 && (
+          <span className="text-slate-300" title="Correlation-adjusted joint probability (Monte Carlo) — the naive product assumes the legs are independent.">
+            Correlated{" "}
+            <b className={sgp.lift > 1 ? "text-accent" : "text-bad"}>{pct(sgp.correlated)}</b>
+            <span className="text-slate-500"> ({sgp.lift >= 1 ? "+" : ""}{Math.round((sgp.lift - 1) * 100)}%)</span>
+          </span>
+        )}
         {removed.size > 0 && <span className="text-[11px] text-warn">recomputed after voiding</span>}
       </div>
 
@@ -243,54 +267,42 @@ function TicketCard({
 
       <TicketAnalysis ticket={modified} leagues={leagues} />
 
-      {onPlace &&
-        (placed ? null : placing ? (
-          <div className="space-y-1.5">
-            <div className="flex items-center gap-2">
-              <input
-                className="w-20 rounded-lg bg-ink border border-edge px-2 py-2 text-sm"
-                placeholder="stake $"
-                inputMode="decimal"
-                value={stake}
-                onChange={(e) => setStake(e.target.value)}
-              />
-              <input
-                className="w-20 rounded-lg bg-ink border border-edge px-2 py-2 text-sm"
-                placeholder="odds"
-                inputMode="decimal"
-                value={odds}
-                onChange={(e) => setOdds(e.target.value)}
-              />
-              <button className="btn btn-primary text-sm px-3 py-2" onClick={confirm}>
-                Place
-              </button>
-              <button className="text-xs text-slate-400 underline" onClick={() => setPlacing(false)}>
-                cancel
-              </button>
-            </div>
-            {recStake > 0 && (
-              <button
-                className="text-[11px] text-accent underline"
-                onClick={() => setStake(String(recStake))}
-              >
-                Kelly suggests ${recStake.toFixed(2)} — use it
-              </button>
-            )}
+      {onPlace && !placed && (active.length === 0 ? (
+        <div className="text-xs text-slate-500 text-center">All legs voided.</div>
+      ) : (
+        <div className="space-y-1">
+          <div className="flex items-center gap-1.5">
+            <span className="text-sm text-slate-500">$</span>
+            <input
+              className="w-16 rounded-lg bg-ink border border-edge px-2 py-2 text-sm"
+              placeholder="stake"
+              inputMode="decimal"
+              value={stake}
+              onChange={(e) => setStake(e.target.value)}
+            />
+            <span className="text-xs text-slate-500">@</span>
+            <input
+              className="w-16 rounded-lg bg-ink border border-edge px-2 py-2 text-sm"
+              placeholder="odds"
+              inputMode="decimal"
+              value={odds}
+              onChange={(e) => setOdds(e.target.value)}
+            />
+            <button className="btn btn-primary text-sm px-3 py-2 flex-1" onClick={confirm}>
+              Place{stake ? ` $${stake}` : ""}
+            </button>
           </div>
-        ) : active.length === 0 ? (
-          <div className="text-xs text-slate-500 text-center">All legs voided.</div>
-        ) : (
-          <button
-            className="btn btn-ghost text-sm w-full"
-            onClick={() => {
-              if (recStake > 0) setStake(String(recStake));
-              if (combinedOdds != null) setOdds(combinedOdds.toFixed(2));
-              setPlacing(true);
-            }}
-          >
-            ＋ Place {removed.size > 0 ? "voided " : ""}ticket{recStake > 0 ? ` · Kelly $${recStake.toFixed(2)}` : ""}
-          </button>
-        ))}
+          {recStake > 0 && (
+            <div className="text-[10px] text-slate-500">
+              Kelly suggests ${recStake.toFixed(2)}
+              {recStake.toFixed(2) !== stake && (
+                <button className="ml-1 text-accent underline" onClick={() => setStake(recStake.toFixed(2))}>use</button>
+              )}
+              {removed.size > 0 ? " · voided ticket" : ""}
+            </div>
+          )}
+        </div>
+      ))}
     </div>
   );
 }

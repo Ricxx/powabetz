@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { errMsg, toast } from "../toast";
 import { api } from "../api";
 import Spinner from "./Spinner";
 import { ANALYSIS_MODELS, type IngestInfo, type IngestItem } from "../types";
@@ -30,7 +31,7 @@ export default function Ingest({ onClose }: { onClose: () => void }) {
 
   function load() {
     api.ingestInfo().then(setInfo).catch(() => {});
-    api.listIngested().then(setItems).catch((e) => setErr(String(e)));
+    api.listIngested().then(setItems).catch((e) => setErr(errMsg(e)));
   }
   useEffect(load, []);
   // Auto-refresh so pages sent from the browser appear without a manual reload.
@@ -45,7 +46,7 @@ export default function Ingest({ onClose }: { onClose: () => void }) {
     try {
       setExtPath(await api.exportExtension());
     } catch (e) {
-      setErr(String(e));
+      setErr(errMsg(e));
     }
   }
   async function process(id: number): Promise<boolean> {
@@ -57,7 +58,7 @@ export default function Ingest({ onClose }: { onClose: () => void }) {
       setExpanded((prev) => new Set(prev).add(id)); // show the output so it's verifiable
       return true;
     } catch (e) {
-      setErr(String(e));
+      setErr(errMsg(e));
       return false;
     } finally {
       setBusy((prev) => {
@@ -79,12 +80,22 @@ export default function Ingest({ onClose }: { onClose: () => void }) {
     }
     setBulk(null);
   }
-  async function del(id: number) {
-    await api.deleteIngested(id).catch(() => {});
-    setItems((prev) => prev.filter((x) => x.id !== id));
+  function del(id: number) {
+    setItems((prev) => prev.filter((x) => x.id !== id)); // optimistic
+    const timer = setTimeout(() => {
+      api.deleteIngested(id).catch(toast.error);
+    }, 5000);
+    toast.undo("Page removed", () => {
+      clearTimeout(timer);
+      load(); // still on the server — restore the list
+    });
   }
   async function saveNote(id: number, note: string) {
-    await api.updateIngestNote(id, note).catch(() => {});
+    try {
+      await api.updateIngestNote(id, note);
+    } catch (e) {
+      toast.error(e);
+    }
   }
   function toggle(id: number) {
     setExpanded((prev) => {
@@ -213,7 +224,7 @@ export default function Ingest({ onClose }: { onClose: () => void }) {
           <div className="flex items-baseline gap-2 px-1">
             <span className="text-sm font-semibold text-slate-200">📌 {g.label}</span>
             {g.date && <span className="text-[11px] text-slate-500">fixture {g.date}</span>}
-            <span className="text-[11px] text-slate-600">· {g.items.length} source{g.items.length > 1 ? "s" : ""}</span>
+            <span className="text-[11px] text-slate-500">· {g.items.length} source{g.items.length > 1 ? "s" : ""}</span>
           </div>
 
           {g.items.map((it) => (

@@ -26,10 +26,21 @@ import Tracker from "./components/Tracker";
 import Newsfeed from "./components/Newsfeed";
 import Ledger from "./components/Ledger";
 import Ingest from "./components/Ingest";
+import Live from "./components/Live";
 import PicksBoard from "./components/PicksBoard";
+import { Toaster, toast } from "./toast";
+
+export default function App() {
+  return (
+    <>
+      <AppInner />
+      <Toaster />
+    </>
+  );
+}
 
 type Step = "date" | "matches" | "markets" | "results";
-type Overlay = "settings" | "history" | "tracker" | "newsfeed" | "ledger" | "ingest" | null;
+type Overlay = "settings" | "history" | "tracker" | "newsfeed" | "ledger" | "ingest" | "live" | null;
 
 function fmtDate(d: Date): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
@@ -97,10 +108,14 @@ function localTimezone(): string {
 function MeterBar({ meter }: { meter: RequestMeter | null }) {
   if (!meter) return null;
   const pct = Math.min(100, Math.round((meter.count / meter.limit) * 100));
-  const tone = pct >= 100 ? "text-bad" : pct >= 80 ? "text-warn" : "text-slate-400";
+  const near = pct >= 80;
+  const tone = pct >= 100 ? "text-bad" : near ? "text-warn" : "text-slate-400";
   return (
-    <span className={`text-xs ${tone}`} title={`API requests today: ${meter.count} / ${meter.limit}`}>
-      {pct}%
+    <span
+      className={`text-xs ${tone} ${near ? "font-semibold" : ""}`}
+      title={`API requests today: ${meter.count} / ${meter.limit}${pct >= 100 ? " — fresh calls blocked until tomorrow" : near ? " — approaching the daily budget" : ""}`}
+    >
+      {near ? `${pct >= 100 ? "🚫" : "⚠"} ${meter.count}/${meter.limit}` : `${pct}%`}
     </span>
   );
 }
@@ -127,12 +142,24 @@ function CostRow({ label, claude }: { label: string; claude: number }) {
   );
 }
 
-export default function App() {
+function AppInner() {
   const [step, setStep] = useState<Step>("date");
   const [overlay, setOverlay] = useState<Overlay>(null);
+  const warnedMeter = useRef(false);
 
   const [settings, setSettings] = useState<SettingsView | null>(null);
   const [meter, setMeter] = useState<RequestMeter | null>(null);
+
+  // One-time nudge when the daily request budget crosses 80%.
+  useEffect(() => {
+    if (!meter || meter.limit <= 0) return;
+    const frac = meter.count / meter.limit;
+    if (frac >= 0.8 && frac < 1 && !warnedMeter.current) {
+      warnedMeter.current = true;
+      toast.info(`Request budget at ${Math.round(frac * 100)}% (${meter.count}/${meter.limit}) — fresh data calls stop at the limit.`);
+    }
+    if (frac < 0.8) warnedMeter.current = false;
+  }, [meter]);
 
   const [date, setDate] = useState(todayStr());
   const [days, setDays] = useState(1);
@@ -186,7 +213,7 @@ export default function App() {
   const [voidedSubjects, setVoidedSubjects] = useState<Map<string, number>>(new Map());
   // Cherry-picked legs pulled from across different tickets into one custom slip.
   const [cart, setCart] = useState<TicketLeg[]>([]);
-  const [buildTab, setBuildTab] = useState<"regular" | "acca" | "board">("regular");
+  const [buildTab, setBuildTab] = useState<"regular" | "acca" | "board" | "bankers">("regular");
   const [luckySafe, setLuckySafe] = useState(0);
   const [luckyModerate, setLuckyModerate] = useState(1);
   const [luckyRisky, setLuckyRisky] = useState(2);
@@ -199,6 +226,7 @@ export default function App() {
   const [model, setModel] = useState("claude-opus-4-8");
   const [showInspector, setShowInspector] = useState(false);
   const [showBoard, setShowBoard] = useState(false);
+  const [boardMode, setBoardMode] = useState<"all" | "bankers">("all");
   const [bankroll, setBankroll] = useState(0);
   const [buildStrategy, setBuildStrategy] = useState("value");
   const [saved, setSaved] = useState(false);
@@ -248,6 +276,10 @@ export default function App() {
 
   async function loadFixtures() {
     if (busy) return; // guard against double-fire / request spam
+    if (selLeagues.size === 0) {
+      toast.info("Pick at least one league first — that keeps the load fast and within budget.");
+      return;
+    }
     setBusy(true);
     setError(null);
     try {
@@ -516,7 +548,14 @@ export default function App() {
 
   async function placeTicket(t: Ticket, stake: number, odds: number | null, strategyOverride?: string) {
     const strat = strategyOverride ?? buildStrategy;
-    await api.placeBet(t, stake, odds, result?.grok_used ?? false, strat).catch((e) => setError(String(e)));
+    try {
+      await api.placeBet(t, stake, odds, result?.grok_used ?? false, strat);
+      const n = t.legs.length;
+      toast.success(`Bet placed — $${stake.toFixed(2)} · ${n} leg${n > 1 ? "s" : ""}`);
+    } catch (e) {
+      toast.error(e);
+      return;
+    }
     api.getBankroll().then((b) => setBankroll(b.current)).catch(() => {});
   }
 
@@ -667,6 +706,14 @@ export default function App() {
     );
   }
 
+  if (overlay === "live") {
+    return (
+      <Shell meter={meter} cost={settings?.usage.cost_usd ?? 0} grokCost={costBreak?.grok_lifetime ?? 0} onCoins={openCost} onNav={setOverlay} current="live">
+        <Live onClose={() => setOverlay(null)} />
+      </Shell>
+    );
+  }
+
   return (
     <Shell
       meter={meter}
@@ -714,6 +761,7 @@ export default function App() {
               markets={[...selMarkets]}
               bankroll={bankroll}
               kellyFraction={settings?.kelly_fraction ?? 0}
+              mode={boardMode}
               onClose={() => setShowBoard(false)}
               onPlaced={() => api.getBankroll().then((b) => setBankroll(b.current)).catch(() => {})}
             />
@@ -729,12 +777,15 @@ export default function App() {
         </div>
       )}
 
-      <StepDots step={step} />
+      <StepDots step={step} onJump={setStep} />
 
       {/* DATE */}
       {step === "date" && (
         <div className="space-y-4">
-          <h2 className="text-lg font-bold">Pick a date</h2>
+          <div>
+            <h2 className="text-lg font-bold">Pick a date &amp; leagues</h2>
+            <p className="text-xs text-slate-400">Step 1 of 4 — choose when, and which competitions to pull matches from.</p>
+          </div>
           <input
             type="date"
             className="w-full rounded-xl bg-panel border border-edge px-4 py-3 text-lg"
@@ -763,7 +814,7 @@ export default function App() {
           <div>
             <div className="flex items-center justify-between mb-2">
               <span className="text-xs font-semibold text-slate-400">
-                Leagues {selLeagues.size === 0 ? "(all)" : `(${selLeagues.size})`}
+                Leagues {selLeagues.size === 0 ? "(pick at least one)" : `(${selLeagues.size})`}
               </span>
               {selLeagues.size > 0 && (
                 <button
@@ -787,16 +838,18 @@ export default function App() {
               onToggle={(id) => toggle(setSelLeagues, id)}
             />
             <p className="text-[11px] text-slate-500 mt-2">
-              Leave blank for all. Your most-picked leagues rise to the top. Fewer leagues = far
-              fewer requests.
+              Pick the leagues you care about — we load only their matches (loading every league at
+              once is slow and burns your request budget). Your most-picked leagues rise to the top.
             </p>
           </div>
 
-          <button className="btn btn-primary w-full" onClick={loadFixtures} disabled={busy}>
+          <button className="btn btn-primary w-full" onClick={loadFixtures} disabled={busy || selLeagues.size === 0}>
             {busy ? (
               <span className="inline-flex items-center gap-2"><Spinner /> Loading fixtures…</span>
+            ) : selLeagues.size === 0 ? (
+              "Pick a league to load matches"
             ) : (
-              "Load fixtures"
+              `Load matches · ${selLeagues.size} league${selLeagues.size > 1 ? "s" : ""}`
             )}
           </button>
           {settings && !settings.has_api_football_key && (
@@ -811,6 +864,7 @@ export default function App() {
       {step === "matches" && (
         <div className="space-y-3 pb-28">
           <Header title={`Matches · ${date}`} onBack={() => setStep("date")} />
+          <p className="text-xs text-slate-400 -mt-1">Step 2 of 4 — tap the matches you want to research (2–4 works best).</p>
           <div
             className={`text-[11px] rounded-lg px-2.5 py-1.5 ${
               selFixtureIds.size > 4
@@ -823,7 +877,12 @@ export default function App() {
               : "Tip: pick 2–4 matches for the sharpest analysis. Going wide dilutes quality."}
           </div>
           {fixtures.length === 0 && (
-            <div className="card text-sm text-slate-400">No fixtures for this date.</div>
+            <div className="card text-sm text-slate-400 space-y-2">
+              <div>No matches for these leagues on {date}.</div>
+              <button className="btn btn-ghost text-xs py-1.5" onClick={() => setStep("date")}>
+                ← Try another date or add leagues
+              </button>
+            </div>
           )}
           <div className="space-y-2">
             {fixtures.map((f) => {
@@ -899,6 +958,7 @@ export default function App() {
       {step === "markets" && (
         <div className="space-y-4 pb-44">
           <Header title="Markets" onBack={() => setStep("matches")} />
+          <p className="text-xs text-slate-400 -mt-1">Step 3 of 4 — pick what to bet on, then choose how to build below (or use a quick preset).</p>
 
           <div>
             <div className="flex items-center justify-between mb-2">
@@ -935,7 +995,7 @@ export default function App() {
                   }
                 >
                   {sub === "Attacking" ? "Goal-scoring props" : "Passes / fouls / tackles / cards"}{" "}
-                  <span className="text-slate-600">— tap to toggle all</span>
+                  <span className="text-slate-500">— tap to toggle all</span>
                 </button>
                 <div className="flex flex-wrap gap-2">
                   {MARKETS.filter((m) => m.group === "player" && m.sub === sub).map((m) => (
@@ -954,7 +1014,7 @@ export default function App() {
                   onClick={() => toggleGroup(MARKETS.filter((m) => m.group === "team" && m.sub === sub).map((m) => m.key))}
                 >
                   {sub === "Result" ? "Match result (full-time & by half)" : "Goals"}{" "}
-                  <span className="text-slate-600">— tap to toggle all</span>
+                  <span className="text-slate-500">— tap to toggle all</span>
                 </button>
                 <div className="flex flex-wrap gap-2">
                   {MARKETS.filter((m) => m.group === "team" && m.sub === sub).map((m) => (
@@ -976,6 +1036,7 @@ export default function App() {
                 ["regular", "🎯 Regular"],
                 ["acca", "🪜 Acca ladder"],
                 ["board", "🧮 Picks board"],
+                ["bankers", "🏦 Bankers"],
               ] as const
             ).map(([id, label]) => (
               <button
@@ -1033,11 +1094,12 @@ export default function App() {
                   ["likely", "Secret picks"],
                   ["oracle", "Oracle ✦"],
                   ["power", "Power Stacker ⚡"],
+                  ["bankers", "Anchors ⚓"],
                 ].map(([id, label]) => (
                   <button
                     key={id}
                     className={`chip flex-1 text-center whitespace-nowrap ${strategy === id ? "chip-on" : ""} ${
-                      id === "oracle" || id === "power" ? "border-accent/60" : ""
+                      id === "oracle" || id === "power" || id === "bankers" ? "border-accent/60" : ""
                     }`}
                     onClick={() => setStrategy(id)}
                   >
@@ -1054,7 +1116,9 @@ export default function App() {
                       ? "✦ Claude's own read. Bets only where the sharp price, my model and a real edge all AGREE — at under-the-radar odds (~1.7–3.2). Deliberately fades chalk, lottery longshots, and any leg where my model fights the market. Each 'why' names the confluence."
                       : strategy === "power"
                         ? "⚡ Power Stacker — cross-game DOUBLES (rarely a treble) only. Stacks two high-likelihood 'must-happen' picks the book prices generously (~2.0) into 4x–10x for fewer things to connect. Low variance, lottery-like payout. Auto-builds 2-leg parlays regardless of the type toggles."
-                        : "Ranks by +EV — value/longshots where the price beats the true probability."}
+                        : strategy === "bankers"
+                          ? "⚓ Anchors — auto-builds a ticket from the 'this basically always happens' picks: regular bookers, reliable shooters, high-volume passers, corner-heavy teams. Leans on the measured recent hit-rate (carded N of last M). (For a browsable, cherry-pick version of the same idea, use the 🏦 Bankers board tab.)"
+                          : "Ranks by +EV — value/longshots where the price beats the true probability."}
               </p>
             </div>
             <div>
@@ -1071,7 +1135,7 @@ export default function App() {
                 onChange={(e) => setMaxLegProb(parseInt(e.target.value, 10) / 100)}
                 className="w-full"
               />
-              <p className="text-[10px] text-slate-600">
+              <p className="text-[10px] text-slate-500">
                 Lower = less safe — strips out the obvious chalk so picks lean under-the-radar
                 (good with Secret picks).
               </p>
@@ -1254,6 +1318,17 @@ export default function App() {
             </div>
           )}
 
+          {buildTab === "bankers" && (
+            <div className="card text-sm text-slate-300 space-y-1">
+              <div className="font-semibold">🏦 Bankers board</div>
+              <p className="text-[11px] text-slate-500">
+                Only the safest, most repeatable legs — high likelihood, recurring events (cards,
+                shots, corners…), strong recent form, must-play. The picks you anchor an acca on.
+                Deterministic, no model call.
+              </p>
+            </div>
+          )}
+
           {buildTab === "acca" && (
           <div className="card space-y-3">
             <div className="text-xs font-semibold text-slate-400">🪜 Acca ladder settings</div>
@@ -1272,7 +1347,7 @@ export default function App() {
             <div>
               <div className="text-[11px] text-slate-500 mb-1">
                 Max appearances per player — {ladderMaxPerSubject}{" "}
-                <span className="text-slate-600">(diversity; 1 = each star in just one ticket)</span>
+                <span className="text-slate-500">(diversity; 1 = each star in just one ticket)</span>
               </div>
               <div className="flex gap-1.5">
                 {[1, 2, 3, 4, 5].map((n) => (
@@ -1291,7 +1366,7 @@ export default function App() {
                 Legs per ticket — {ladderMinLegs}–{ladderMaxLegs}
               </div>
               <div className="flex gap-1.5 mb-1">
-                <span className="text-[10px] text-slate-600 w-7 shrink-0 self-center">min</span>
+                <span className="text-[10px] text-slate-500 w-7 shrink-0 self-center">min</span>
                 {[2, 3, 4, 5, 6].map((n) => (
                   <button
                     key={n}
@@ -1306,7 +1381,7 @@ export default function App() {
                 ))}
               </div>
               <div className="flex gap-1.5">
-                <span className="text-[10px] text-slate-600 w-7 shrink-0 self-center">max</span>
+                <span className="text-[10px] text-slate-500 w-7 shrink-0 self-center">max</span>
                 {[3, 4, 6, 8, 10, 12].map((n) => (
                   <button
                     key={n}
@@ -1464,8 +1539,13 @@ export default function App() {
               </button>
             )}
             {buildTab === "board" && (
-              <button className="btn btn-primary w-full" disabled={busy || prewarmBusy} onClick={() => setShowBoard(true)}>
+              <button className="btn btn-primary w-full" disabled={busy || prewarmBusy} onClick={() => { setBoardMode("all"); setShowBoard(true); }}>
                 {prewarmBusy ? "🔒 Pre-scoring…" : "🧮 Open picks board"}
+              </button>
+            )}
+            {buildTab === "bankers" && (
+              <button className="btn btn-primary w-full" disabled={busy || prewarmBusy} onClick={() => { setBoardMode("bankers"); setShowBoard(true); }}>
+                {prewarmBusy ? "🔒 Pre-scoring…" : "🏦 Open bankers board"}
               </button>
             )}
             {busy && (
@@ -1482,6 +1562,7 @@ export default function App() {
       {step === "results" && result && (
         <div className="space-y-3">
           <Header title="Tickets" onBack={() => setStep("markets")} />
+          <p className="text-xs text-slate-400 -mt-1">Step 4 of 4 — review, tweak the stake, and place. Tap a ticket to expand it.</p>
           {busy && (
             <div className="text-xs text-accent inline-flex items-center gap-2">
               <Spinner /> Generating a fresh set…
@@ -1551,7 +1632,7 @@ function OddsBand({
       <div className="text-[11px] text-slate-500 mb-1">
         Per-leg odds band —{" "}
         {active ? `${min.toFixed(2)} – ${max >= 999 ? "∞" : max.toFixed(2)}` : "off (any price)"}
-        <span className="text-slate-600"> · skips chalk &amp; lottery prices</span>
+        <span className="text-slate-500"> · skips chalk &amp; lottery prices</span>
       </div>
       <div className="flex items-center gap-1.5 flex-wrap">
         <input
@@ -1595,6 +1676,7 @@ const NAV_ITEMS: { id: Overlay; icon: string; label: string }[] = [
   { id: null, icon: "🏠", label: "Build" },
   { id: "tracker", icon: "💰", label: "Tracker" },
   { id: "ledger", icon: "📊", label: "Ledger" },
+  { id: "live", icon: "🔴", label: "Live" },
   { id: "newsfeed", icon: "📰", label: "News" },
   { id: "ingest", icon: "🧲", label: "Ingest" },
   { id: "history", icon: "🗂", label: "History" },
@@ -1664,14 +1746,24 @@ function Shell({
   );
 }
 
-function StepDots({ step }: { step: Step }) {
+const STEP_LABELS: Record<Step, string> = { date: "Date", matches: "Matches", markets: "Markets", results: "Tickets" };
+function StepDots({ step, onJump }: { step: Step; onJump?: (s: Step) => void }) {
   const order: Step[] = ["date", "matches", "markets", "results"];
   const i = order.indexOf(step);
   return (
     <div className="flex gap-1.5 mb-4">
-      {order.map((_, k) => (
-        <div key={k} className={`h-1 flex-1 rounded-full ${k <= i ? "bg-accent" : "bg-edge"}`} />
-      ))}
+      {order.map((s, k) => {
+        const back = k < i; // only jump backward to a completed step (state is kept)
+        return (
+          <button
+            key={k}
+            disabled={!back || !onJump}
+            onClick={() => back && onJump?.(s)}
+            title={back ? `Back to ${STEP_LABELS[s]}` : STEP_LABELS[s]}
+            className={`h-1.5 flex-1 rounded-full transition ${k <= i ? "bg-accent" : "bg-edge"} ${back ? "cursor-pointer hover:opacity-80" : "cursor-default"}`}
+          />
+        );
+      })}
     </div>
   );
 }

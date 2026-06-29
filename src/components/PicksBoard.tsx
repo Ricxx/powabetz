@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
+import { errMsg, toast } from "../toast";
 import { api } from "../api";
+import Hint from "./Hint";
 import { kellyStake, shortTeam } from "../types";
 import type { Candidate, FixtureInput, Ticket, TicketEval } from "../types";
 
@@ -37,6 +39,7 @@ export default function PicksBoard({
   markets,
   bankroll = 0,
   kellyFraction = 0,
+  mode = "all",
   onClose,
   onPlaced,
 }: {
@@ -44,14 +47,16 @@ export default function PicksBoard({
   markets: string[];
   bankroll?: number;
   kellyFraction?: number;
+  mode?: "all" | "bankers";
   onClose: () => void;
   onPlaced: () => void;
 }) {
+  const bankers = mode === "bankers";
   const [cands, setCands] = useState<Candidate[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [sel, setSel] = useState<Set<number>>(new Set());
   const [search, setSearch] = useState("");
-  const [sortBy, setSortBy] = useState<"ev" | "prob">("ev");
+  const [sortBy, setSortBy] = useState<"ev" | "prob">(bankers ? "prob" : "ev");
   const [valueOnly, setValueOnly] = useState(false);
 
   const [built, setBuilt] = useState<Built[]>([]);
@@ -59,7 +64,8 @@ export default function PicksBoard({
   const [evaluating, setEvaluating] = useState(false);
 
   useEffect(() => {
-    api.getPicks(fixtures, markets).then(setCands).catch((e) => setErr(String(e)));
+    const load = bankers ? api.getBankers(fixtures, markets) : api.getPicks(fixtures, markets);
+    load.then(setCands).catch((e) => setErr(errMsg(e)));
   }, []);
 
   const shown = useMemo(() => {
@@ -75,11 +81,14 @@ export default function PicksBoard({
           c.market.toLowerCase().includes(q) ||
           c.fixture.toLowerCase().includes(q)
       );
-    rows.sort((a, b) =>
-      sortBy === "ev" ? (b.c.ev ?? -9) - (a.c.ev ?? -9) : b.c.est_prob - a.c.est_prob
-    );
+    // Bankers arrive pre-ranked by the banker score — keep that order.
+    if (!bankers) {
+      rows.sort((a, b) =>
+        sortBy === "ev" ? (b.c.ev ?? -9) - (a.c.ev ?? -9) : b.c.est_prob - a.c.est_prob
+      );
+    }
     return rows.slice(0, 120);
-  }, [cands, search, sortBy, valueOnly]);
+  }, [cands, search, sortBy, valueOnly, bankers]);
 
   const slip = useMemo(() => (cands ? [...sel].map((i) => cands[i]).filter(Boolean) : []), [cands, sel]);
   const slipProb = slip.reduce((a, c) => a * c.est_prob, 1);
@@ -137,7 +146,7 @@ export default function PicksBoard({
         prev.map((b) => (b.evalSel ? { ...b, result: evals[k++] ?? null } : b))
       );
     } catch (e) {
-      setErr(String(e));
+      setErr(errMsg(e));
     } finally {
       setEvaluating(false);
     }
@@ -146,14 +155,15 @@ export default function PicksBoard({
   return (
     <div className="space-y-3 pb-40">
       <div className="flex items-center justify-between">
-        <h2 className="text-lg font-bold">Picks board</h2>
+        <h2 className="text-lg font-bold">{bankers ? "🏦 Bankers board" : "Picks board"}</h2>
         <button className="btn btn-ghost text-sm py-2" onClick={onClose}>
           Done
         </button>
       </div>
       <p className="text-[11px] text-slate-500">
-        Tap picks → "Add as ticket" to build several. Select tickets and Evaluate to get model
-        analysis + risks. +EV uses best book price vs Pinnacle.
+        {bankers
+          ? "The safest, most repeatable legs across your slate — ranked by likelihood, recurring events and recent form, must-play only. Anchor an accumulator with these, then evaluate."
+          : 'Tap picks → "Add as ticket" to build several. Select tickets and Evaluate to get model analysis + risks. +EV uses best book price vs Pinnacle.'}
       </p>
 
       {/* built tickets */}
@@ -246,6 +256,7 @@ export default function PicksBoard({
         <button className={`chip ${valueOnly ? "chip-on" : ""}`} onClick={() => setValueOnly((v) => !v)}>
           +EV only
         </button>
+        <Hint text="EV (expected value) is your edge per $1 staked: book odds × true probability − 1. Positive means the price beats the fair chance. We judge it against the sharp Pinnacle de-vigged probability where available, else our model." />
       </div>
 
       {err && <div className="text-xs text-bad">{err}</div>}
@@ -347,9 +358,18 @@ function PlaceRow({
 
   async function place() {
     const s = parseFloat(stake);
-    if (!Number.isFinite(s) || s <= 0) return;
+    if (!Number.isFinite(s) || s <= 0) {
+      toast.error("Enter a stake greater than 0.");
+      return;
+    }
     const o = parseFloat(odds);
-    await api.placeBet(ticket, s, Number.isFinite(o) && o > 0 ? o : null, false, "board").catch(() => {});
+    try {
+      await api.placeBet(ticket, s, Number.isFinite(o) && o > 0 ? o : null, false, "board");
+    } catch (e) {
+      toast.error(e);
+      return;
+    }
+    toast.success(`Bet placed — $${s.toFixed(2)}`);
     setPlaced(true);
     onPlaced();
   }
@@ -371,8 +391,8 @@ function PlaceRow({
           value={odds}
           onChange={(e) => setOdds(e.target.value)}
         />
-        <button className="btn btn-ghost text-xs px-3 py-1.5" onClick={place} disabled={placed}>
-          {placed ? "Placed ✓" : "Place"}
+        <button className="btn btn-primary text-xs px-3 py-1.5" onClick={place} disabled={placed}>
+          {placed ? "Placed ✓" : `Place${stake ? ` $${stake}` : ""}`}
         </button>
         <button className="text-xs text-slate-500 underline ml-auto" onClick={onRemove}>
           remove

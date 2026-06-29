@@ -236,6 +236,56 @@ export interface IngestInfo {
   new_count: number;
 }
 
+export interface LiveFixture {
+  fixture_id: number;
+  league_id: number;
+  league_name: string;
+  season: number;
+  home_team: string;
+  away_team: string;
+  home_team_id: number;
+  away_team_id: number;
+  status: string;
+  elapsed: number;
+  home_goals: number;
+  away_goals: number;
+  has_stats: boolean;
+}
+export interface LiveStatKV { label: string; value: string }
+export interface LiveTeamStat { team: string; stats: LiveStatKV[] }
+export interface LiveEvent { minute: number; team: string; kind: string; player: string; detail: string }
+export interface LiveEstimate { label: string; prob: number; basis: string; edge?: number | null; book?: string | null }
+export interface LiveOdd { market: string; selection: string; odds: number; implied: number }
+export interface LiveSnapshot {
+  fixture: LiveFixture;
+  stats: LiveTeamStat[];
+  events: LiveEvent[];
+  estimates: LiveEstimate[];
+  odds: LiveOdd[];
+  note: string;
+}
+export interface LiveLeg { label: string; prob: number; odds: number | null; source: string; why: string }
+export interface LiveTicket {
+  fixture: LiveFixture;
+  legs: LiveLeg[];
+  combined_prob: number;
+  combined_odds: number | null;
+  rationale: string;
+  confidence: string;
+  model: string;
+  cached: boolean;
+  note: string;
+}
+
+export interface SgpPrice {
+  correlated: number;
+  independent: number;
+  lift: number;
+  fair_odds: number;
+  legs: number;
+  sims: number;
+}
+
 export interface ModelPurposeRow {
   model: string;
   purpose: string;
@@ -519,5 +569,8 @@ export const MARKETS: MarketDef[] = [
   { key: "tcorners", label: "Team Corners (recent form)", group: "team", sub: "Goals" },
   { key: "tshots", label: "Team Shots (recent form)", group: "team", sub: "Goals" },
   { key: "toffsides", label: "Team Offsides (recent form)", group: "team", sub: "Involvement" },
+  { key: "tcards", label: "Team Total Cards", group: "team", sub: "Involvement" },
+  { key: "bothcards", label: "Both Teams Carded", group: "team", sub: "Involvement" },
+  { key: "mostcards", label: "Most Cards (which team)", group: "team", sub: "Involvement" },
   { key: "saves", label: "Goalkeeper Saves", group: "player", sub: "Involvement" },
 ];

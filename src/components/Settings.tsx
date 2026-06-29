@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
+import { errMsg, toast } from "../toast";
 import { api } from "../api";
+import Hint from "./Hint";
 import { COMMON_BOOKS, MODEL_OPTIONS, TIMEZONES, type BankrollView, type SettingsView } from "../types";
 
 export default function Settings({
@@ -15,7 +17,6 @@ export default function Settings({
   const [an, setAn] = useState("");
   const [grok, setGrok] = useState("");
   const [openai, setOpenai] = useState("");
-  const [parlay, setParlay] = useState("");
   const [model, setModel] = useState(settings.model);
   const [limit, setLimit] = useState(String(settings.meter.limit));
   const [selBooks, setSelBooks] = useState<Set<string>>(new Set(settings.books));
@@ -51,7 +52,7 @@ export default function Settings({
         an || null,
         grok || null,
         openai || null,
-        parlay || null,
+        null,
         model,
         Number.isFinite(lim) && lim > 0 ? lim : null,
         [...selBooks],
@@ -66,10 +67,10 @@ export default function Settings({
       setAn("");
       setGrok("");
       setOpenai("");
-      setParlay("");
       setProxyToken("");
+      toast.success("Settings saved.");
     } catch (e) {
-      setErr(String(e));
+      toast.error(e);
     } finally {
       setBusy(false);
     }
@@ -92,7 +93,7 @@ export default function Settings({
       URL.revokeObjectURL(url);
       setDataMsg("Exported — saved to your Downloads.");
     } catch (e) {
-      setErr(String(e));
+      setErr(errMsg(e));
     }
   }
 
@@ -109,7 +110,7 @@ export default function Settings({
       setDataMsg(`Imported ${n} rows. Reloading…`);
       setTimeout(() => window.location.reload(), 700);
     } catch (e) {
-      setErr(String(e));
+      setErr(errMsg(e));
     } finally {
       setImporting(false);
     }
@@ -117,13 +118,12 @@ export default function Settings({
 
   async function doReset() {
     if (!confirm("Reset everything? This permanently clears ALL bets, generated tickets, saved picks, stats, calibration learning and caches. Your API keys and settings are kept. This cannot be undone.")) return;
-    if (!confirm("Are you sure? There's no undo.")) return;
     try {
       await api.resetData();
       setDataMsg("Reset complete. Reloading…");
       setTimeout(() => window.location.reload(), 700);
     } catch (e) {
-      setErr(String(e));
+      setErr(errMsg(e));
     }
   }
 
@@ -133,7 +133,7 @@ export default function Settings({
     try {
       setBank(await api.setBankroll(v));
     } catch (e) {
-      setErr(String(e));
+      setErr(errMsg(e));
     }
   }
 
@@ -191,7 +191,10 @@ export default function Settings({
         </div>
 
         <div className="pt-1">
-          <div className="text-xs font-semibold text-slate-400 mb-1">Stake sizing (Kelly)</div>
+          <div className="text-xs font-semibold text-slate-400 mb-1">
+            Stake sizing (Kelly)
+            <Hint text="The Kelly criterion sizes each stake from your edge and the odds to grow a bankroll fastest. It's aggressive, so we use a fraction (¼ is the sane default) — far less swing for almost the same growth." />
+          </div>
           <p className="text-[11px] text-slate-500 mb-2">
             Suggests a stake per ticket from edge + bankroll. Fractional Kelly trades a little
             growth for far less variance — ¼ is the sane default.
@@ -315,12 +318,6 @@ export default function Settings({
           set={settings.has_openai_key}
           value={openai}
           onChange={setOpenai}
-        />
-        <KeyInput
-          label="Parlay API key — sharp odds / de-vig / +EV, optional"
-          set={settings.has_parlay_key}
-          value={parlay}
-          onChange={setParlay}
         />
         <div className="pt-1 border-t border-edge">
           <div className="text-xs font-semibold text-slate-300 mt-2">🌐 Server mode (shared access)</div>

@@ -53,11 +53,29 @@ cp .env.example .env        # dev only — fill in keys (optional; Settings work
 npm run tauri dev           # launches the desktop app
 ```
 
-Build a release bundle:
+## Build & deploy
 
 ```bash
 npm run tauri build
 ```
+
+This produces signed-if-configured native bundles under
+`src-tauri/target/release/bundle/`:
+
+- **macOS** — `dmg/powabet_<version>_<arch>.dmg` (installer) and `macos/powabet.app`.
+  Built per-architecture; run on Apple Silicon to get `aarch64`, on Intel for `x64`, or
+  add `--target universal-apple-darwin` for a universal binary. Unsigned bundles open via
+  right-click → Open the first time (Gatekeeper). For notarized distribution, add an Apple
+  signing identity to `tauri.conf.json` → `bundle.macOS`.
+- **Windows** — `.msi` / `.exe` (NSIS) when built on Windows.
+- **Linux** — `.deb` / `.AppImage` when built on Linux.
+
+Versioning lives in three files, keep them in sync: `package.json`, `src-tauri/Cargo.toml`,
+and `src-tauri/tauri.conf.json` (`version`). Cross-platform installers are best produced in
+CI (e.g. GitHub Actions with the `tauri-apps/tauri-action`), one runner per OS.
+
+No secrets are bundled — API keys are entered by the user in **Settings** at runtime and
+stored in the OS app-data `settings.json`; `.env` is dev-only and gitignored.
 
 ## Keys
 

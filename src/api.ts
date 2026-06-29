@@ -16,6 +16,9 @@ import type {
   IngestInfo,
   IngestItem,
   LeagueOption,
+  LiveFixture,
+  LiveSnapshot,
+  LiveTicket,
   MarketReportRow,
   ModelPurposeRow,
   PlacedBet,
@@ -23,10 +26,12 @@ import type {
   RequestMeter,
   SavedTicket,
   SettingsView,
+  SgpPrice,
   TeamSquad,
   TeamStatsView,
   Ticket,
   TicketEval,
+  TicketLeg,
   UsageBreakdown,
   FixtureInput,
 } from "./types";
@@ -162,6 +167,13 @@ export const api = {
   exportData: () => invoke<string>("export_data"),
   importData: (json: string) => invoke<number>("import_data", { json }),
   resetData: () => invoke<void>("reset_data"),
+
+  liveFixtures: () => invoke<LiveFixture[]>("live_fixtures"),
+  liveSnapshot: (fixture: LiveFixture) => invoke<LiveSnapshot>("live_snapshot", { fixture }),
+  liveTicket: (fixture: LiveFixture, model: string) => invoke<LiveTicket>("live_ticket", { fixture, model }),
+  priceSgp: (legs: TicketLeg[]) => invoke<SgpPrice>("price_sgp", { legs }),
+  getBankers: (fixtures: FixtureInput[], markets: string[]) =>
+    invoke<Candidate[]>("get_bankers", { fixtures, markets }),
 
   usageByPurpose: () => invoke<ModelPurposeRow[]>("usage_by_purpose"),
   exportExtension: () => invoke<string>("export_extension"),

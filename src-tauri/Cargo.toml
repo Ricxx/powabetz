@@ -1,6 +1,6 @@
 [package]
 name = "powabet"
-version = "0.1.0"
+version = "1.0.0"
 description = "Click-driven football player-prop research"
 authors = ["powabet"]
 edition = "2021"

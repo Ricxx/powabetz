@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { errMsg } from "../toast";
 import { api } from "../api";
 import type { BuildResult, SavedTicket } from "../types";
 import Results from "./Results";
@@ -9,7 +10,7 @@ export default function History({ onClose }: { onClose: () => void }) {
   const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
-    api.listTickets().then(setTickets).catch((e) => setErr(String(e)));
+    api.listTickets().then(setTickets).catch((e) => setErr(errMsg(e)));
   }, []);
 
   if (open) {

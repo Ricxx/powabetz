@@ -131,10 +131,26 @@ fn bet_tag(id: i64, name: &str) -> Option<&'static str> {
         266 => return Some("fouls"),
         272 | 278 => return Some("tackles"),
         273 | 279 => return Some("passes"),
+        6 => return Some("h1ou"),
+        26 => return Some("h2ou"),
+        10 => return Some("exact"),
+        82 => return Some("tcards_home"),
+        83 => return Some("tcards_away"),
+        158 => return Some("mostcards"),
         _ => {}
     }
     let n = name.to_lowercase();
-    if n.contains("anytime") && n.contains("scorer") {
+    if n.contains("goalkeeper saves") {
+        Some("saves")
+    } else if n.contains("both teams to receive a card") {
+        Some("bothcards")
+    } else if n == "exact score" {
+        Some("exact")
+    } else if n.contains("offsides") && n.contains("home") && n.contains("total") {
+        Some("toffsides_home")
+    } else if n.contains("offsides") && n.contains("away") && n.contains("total") {
+        Some("toffsides_away")
+    } else if n.contains("anytime") && n.contains("scorer") {
         Some("scorer")
     } else {
         None
@@ -222,9 +238,12 @@ fn devig(odds: &[f64]) -> Vec<f64> {
 }
 
 /// O/U tags that carry "Over X.5 / Under X.5" lines.
-const OU_TAGS: [&str; 5] = ["ou", "tgoals_home", "tgoals_away", "corners_home", "corners_away"];
+const OU_TAGS: [&str; 11] = [
+    "ou", "tgoals_home", "tgoals_away", "corners_home", "corners_away",
+    "h1ou", "h2ou", "tcards_home", "tcards_away", "toffsides_home", "toffsides_away",
+];
 /// Player threshold prop tags (value like "Name - 1+" or "Name Over 0.5").
-const PROP_TAGS: [&str; 5] = ["sot", "pshots", "fouls", "tackles", "passes"];
+const PROP_TAGS: [&str; 6] = ["sot", "pshots", "fouls", "tackles", "passes", "saves"];
 
 pub fn parse_fixture_odds(json: &Value, allowed: &[String]) -> FixtureOdds {
     let mut out = FixtureOdds::default();
@@ -271,6 +290,21 @@ pub fn parse_fixture_odds(json: &Value, allowed: &[String]) -> FixtureOdds {
             "dc" => {
                 if let Some(s) = dc_sel(value) {
                     best(&mut out.book, format!("dc|{s}"), *odd, bname);
+                }
+            }
+            "exact" => {
+                let s = value.replace(':', "-").replace(' ', "");
+                best(&mut out.book, format!("exact|{s}"), *odd, bname);
+            }
+            "bothcards" => {
+                let s = if value.starts_with("yes") { "yes" } else if value.starts_with("no") { "no" } else { "" };
+                if !s.is_empty() {
+                    best(&mut out.book, format!("bothcards|{s}"), *odd, bname);
+                }
+            }
+            "mostcards" => {
+                if let Some(s) = onex2_sel(value) {
+                    best(&mut out.book, format!("mostcards|{s}"), *odd, bname);
                 }
             }
             _ => {}
@@ -323,6 +357,35 @@ pub fn parse_fixture_odds(json: &Value, allowed: &[String]) -> FixtureOdds {
         let p = devig(&[y, n]);
         out.pin.insert("btts|yes".into(), round4(p[0]));
         out.pin.insert("btts|no".into(), round4(p[1]));
+    }
+
+    if let (Some(y), Some(n)) = (pin_get("bothcards", "yes"), pin_get("bothcards", "no")) {
+        let p = devig(&[y, n]);
+        out.pin.insert("bothcards|yes".into(), round4(p[0]));
+        out.pin.insert("bothcards|no".into(), round4(p[1]));
+    }
+
+    // Most cards (which team gets more) — de-vig the 3-way like 1x2.
+    if let (Some(h), Some(d), Some(a)) = (pin_get("mostcards", "home"), pin_get("mostcards", "draw"), pin_get("mostcards", "away")) {
+        let p = devig(&[h, d, a]);
+        out.pin.insert("mostcards|home".into(), round4(p[0]));
+        out.pin.insert("mostcards|draw".into(), round4(p[1]));
+        out.pin.insert("mostcards|away".into(), round4(p[2]));
+    }
+
+    // Exact score — de-vig the whole scoreline set together.
+    {
+        let exacts: Vec<(String, f64)> = rows
+            .iter()
+            .filter(|(bid, _, t, _, o)| *bid == PINNACLE && *t == "exact" && *o > 1.0)
+            .map(|(_, _, _, v, o)| (v.replace(':', "-").replace(' ', ""), *o))
+            .collect();
+        if exacts.len() >= 2 {
+            let probs = devig(&exacts.iter().map(|(_, o)| *o).collect::<Vec<_>>());
+            for ((s, _), p) in exacts.iter().zip(probs) {
+                out.pin.insert(format!("exact|{s}"), round4(p));
+            }
+        }
     }
 
     for (bid, _, tag, value, odd) in &rows {
