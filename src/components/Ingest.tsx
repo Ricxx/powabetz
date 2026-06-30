@@ -27,12 +27,28 @@ export default function Ingest({ onClose }: { onClose: () => void }) {
   const [extPath, setExtPath] = useState<string | null>(null);
   const [showSetup, setShowSetup] = useState(false);
   const [expanded, setExpanded] = useState<Set<number>>(new Set());
-  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  const [openGroups, setOpenGroups] = useState<Set<string>>(new Set()); // collapsed by default
+  const [showArchive, setShowArchive] = useState(false);
   const [procModel, setProcModel] = useState("claude-haiku-4-5");
 
   function load() {
     api.ingestInfo().then(setInfo).catch(() => {});
-    api.listIngested().then(setItems).catch((e) => setErr(errMsg(e)));
+    api
+      .listIngested()
+      .then((list) => {
+        // Auto-clean: drop archived pages whose fixture was 7+ days ago.
+        const cutoff = new Date(Date.now() - 7 * 86400_000).toISOString().slice(0, 10);
+        const stale = list.filter((it) => it.fixture_date && it.fixture_date < cutoff);
+        if (stale.length > 0) {
+          Promise.allSettled(stale.map((it) => api.deleteIngested(it.id))).then(() =>
+            api.listIngested().then(setItems).catch(() => {})
+          );
+          setItems(list.filter((it) => !stale.some((s) => s.id === it.id)));
+        } else {
+          setItems(list);
+        }
+      })
+      .catch((e) => setErr(errMsg(e)));
   }
   useEffect(load, []);
   // Auto-refresh so pages sent from the browser appear without a manual reload.
@@ -129,7 +145,125 @@ export default function Ingest({ onClose }: { onClose: () => void }) {
     if (!groups.has(key)) groups.set(key, { label, date, items: [] });
     groups.get(key)!.items.push(it);
   }
-  const grouped = [...groups.values()].sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+  // Active = matches today/upcoming (or undated); Archive = day already passed.
+  const today = new Date().toISOString().slice(0, 10);
+  const all = [...groups.values()];
+  const active = all
+    .filter((g) => !g.date || g.date >= today)
+    .sort((a, b) => (a.date || "9999").localeCompare(b.date || "9999") || a.label.localeCompare(b.label));
+  const archive = all.filter((g) => g.date && g.date < today).sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+
+  const dayLabel = (d: string) => {
+    if (!d) return "Undated";
+    const dt = new Date(d + "T00:00:00");
+    if (d === today) return "Today";
+    if (d === new Date(Date.now() + 86400_000).toISOString().slice(0, 10)) return "Tomorrow";
+    return dt.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" });
+  };
+
+  // One ingested source card.
+  const renderItem = (it: IngestItem) => (
+    <div key={it.id} className="card space-y-1.5">
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <div className="text-sm font-medium truncate">{it.title || it.url}</div>
+          <div className="text-[11px] text-slate-500 flex items-center gap-2 flex-wrap">
+            <a className="truncate hover:text-slate-300" href={it.url} target="_blank" rel="noreferrer">
+              {hostOf(it.url)}
+            </a>
+            <span>· ingested {fmtDate(it.created_at)}</span>
+            {it.status === "processed" && it.model && <span>· by {modelLabel(it.model)}</span>}
+            {it.used && <span className="text-accent">· used in a build</span>}
+          </div>
+        </div>
+        <span className={`badge shrink-0 ${it.status === "processed" ? "bg-accent/20 text-accent" : "bg-edge text-slate-300"}`}>
+          {it.status === "processed" ? "processed" : "new"}
+        </span>
+      </div>
+
+      {it.summary && <p className="text-xs text-slate-400">{it.summary}</p>}
+
+      {/* Extraction output — viewable so you can check it isn't garbage */}
+      {it.status === "processed" && it.data.length > 0 && (
+        <div>
+          <button className="text-[11px] text-slate-400 hover:text-slate-100" onClick={() => toggle(it.id)}>
+            {expanded.has(it.id) ? "▴ hide extracted data" : `▾ view extracted data (${it.data.length})`}
+          </button>
+          {expanded.has(it.id) && (
+            <table className="w-full text-[11px] mt-1">
+              <tbody>
+                {it.data.map((kv, i) => (
+                  <tr key={i} className="border-t border-edge">
+                    <td className="py-0.5 pr-2 text-slate-500 align-top">{kv.label}</td>
+                    <td className="py-0.5 text-slate-200">{kv.value}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
+
+      <textarea
+        className="w-full rounded-lg bg-ink border border-edge px-2 py-1.5 text-xs"
+        rows={2}
+        placeholder="Note for Haiku (e.g. 'extract only the predicted scoreline + corners')"
+        defaultValue={it.note}
+        onBlur={(e) => saveNote(it.id, e.target.value)}
+      />
+
+      <div className="flex items-center gap-3 text-xs">
+        <button
+          className="btn btn-primary text-xs px-3 py-1.5"
+          disabled={busy.has(it.id) || bulk !== null}
+          onClick={() => process(it.id)}
+        >
+          {busy.has(it.id) ? (
+            <span className="inline-flex items-center gap-2"><Spinner /> Processing…</span>
+          ) : it.status === "processed" ? (
+            `Re-process with ${modelLabel(procModel)}`
+          ) : (
+            `Process with ${modelLabel(procModel)}`
+          )}
+        </button>
+        <button className="underline text-slate-500" onClick={() => del(it.id)}>
+          delete
+        </button>
+      </div>
+    </div>
+  );
+
+  // One fixture's collapsible group (collapsed by default).
+  const renderGroup = (g: { label: string; date: string; items: IngestItem[] }) => {
+    const gkey = g.label + g.date;
+    const isOpen = openGroups.has(gkey);
+    const unprocessed = g.items.filter((x) => x.status !== "processed").length;
+    return (
+      <div key={gkey} className="space-y-2">
+        <div className="flex items-center gap-2 px-1">
+          <button
+            className="flex items-center gap-2 text-left min-w-0"
+            onClick={() => setOpenGroups((p) => { const n = new Set(p); n.has(gkey) ? n.delete(gkey) : n.add(gkey); return n; })}
+          >
+            <span className="text-slate-500 text-xs">{isOpen ? "▾" : "▸"}</span>
+            <span className="text-sm font-semibold text-slate-200 truncate">📌 {g.label}</span>
+            <span className="text-[11px] text-slate-500 shrink-0">· {g.items.length} src{unprocessed > 0 ? `, ${unprocessed} new` : ""}</span>
+          </button>
+          {unprocessed > 0 && (
+            <button
+              className="ml-auto chip text-[10px] py-0.5 shrink-0"
+              disabled={!!bulk}
+              onClick={() => processIds(g.items.map((x) => x.id))}
+              title="Process every new source for this fixture"
+            >
+              Process {unprocessed}
+            </button>
+          )}
+        </div>
+        {isOpen && g.items.map((it) => renderItem(it))}
+      </div>
+    );
+  };
 
   return (
     <div className="space-y-3">
@@ -232,107 +366,44 @@ export default function Ingest({ onClose }: { onClose: () => void }) {
         </div>
       )}
 
-      {grouped.map((g) => {
-        const gkey = g.label + g.date;
-        const isCollapsed = collapsed.has(gkey);
-        const unprocessed = g.items.filter((x) => x.status !== "processed").length;
-        return (
-        <div key={gkey} className="space-y-2">
-          <div className="flex items-center gap-2 px-1">
-            <button
-              className="flex items-center gap-2 text-left min-w-0"
-              onClick={() => setCollapsed((p) => { const n = new Set(p); n.has(gkey) ? n.delete(gkey) : n.add(gkey); return n; })}
-            >
-              <span className="text-slate-500 text-xs">{isCollapsed ? "▸" : "▾"}</span>
-              <span className="text-sm font-semibold text-slate-200 truncate">📌 {g.label}</span>
-              {g.date && <span className="text-[11px] text-slate-500 shrink-0">{g.date}</span>}
-              <span className="text-[11px] text-slate-500 shrink-0">· {g.items.length} src{unprocessed > 0 ? `, ${unprocessed} new` : ""}</span>
-            </button>
-            {unprocessed > 0 && (
-              <button
-                className="ml-auto chip text-[10px] py-0.5 shrink-0"
-                disabled={!!bulk}
-                onClick={() => processIds(g.items.map((x) => x.id))}
-                title="Process every new source for this fixture"
-              >
-                Process {unprocessed}
-              </button>
-            )}
-          </div>
-
-          {!isCollapsed && g.items.map((it) => (
-            <div key={it.id} className="card space-y-1.5">
-              <div className="flex items-start justify-between gap-2">
-                <div className="min-w-0">
-                  <div className="text-sm font-medium truncate">{it.title || it.url}</div>
-                  <div className="text-[11px] text-slate-500 flex items-center gap-2 flex-wrap">
-                    <a className="truncate hover:text-slate-300" href={it.url} target="_blank" rel="noreferrer">
-                      {hostOf(it.url)}
-                    </a>
-                    <span>· ingested {fmtDate(it.created_at)}</span>
-                    {it.status === "processed" && it.model && <span>· by {modelLabel(it.model)}</span>}
-                    {it.used && <span className="text-accent">· used in a build</span>}
-                  </div>
-                </div>
-                <span className={`badge shrink-0 ${it.status === "processed" ? "bg-accent/20 text-accent" : "bg-edge text-slate-300"}`}>
-                  {it.status === "processed" ? "processed" : "new"}
-                </span>
-              </div>
-
-              {it.summary && <p className="text-xs text-slate-400">{it.summary}</p>}
-
-              {/* Extraction output — viewable so you can check it isn't garbage */}
-              {it.status === "processed" && it.data.length > 0 && (
-                <div>
-                  <button className="text-[11px] text-slate-400 hover:text-slate-100" onClick={() => toggle(it.id)}>
-                    {expanded.has(it.id) ? "▴ hide extracted data" : `▾ view extracted data (${it.data.length})`}
-                  </button>
-                  {expanded.has(it.id) && (
-                    <table className="w-full text-[11px] mt-1">
-                      <tbody>
-                        {it.data.map((kv, i) => (
-                          <tr key={i} className="border-t border-edge">
-                            <td className="py-0.5 pr-2 text-slate-500 align-top">{kv.label}</td>
-                            <td className="py-0.5 text-slate-200">{kv.value}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  )}
-                </div>
+      {/* ACTIVE — today & upcoming, grouped by day, earliest first. */}
+      {active.length > 0 &&
+        active.map((g, i) => {
+          const prev = active[i - 1];
+          const showDay = !prev || (prev.date || "") !== (g.date || "");
+          return (
+            <div key={g.label + g.date} className="space-y-2">
+              {showDay && (
+                <div className="text-[11px] font-bold text-accent uppercase tracking-wide pt-1 px-1">📅 {dayLabel(g.date)}</div>
               )}
-
-              <textarea
-                className="w-full rounded-lg bg-ink border border-edge px-2 py-1.5 text-xs"
-                rows={2}
-                placeholder="Note for Haiku (e.g. 'extract only the predicted scoreline + corners')"
-                defaultValue={it.note}
-                onBlur={(e) => saveNote(it.id, e.target.value)}
-              />
-
-              <div className="flex items-center gap-3 text-xs">
-                <button
-                  className="btn btn-primary text-xs px-3 py-1.5"
-                  disabled={busy.has(it.id) || bulk !== null}
-                  onClick={() => process(it.id)}
-                >
-                  {busy.has(it.id) ? (
-                    <span className="inline-flex items-center gap-2"><Spinner /> Processing…</span>
-                  ) : it.status === "processed" ? (
-                    `Re-process with ${modelLabel(procModel)}`
-                  ) : (
-                    `Process with ${modelLabel(procModel)}`
-                  )}
-                </button>
-                <button className="underline text-slate-500" onClick={() => del(it.id)}>
-                  delete
-                </button>
-              </div>
+              {renderGroup(g)}
             </div>
-          ))}
+          );
+        })}
+
+      {/* ARCHIVE — matches whose day has passed. Not used in future builds; auto-deleted 7 days on. */}
+      {archive.length > 0 && (
+        <div className="space-y-2 pt-2 border-t border-edge">
+          <button
+            className="w-full flex items-center justify-between text-left px-1"
+            onClick={() => setShowArchive((v) => !v)}
+          >
+            <span className="text-xs font-semibold text-slate-400">🗄 Archive — {archive.length} past fixture{archive.length === 1 ? "" : "s"}</span>
+            <span className="text-[11px] text-slate-500">{showArchive ? "hide ▴" : "show ▾"}</span>
+          </button>
+          {showArchive && (
+            <>
+              <p className="text-[10px] text-slate-500 px-1">Past matches — kept for reference, never used in new builds, auto-removed 7 days after kickoff.</p>
+              {archive.map((g) => (
+                <div key={g.label + g.date} className="space-y-2">
+                  <div className="text-[11px] text-slate-600 px-1">📅 {dayLabel(g.date)}</div>
+                  {renderGroup(g)}
+                </div>
+              ))}
+            </>
+          )}
         </div>
-        );
-      })}
+      )}
     </div>
   );
 }

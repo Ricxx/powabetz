@@ -88,6 +88,7 @@ function stratLabel(s: string): string {
   if (s === "bankers") return "Anchors ⚓";
   if (s === "jackpot") return "Jackpot 🎰";
   if (s === "predictor") return "Match Predictor 🔮";
+  if (s === "scout") return "Scout 📡";
   if (s === "live") return "Live 🔴";
   if (s === "custom") return "Cherry-picked 🍒";
   if (s === "ladder") return "Acca ladder";

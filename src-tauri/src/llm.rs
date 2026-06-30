@@ -66,6 +66,8 @@ Pick legs that move in the SAME direction (positively correlated). NEVER stack c
 
 Rules: a player who hasn't scored recently is only a strong scorer pick when form_state="due_regression"; "cold_falling_off" means down-rank. Injured/suspended subjects cannot feature. If xg_source="proxy" or a leg carries a proxy/crude flag, lower confidence. NEVER stack nested/correlated legs for the SAME player in one ticket — a goal implies a shot on target which implies a shot, so pick only ONE of {anytime scorer, shots on target, player shots} per player (the others are redundant). Likewise never combine two lines of the same team goals/corners market. NEVER combine MUTUALLY-IMPLIED legs in one ticket: "Both teams to score" already GUARANTEES "Over 1.5 goals" (and almost always Over 0.5/1.5/the lower over lines) — pick ONE, not both; "Over 2.5" + "Over 1.5" is redundant (keep the higher); a team to win + that same team Double-Chance is redundant. Each leg in a ticket must add a GENUINELY new condition.
 
+CRITICAL — TEAM vs MATCH totals: a "Team Shots / Team Corners / Team Total Cards" line is for ONE team only (e.g. Mexico's own shots), NOT the match total of both teams. Never attach a both-teams figure to a single team: one team almost never exceeds ~18 shots, ~9 corners or ~4 cards in a game, so an "over 26.5 shots" or "over 14.5 corners" line on a SINGLE team is wrong — that is a match total. Only ever use a row EXACTLY as given in the table; never invent a line or move a total onto one team.
+
 CRITICAL for matching: in every leg, copy the row's "subject" verbatim into "selection" and the row's "market" verbatim into "market" (and its "line"). Do NOT put probabilities or odds in legs — those are filled in automatically afterwards. Treat predictions and the user's notes as soft context. Output strict JSON only."#;
 
 /// Options that shape the requested slate.
@@ -225,6 +227,7 @@ fn user_prompt(
         "power" => "POWER-STACKER mode — low-leg, high-conviction parlays: lottery-like payouts with FEWER things to connect. Build cross-game DOUBLES (occasionally a treble). Every leg must be a HIGH-LIKELIHOOD outcome that 'should happen' yet is still priced GENEROUSLY (~1.8-2.5) because the book is enticing action — a dominant favourite to win (~2.0), an in-form scorer the book shades (~2.2), a soft over. Stack TWO such legs so the COMBINED odds clear AT LEAST 4.0 (ideally 5-10x). You may pair ONE slightly-less-expected but still-likely leg (~2.5-5.0) with a near-certain ~2.0 leg to reach ~10x on something genuinely simple. Each leg from a DIFFERENT fixture; across the whole slate MAXIMISE diversity — different teams, players AND markets every ticket, never reuse the same selection. Lower variance is the point: do not over-stack. In each 'why', state the combined odds and explain why BOTH legs 'must happen'.",
         "predictor" => "MATCH-PREDICTOR mode — a DEEP read of ONE single game. The whole market for this fixture is in the table (every player prop and match prop). Build 6-8 DIFFERENT same-game tickets, each a distinct ANGLE on how the match plays out, so together they paint the full picture: e.g. (1) a SAFE banker SGP of high-likelihood legs, (2) a GOALS-themed SGP (a side to win + their scorer + over + BTTS), (3) a CARDS/physical SGP, (4) a STAR-PLAYERS SGP (the key men for shots/SOT/to score), (5) a CORRECT-SCORE-led build, (6) a VALUE longshot. Each ticket 3-5 correlated same-game legs that tell ONE coherent story. Mix player props AND match props across the set; never reuse the same selection across tickets. In each 'why', say what scenario it's betting on.",
         "jackpot" => "JACKPOT mode — deliberate LOTTERY TICKETS: small stake, life-changing-if-it-lands payout. Build big multi-leg parlays (5-8 legs) whose COMBINED hit chance is roughly 1-5% (use each leg's est_prob; the product should land ~0.01-0.05) and whose combined odds are LARGE (~20x to 150x+). Crucially these are PLAUSIBLE longshots, NOT random junk: every single leg must be a genuinely REASONABLE outcome on its own (an in-form scorer to score, a strong favourite to win, a likely card/shot/corner over) — the ticket is a longshot only because MANY reasonable things must ALL happen. Prefer POSITIVELY CORRELATED legs (same-game builds: a team to win + their striker to score + match over) so the legs reinforce each other and the true joint chance beats the naive product. Lean on the in-form flag, the API predictions and the Grok digest for which longshots are live. NEVER stack contradictory or mutually-exclusive legs. In each 'why', state the combined odds and the rough hit chance, and name the one leg most likely to break it.",
+        "scout" => "SCOUT mode — FUSE TWO INDEPENDENT SOURCES into the picks: (A) OUR full engine table above (every market, built from our API data + models), and (B) the FULL INGESTED PAGE(S) the user hand-fed for these fixtures (injected in the notes below — corners, cards, shots, form, xG, injuries, predictions, analyst reads, whatever the page carried). Some legs in the table are flagged 'from ingested stats' (derived straight from the page's numbers); the rest are ours. Your job: cross-reference the two and surface the picks they JOINTLY support. Rules: (1) Where our number and the ingested number AGREE on a line, that's your strongest conviction — lead with those. (2) Where they DISAGREE, judge which source to trust for that market and SAY why (e.g. the page has fresher corner data; our injury read is better). (3) Use the page's EXTRA angles our table can't see (a noted suspension, a tactical mismatch, a predicted scoreline) to pick or veto legs across ANY market, not just corners/cards/shots. (4) The ingested data is the user's EDGE — it must materially shape the slate, not be ignored. Build a varied set — singles and 2-5 leg builds across the fixtures. Never stack mutually-implied or same-team-same-market lines. In each 'why', name what BOTH sources said (e.g. 'our 5.6 + page 6.4 corners → over 4.5 strong' or 'page flags their CB suspended → fade their clean sheet').",
         _ => "Lean value/longshot: prioritise +EV legs (best price beats the true probability) — that is the exploitable edge.",
     };
     let variation_block = if opts.variation > 0 || !opts.exclude.is_empty() {
@@ -447,7 +450,7 @@ pub async fn openai_call(
     if proxy.is_none() && api_key.is_none() {
         return Err("OpenAI key not set. Add it in Settings.".to_string());
     }
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": model,
         "max_completion_tokens": max_tokens,
         "messages": [
@@ -455,6 +458,16 @@ pub async fn openai_call(
             { "role": "user", "content": user }
         ]
     });
+    // GPT-5 models are reasoning models: with the default effort they can burn the
+    // whole token budget on hidden reasoning and return EMPTY content (the cause of
+    // "model returned no JSON"). Cap the effort low so output tokens remain, and —
+    // when the prompt clearly wants JSON — force a JSON object response.
+    if model.starts_with("gpt-5") {
+        body["reasoning_effort"] = serde_json::json!("low");
+        if system.contains("JSON") || user.contains("Return ONLY this JSON") || user.contains("strict JSON") {
+            body["response_format"] = serde_json::json!({ "type": "json_object" });
+        }
+    }
     let endpoint = match &proxy {
         Some((base, _)) => format!("{base}/openai/v1/chat/completions"),
         None => OPENAI_ENDPOINT.to_string(),
@@ -603,10 +616,20 @@ Return ONLY this JSON (omit unknown fields, keep values short):
 
 For "data": capture EVERY useful NUMBER, not just a few. Prefer STATS with a clear subject in the label, e.g. "Morocco corners/game 6.4", "Morocco corners against 4.1", "Netherlands shots on target/game 5.2", "Netherlands cards/game 1.8", "Morocco possession 47%", "Netherlands xG 1.7", "Morocco form WWDLW", "Hakimi shots/game 2.1", "Brobbey goals 4". Include team form, corners, shots/SOT, cards/fouls, possession, xG/xGA, goals for/against, and key players' goals/assists/shots — whatever the page shows. Also keep any predicted score, 1X2 %, or analyst note. Copy numbers EXACTLY; never invent."#
     );
-    let (resp, gin, gout) = chat_call(state, model, INGEST_SYSTEM, &user, 2200).await?;
-    let start = resp.find('{').ok_or("model returned no JSON")?;
-    let end = resp.rfind('}').ok_or("model returned no JSON")?;
-    Ok((resp[start..=end].to_string(), gin, gout))
+    let (resp, gin, gout) = chat_call(state, model, INGEST_SYSTEM, &user, 3000).await?;
+    let start = resp.find('{');
+    let end = resp.rfind('}');
+    match (start, end) {
+        (Some(s), Some(e)) if e > s => Ok((resp[s..=e].to_string(), gin, gout)),
+        _ => {
+            let snip: String = resp.trim().chars().take(120).collect();
+            Err(format!(
+                "model returned no JSON (got {} chars: \"{}\"). Try a different model — gpt-5-nano can struggle here; Haiku is reliable.",
+                resp.trim().len(),
+                snip
+            ))
+        }
+    }
 }
 
 const EVAL_SYSTEM: &str = r#"You are a sharp football betting analyst. Return CLEAR, STRUCTURED output — never a rambling paragraph. Reason about the ACTUAL match(es) — the specific teams/players, the competition (use the per-leg "competition" — a World Cup knockout is not a friendly), likely lineups and ROTATION, tactics/formation, motivation, referee, home/away and form — NOT just the supplied numbers.

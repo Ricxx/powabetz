@@ -358,6 +358,19 @@ fn grade_leg(leg: &TicketLeg, r: &FixtureResult) -> LegResult {
             let (mine, theirs) = if is_home { (r.home_cards, r.away_cards) } else { (r.away_cards, r.home_cards) };
             won(mine > theirs, format!("cards {}-{}", r.home_cards as i64, r.away_cards as i64))
         }
+        "Most Corners" | "Most Shots" => {
+            let sel = leg.selection.to_lowercase();
+            let hl = r.home_name.to_lowercase();
+            let is_home = hl.contains(&sel) || sel.contains(&hl);
+            let (h, a) = if market == "Most Corners" { (r.home_corners, r.away_corners) } else { (r.home_shots, r.away_shots) };
+            match (h, a) {
+                (Some(hv), Some(av)) => {
+                    let (mine, theirs) = if is_home { (hv, av) } else { (av, hv) };
+                    won(mine > theirs, format!("{} {}-{}", if market == "Most Corners" { "corners" } else { "shots" }, hv as i64, av as i64))
+                }
+                _ => ungraded("no team stats"),
+            }
+        }
         "Team Total Cards" => {
             let sel = leg.selection.to_lowercase();
             let is_home = r.home_name.to_lowercase().contains(&sel) || sel.contains(&r.home_name.to_lowercase());

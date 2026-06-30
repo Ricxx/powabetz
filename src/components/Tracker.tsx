@@ -24,6 +24,7 @@ function stratLabel(s: string): string {
   if (s === "bankers") return "Anchors ⚓";
   if (s === "jackpot") return "Jackpot 🎰";
   if (s === "predictor") return "Match Predictor 🔮";
+  if (s === "scout") return "Scout 📡";
   if (s === "live") return "Live 🔴";
   if (s === "custom") return "Cherry-picked 🍒";
   if (s === "ladder") return "Acca ladder";
@@ -182,7 +183,7 @@ export default function Tracker({ onClose }: { onClose: () => void }) {
   const noGrok = split(bets.filter((b) => !b.grok_used));
 
   // ROI split by the strategy each ticket came from.
-  const strategies = ["value", "favorites", "likely", "oracle", "power", "bankers", "jackpot", "predictor", "live", "custom", "ladder", "board"].filter((s) =>
+  const strategies = ["value", "favorites", "likely", "oracle", "power", "bankers", "jackpot", "predictor", "scout", "live", "custom", "ladder", "board"].filter((s) =>
     bets.some((b) => b.strategy === s && b.settled)
   );
 

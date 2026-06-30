@@ -973,11 +973,11 @@ fn map_availability(kind: &str, reason: &str) -> String {
 
 // ---------- build tickets ----------
 
-const ALL_MARKETS: [&str; 28] = [
+const ALL_MARKETS: [&str; 30] = [
     "scorer", "sot", "pshots", "assists", "tackles", "fouls", "cards", "passes", "win", "dc",
     "btts", "half1", "half2", "ou25", "tgoals", "tcorners", "tshots", "ahandicap", "h1goals",
     "h2goals", "exactscore", "goalsrange", "saves", "toffsides", "tcards", "bothcards", "mostcards",
-    "firstscore",
+    "mostcorners", "mostshots", "firstscore",
 ];
 
 /// Fetch a team's full player list + season stats (paged), for auto candidate
@@ -1343,6 +1343,19 @@ async fn attach_plausibility(
                         if let Ok(conn) = state.db.lock() {
                             let _ = db::ai_put(&conn, &key, &v.to_string(), model, af::now_ts());
                         }
+                    }
+                }
+            }
+            // Backfill a NEUTRAL entry for any line the model didn't return (or
+            // renamed so it didn't match). Without this they stay uncached and get
+            // re-requested on every build — the cause of plausibility re-running.
+            for &i in &uncached {
+                if candidates[i].plausibility.is_none() {
+                    let v = serde_json::json!({ "s": 3, "r": "" });
+                    apply_plaus(&mut candidates[i], &v);
+                    let key = plaus_key(model, &candidates[i]);
+                    if let Ok(conn) = state.db.lock() {
+                        let _ = db::ai_put(&conn, &key, &v.to_string(), model, af::now_ts());
                     }
                 }
             }
@@ -1776,7 +1789,10 @@ pub async fn build_tickets(
     // Match Predictor: a deep read of ONE game — force every market so the
     // forecast and the SGP variations have the full picture.
     let predictor = selection.strategy.as_deref() == Some("predictor") && selection.fixtures.len() == 1;
-    let markets: Vec<String> = if selection.markets.is_empty() || predictor {
+    // Scout fuses OUR full data with the ingested page data through the model, so
+    // it needs the whole engine table built (every market), same as the predictor.
+    let scout = selection.strategy.as_deref() == Some("scout");
+    let markets: Vec<String> = if selection.markets.is_empty() || predictor || scout {
         ALL_MARKETS.iter().map(|s| s.to_string()).collect()
     } else {
         selection.markets.clone()
@@ -1798,6 +1814,40 @@ pub async fn build_tickets(
     // Calibration shrink learned from settled bets (1.0 = none).
     let (calib_lambda, calib_n) = calibration_shrink(&state);
     let calib_on = (calib_lambda - 1.0).abs() > 1e-6;
+
+    // Resolve the strategy up-front (Scout needs it inside the fixture loop).
+    let strategy = selection
+        .strategy
+        .clone()
+        .unwrap_or_else(|| if selection.most_likely { "likely".to_string() } else { "value".to_string() });
+    // Today (UTC) — used to ignore ARCHIVED ingests (past fixtures) everywhere.
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let ingest_archived = |v: &serde_json::Value| -> bool {
+        // Archived if the page's fixture date is strictly before today.
+        v.get("date").and_then(|d| d.as_str()).map(|d| !d.is_empty() && d < today.as_str()).unwrap_or(false)
+    };
+    // Scout strategy: picks built purely from ingested 3rd-party stats, kept
+    // independent of the engine. Pre-parse the matched pages' extracted JSON once.
+    let scout_parsed: Vec<(String, serde_json::Value)> = if strategy == "scout" {
+        let conn = state.db.lock().map_err(|_| "db lock")?;
+        db::ingest_for_fixture(&conn)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|i| i.status == "processed")
+            .filter_map(|i| {
+                let fl = i.fixture_label.clone()?;
+                let v = serde_json::from_str::<serde_json::Value>(i.extracted_json.as_deref()?).ok()?;
+                if ingest_archived(&v) {
+                    return None; // past fixture — archived, not for future builds
+                }
+                Some((crate::odds::fold(&fl), v))
+            })
+            .collect()
+    } else {
+        vec![]
+    };
+    let mut scout_candidates: Vec<Candidate> = Vec::new();
+    let mut scout_any_match = false;
 
     for fx in &selection.fixtures {
         let fixture_label = format!("{} vs {}", fx.home_team, fx.away_team);
@@ -2071,6 +2121,34 @@ pub async fn build_tickets(
 
         // Attach Pinnacle/Bet365/EV to this fixture's legs.
         features::attach_odds(&mut candidates, &fixture_odds, &fixture_label, &fx.home_team);
+
+        // Scout: build this fixture's picks straight from its ingested stats and
+        // price them off the same odds — kept in a SEPARATE pool from the engine.
+        if strategy == "scout" {
+            let (hf, af) = (crate::odds::fold(&fx.home_team), crate::odds::fold(&fx.away_team));
+            let matched: Vec<&serde_json::Value> = scout_parsed
+                .iter()
+                .filter(|(fl, _)| fl.contains(&hf) || fl.contains(&af))
+                .map(|(_, v)| v)
+                .collect();
+            if !matched.is_empty() {
+                scout_any_match = true;
+                // Stat lines the ingested page supports, derived + priced from its
+                // own numbers — added ALONGSIDE the engine's, both flagged by source.
+                let mut sc = crate::ingeststats::candidates_for_fixture(&matched, &fx.home_team, &fx.away_team, &fixture_label, fx.fixture_id);
+                features::attach_odds(&mut sc, &fixture_odds, &fixture_label, &fx.home_team);
+                scout_candidates.extend(sc);
+            }
+        }
+    }
+    // Scout FUSES both sources: our full engine table (our API stats) PLUS the
+    // ingest-derived stat lines, with the rest of the ingested page injected as
+    // rich context below. Requires at least one matching ingested page.
+    if strategy == "scout" {
+        if !scout_any_match {
+            return Err("Scout needs ingested data for these fixtures. Ingest a preview/stats page that matches one of your matches, process it (🧲 Ingest), then build Scout.".to_string());
+        }
+        candidates.extend(scout_candidates);
     }
 
     if calib_on {
@@ -2154,10 +2232,6 @@ pub async fn build_tickets(
 
     // "Most likely" mode ranks by pure probability and widens the pool so a far
     // broader set of plausible lines reaches the model (not just +EV ones).
-    let strategy = selection
-        .strategy
-        .clone()
-        .unwrap_or_else(|| if selection.most_likely { "likely".to_string() } else { "value".to_string() });
     let (mut pool_n, mut market_cap) = match strategy.as_str() {
         "likely" => (90usize, 18usize),
         "favorites" => (70, 14),
@@ -2166,6 +2240,7 @@ pub async fn build_tickets(
         "bankers" => (80, 16), // wide net of reliable recurring events
         "jackpot" => (90, 14), // lottery — wide pool of plausible longshots to stack big
         "predictor" => (110, 20), // deep single-match read — the whole market for one game
+        "scout" => (80, 18),  // ingest-derived corner/card/shot lines across the slate
         _ => (50, 8),         // value
     };
     // Make sure the pool is big enough to actually BUILD the requested slate: with
@@ -2244,7 +2319,9 @@ pub async fn build_tickets(
     };
     // Pull in any browser-ingested pages matched to these fixtures — labeled
     // 3rd-party context for the model, and mark each item "used".
-    if selection.use_ingest.unwrap_or(true) {
+    // Scout is built ON the ingested data, so always pull it in (and fully); the
+    // other strategies only fold it in when use_ingest is on (and compactly).
+    if selection.use_ingest.unwrap_or(true) || scout {
         let conn = state.db.lock().map_err(|_| "db lock")?;
         if let Ok(items) = db::ingest_for_fixture(&conn) {
             for it in items.iter().filter(|i| i.status == "processed") {
@@ -2256,17 +2333,29 @@ pub async fn build_tickets(
                     fl.contains(&crate::odds::fold(&f.home_team)) || fl.contains(&crate::odds::fold(&f.away_team))
                 });
                 if let Some(f) = m {
-                    let detail = it
-                        .extracted_json
-                        .as_deref()
-                        .and_then(|j| serde_json::from_str::<Value>(j).ok())
-                        .map(|v| compact_ingest(&v))
+                    let parsed = it.extracted_json.as_deref().and_then(|j| serde_json::from_str::<Value>(j).ok());
+                    // Skip ARCHIVED pages (their fixture day has passed) — never feed
+                    // a stale past-match page into a new build.
+                    if parsed.as_ref().map(|v| ingest_archived(v)).unwrap_or(false) {
+                        continue;
+                    }
+                    let detail = parsed
+                        // Scout gets EVERYTHING the page yielded; others a tight digest.
+                        .map(|v| if scout { compact_ingest_full(&v) } else { compact_ingest(&v) })
                         .unwrap_or_default();
                     if !detail.is_empty() {
-                        pred_notes.push(format!(
-                            "{} vs {}: INGESTED page stats (3rd-party, from {}) — WEIGH these for the matching markets (corner numbers inform corner O/U, card/foul numbers inform card markets, shot numbers inform shots/SOT, form & xG inform result/goals): {}",
-                            f.home_team, f.away_team, it.url, detail
-                        ));
+                        let note = if scout {
+                            format!(
+                                "{} vs {}: FULL INGESTED PAGE (3rd-party, from {}). This is the user's hand-fed intel — FUSE it with our table above: where our numbers and these AGREE, lean in; where they DIFFER, say which you trust and why; use the page's extra angles (form, xG, injuries, predictions, analyst reads) our table can't see. Data: {}",
+                                f.home_team, f.away_team, it.url, detail
+                            )
+                        } else {
+                            format!(
+                                "{} vs {}: INGESTED page stats (3rd-party, from {}) — WEIGH these for the matching markets (corner numbers inform corner O/U, card/foul numbers inform card markets, shot numbers inform shots/SOT, form & xG inform result/goals): {}",
+                                f.home_team, f.away_team, it.url, detail
+                            )
+                        };
+                        pred_notes.push(note);
                         let _ = db::ingest_mark_used(&conn, it.id);
                     }
                 }
@@ -4072,6 +4161,35 @@ fn compact_ingest(v: &Value) -> String {
         out.push_str(&data.join("; "));
     }
     out.chars().take(400).collect()
+}
+
+/// Full digest of an ingested page for the Scout strategy — every extracted
+/// stat/note (not a 12-item slice), so the model fuses the whole page with our
+/// data. Capped generously to stay within the token budget.
+fn compact_ingest_full(v: &Value) -> String {
+    let summary = v.get("summary").and_then(|s| s.as_str()).unwrap_or("");
+    let data: Vec<String> = v
+        .get("data")
+        .and_then(|d| d.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| {
+                    let l = e.get("label").and_then(|x| x.as_str())?;
+                    let val = e.get("value").and_then(|x| x.as_str())?;
+                    Some(format!("{l}={val}"))
+                })
+                .take(60)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut out = summary.to_string();
+    if !data.is_empty() {
+        if !out.is_empty() {
+            out.push_str(" | ");
+        }
+        out.push_str(&data.join("; "));
+    }
+    out.chars().take(1600).collect()
 }
 
 fn to_ingest_item(r: &db::IngestRow) -> IngestItem {

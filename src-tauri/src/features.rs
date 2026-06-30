@@ -53,9 +53,19 @@ fn pois_cdf(k: u32, l: f64) -> f64 {
 /// Values follow the empirical literature: corners ~mild, cards the most spread
 /// (refs/fixtures vary a lot), shots moderate. (Karlis & Ntzoufras 2000 on count
 /// models for football; corners/cards overdispersion is well documented.)
-const PHI_CORNERS: f64 = 1.18;
-const PHI_CARDS: f64 = 1.30;
-const PHI_SHOTS: f64 = 1.20;
+/// P(count A strictly exceeds count B) for two independent Poisson means — used
+/// for "which team gets the most corners/shots" (an either-team 1x2-style market).
+fn prob_more(la: f64, lb: f64) -> f64 {
+    let mut p = 0.0;
+    for b in 0..=40u32 {
+        p += pois_pmf(b, lb) * (1.0 - pois_cdf(b, la));
+    }
+    p.clamp(0.0, 1.0)
+}
+
+pub const PHI_CORNERS: f64 = 1.18;
+pub const PHI_CARDS: f64 = 1.30;
+pub const PHI_SHOTS: f64 = 1.20;
 const PHI_OFFSIDES: f64 = 1.15;
 // Per-PLAYER count props are overdispersed too — a player's shots/tackles vary
 // game to game with role, opponent and game state. Same NB treatment, slightly
@@ -77,7 +87,7 @@ fn nb_ge2(mu: f64, phi: f64) -> f64 {
 /// Negative-Binomial P(X > k) for mean `mu` with overdispersion `phi` (var/mean).
 /// Reduces to Poisson when phi ≈ 1. Parameterized by mean + dispersion:
 /// r = mu/(phi−1), p = r/(r+mu); pmf via the standard NB recurrence.
-fn nb_over(k: u32, mu: f64, phi: f64) -> f64 {
+pub fn nb_over(k: u32, mu: f64, phi: f64) -> f64 {
     if phi <= 1.0001 || mu <= 1e-6 {
         return (1.0 - pois_cdf(k, mu)).clamp(0.0, 1.0);
     }
@@ -1056,6 +1066,22 @@ pub fn build_team_candidates(
                     if let Some(p) = mr {
                         out.push(mk(team, "Most Cards", "mostcards", "most cards", p, clampp(p), vec!["recent card edge".to_string()]));
                     }
+                }
+            }
+            "mostcorners" => {
+                // Which team takes the most corners (either-team market).
+                if let (Some(hc), Some(ac)) = (home.corners_for, away.corners_for) {
+                    let (ph, pa) = (prob_more(hc, ac), prob_more(ac, hc));
+                    out.push(mk(&home.name, "Most Corners", "mostcorners", "most corners", ph, clampp(ph), vec![format!("corners/g {hc:.1} vs {ac:.1}")]));
+                    out.push(mk(&away.name, "Most Corners", "mostcorners", "most corners", pa, clampp(pa), vec![format!("corners/g {ac:.1} vs {hc:.1}")]));
+                }
+            }
+            "mostshots" => {
+                // Which team has the most shots (either-team market).
+                if let (Some(hs), Some(as_)) = (home.shots_for, away.shots_for) {
+                    let (ph, pa) = (prob_more(hs, as_), prob_more(as_, hs));
+                    out.push(mk(&home.name, "Most Shots", "mostshots", "most shots", ph, clampp(ph), vec![format!("shots/g {hs:.1} vs {as_:.1}")]));
+                    out.push(mk(&away.name, "Most Shots", "mostshots", "most shots", pa, clampp(pa), vec![format!("shots/g {as_:.1} vs {hs:.1}")]));
                 }
             }
             "toffsides" => {

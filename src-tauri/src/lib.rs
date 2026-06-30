@@ -7,6 +7,7 @@ mod db;
 mod features;
 mod grok;
 mod ingest;
+mod ingeststats;
 mod llm;
 mod models;
 mod montecarlo;

@@ -205,6 +205,8 @@ function AppInner() {
     if (on) localStorage.setItem("pb_mode", mode);
     else localStorage.removeItem("pb_mode");
   }
+  // Simple-mode risk dial — best-in-class presets so it stays one-tap.
+  const [simpleRisk, setSimpleRisk] = useState<"safe" | "balanced" | "bold" | "scout">("balanced");
   const [strategy, setStrategy] = useState("value");
   // Match Predictor only works with one fixture — fall back if that changes.
   useEffect(() => {
@@ -301,6 +303,19 @@ function AppInner() {
     () => fixtures.filter((f) => selFixtureIds.has(f.fixture_id)),
     [fixtures, selFixtureIds]
   );
+
+  // If a selected match has ENDED (e.g. you left the app open across kickoff),
+  // drop it from the selection so the next build can't silently include it.
+  useEffect(() => {
+    const ended = fixtures.filter((f) => selFixtureIds.has(f.fixture_id) && liveInfo(f).state === "ended");
+    if (ended.length === 0) return;
+    setSelFixtureIds((prev) => {
+      const next = new Set(prev);
+      ended.forEach((f) => next.delete(f.fixture_id));
+      return next;
+    });
+    toast.info(`Dropped ${ended.length} ended match${ended.length > 1 ? "es" : ""} from your selection`);
+  }, [fixtures]);
 
   function fail(e: unknown) {
     setError(String(e));
@@ -427,6 +442,14 @@ function AppInner() {
     if (busy || prewarmBusy) return; // guard against double-fire / request spam
     const v = opts?.variation ?? 0;
     const simple = opts?.simple ?? false;
+    // Best-in-class presets per Simple risk dial.
+    const RISK: Record<string, { strategy: string; safe: number; mod: number; risky: number }> = {
+      safe: { strategy: "favorites", safe: 1, mod: 0, risky: 0 },
+      balanced: { strategy: "value", safe: 0, mod: 1, risky: 1 },
+      bold: { strategy: "value", safe: 0, mod: 1, risky: 3 },
+      scout: { strategy: "scout", safe: 0, mod: 1, risky: 1 },
+    };
+    const rk = RISK[simpleRisk] ?? RISK.balanced;
     setBusy(true);
     setError(null);
     setSaved(false);
@@ -436,7 +459,7 @@ function AppInner() {
       const selection = {
         fixtures: toFixtureInputs(selectedFixtures),
         // Simple = the whole market for every match, a varied set of tickets,
-        // a couple of jackpot longshots, all the data + ingests — zero setup.
+        // tuned by the risk dial, all the data + ingests — zero setup.
         markets: simple ? [...allMarketKeys] : [...selMarkets],
         reasoning: simple ? true : reasoning,
         implied_prob: impliedProb,
@@ -448,7 +471,7 @@ function AppInner() {
         exclude: opts?.exclude ?? [],
         bias_builders: biasBuilders,
         most_likely: simple ? false : strategy === "likely",
-        strategy: simple ? "value" : strategy,
+        strategy: simple ? rk.strategy : strategy,
         max_leg_prob: maxLegProb,
         use_grok: simple ? false : useGrok,
         grok_veto: grokVeto,
@@ -460,9 +483,9 @@ function AppInner() {
         use_predictions: usePredictions,
         use_xg: useXg,
         use_tactics: useTactics,
-        lucky_safe: simple ? 0 : luckySafe,
-        lucky_moderate: simple ? 1 : luckyModerate,
-        lucky_risky: simple ? 2 : luckyRisky,
+        lucky_safe: simple ? rk.safe : luckySafe,
+        lucky_moderate: simple ? rk.mod : luckyModerate,
+        lucky_risky: simple ? rk.risky : luckyRisky,
         use_ingest: simple ? true : useIngest,
         min_legs: simple ? null : regMinLegs > 1 ? regMinLegs : null,
         min_odds: simple ? null : oddsMin > 1.01 ? oddsMin : null,
@@ -473,7 +496,7 @@ function AppInner() {
       };
       const resp = await api.buildTickets(selection);
       setResult(resp.result);
-      setBuildStrategy(simple ? "value" : strategy);
+      setBuildStrategy(simple ? rk.strategy : strategy);
       setUsage(resp.usage);
       setMeter(resp.meter);
       setStep("results");
@@ -937,11 +960,11 @@ function AppInner() {
               return (
                 <button
                   key={f.fixture_id}
-                  disabled={ended}
+                  disabled={ended && !on}
                   className={`card w-full text-left ${on ? "border-accent bg-accent/10" : ""} ${
-                    ended ? "opacity-50 cursor-not-allowed" : ""
+                    ended && !on ? "opacity-50 cursor-not-allowed" : ""
                   }`}
-                  onClick={() => !ended && toggle(setSelFixtureIds, f.fixture_id)}
+                  onClick={() => (!ended || on) && toggle(setSelFixtureIds, f.fixture_id)}
                 >
                   <div className="flex items-center justify-between gap-2">
                     <span className="font-semibold">
@@ -955,7 +978,7 @@ function AppInner() {
                       )}
                       {ended && (
                         <span className="text-[10px] font-semibold text-slate-400 bg-edge rounded px-1.5 py-0.5">
-                          Ended
+                          {on ? "Ended — tap to remove ✕" : "Ended"}
                         </span>
                       )}
                       {on && !ended && <span className="text-accent text-sm">✓</span>}
@@ -1028,8 +1051,34 @@ function AppInner() {
               <div className="text-sm font-bold">🟢 Simple build</div>
               <p className="text-xs text-slate-400">
                 We'll read <b>every market</b> for your {selFixtureIds.size} match{selFixtureIds.size === 1 ? "" : "es"}, forecast each game, and build a
-                varied set — <b>singles, SGPs, SGP+ and a couple of jackpot longshots</b> — using all the data (and your ingested pages where they
-                match). No setup. The per-match forecast shows under the tickets.
+                varied set using all the data. Pick a risk level — that's the only choice. The per-match forecast shows under the tickets.
+              </p>
+              {/* Risk dial — best-in-class presets, one tap. */}
+              <div className="grid grid-cols-4 gap-1">
+                {([
+                  ["safe", "🛡️ Safe", "Form favourites, no longshots"],
+                  ["balanced", "⚖️ Balanced", "Value picks + a couple of longshots"],
+                  ["bold", "🔥 Bold", "More jackpot-style longshots"],
+                  ["scout", "📡 Scout", "Fuse your ingested pages with our data"],
+                ] as [typeof simpleRisk, string, string][]).map(([id, label, hint]) => (
+                  <button
+                    key={id}
+                    title={hint}
+                    className={`chip text-center text-[11px] py-2 ${simpleRisk === id ? "chip-on" : ""}`}
+                    onClick={() => setSimpleRisk(id)}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              <p className="text-[10px] text-slate-500">
+                {simpleRisk === "safe"
+                  ? "🛡️ Safe — in-form favourites at fair odds, no lottery legs. Bankable."
+                  : simpleRisk === "balanced"
+                    ? "⚖️ Balanced — +EV value picks across markets plus a couple of longshots. The all-rounder."
+                    : simpleRisk === "bold"
+                      ? "🔥 Bold — same value core but more jackpot-style longshots stacked for big payouts."
+                      : "📡 Scout — builds from the stats you've ingested fused with our data (needs a processed page matching your fixtures)."}
               </p>
               <button className="btn btn-primary w-full text-sm py-2.5" disabled={busy || prewarmBusy} onClick={() => build({ simple: true })}>
                 {busy ? <span className="inline-flex items-center gap-2"><Spinner /> Building…</span> : prewarmBusy ? "🔒 Pre-scoring…" : "✨ Build my tickets"}
@@ -1178,6 +1227,7 @@ function AppInner() {
                   ["bankers", "Anchors ⚓"],
                   ["jackpot", "Jackpot 🎰"],
                   ["predictor", "Match Predictor 🔮"],
+                  ["scout", "Scout 📡"],
                 ] as [string, string][]).map(([id, label]) => {
                   // Match Predictor needs exactly one fixture — show it but disable
                   // it (with a hint) otherwise, so it's discoverable.
@@ -1188,7 +1238,7 @@ function AppInner() {
                       disabled={dis}
                       title={dis ? "Select exactly ONE match to use Match Predictor" : undefined}
                       className={`chip flex-1 text-center whitespace-nowrap ${strategy === id ? "chip-on" : ""} ${
-                        id === "oracle" || id === "power" || id === "bankers" || id === "jackpot" || id === "predictor" ? "border-accent/60" : ""
+                        id === "oracle" || id === "power" || id === "bankers" || id === "jackpot" || id === "predictor" || id === "scout" ? "border-accent/60" : ""
                       } ${dis ? "opacity-40 cursor-not-allowed" : ""}`}
                       onClick={() => !dis && setStrategy(id)}
                     >
@@ -1215,7 +1265,9 @@ function AppInner() {
                             ? "🎰 Jackpot — deliberate lottery tickets: 5-8 plausible longshots stacked for ~1-5% hit chance at 20x-150x+. Every leg is reasonable on its own; it's a longshot only because they must ALL land. Prefers correlated same-game legs so the true chance beats the multiply. Stake tiny (your 50¢), build a couple daily, wait for one to hit."
                             : strategy === "predictor"
                               ? "🔮 Match Predictor — a deep read of THIS one game. Forces every market, shows a forecast (likely result, scores, goals, cards, key players with %), then builds several same-game SGP variations. If the match is already in-play, it pulls the LIVE score/stats and the model adjusts every suggestion for the time remaining. (Single fixture only.)"
-                              : "Ranks by +EV — value/longshots where the price beats the true probability."}
+                              : strategy === "scout"
+                                ? "📡 Scout — FUSES your ingested pages with our data through the model. It builds our full table (every market, our API + models), pulls in the WHOLE ingested page (corners, cards, shots, form, xG, injuries, predictions, analyst reads — whatever you scraped), and the model cross-references the two: leaning in where they agree, judging where they differ, and using the page's extra angles to pick across any market. Needs at least one processed page matching your fixtures (a stats/preview page → 🧲 Ingest → process). Your hand-fed edge, run through the model."
+                                : "Ranks by +EV — value/longshots where the price beats the true probability."}
               </p>
             </div>
             <div>
@@ -1610,7 +1662,7 @@ function AppInner() {
               </div>
             )}
             {buildTab === "regular" && (
-              <button className="btn btn-primary w-full" disabled={(selMarkets.size === 0 && strategy !== "predictor") || busy || prewarmBusy} onClick={() => build()}>
+              <button className="btn btn-primary w-full" disabled={(selMarkets.size === 0 && strategy !== "predictor" && strategy !== "scout") || busy || prewarmBusy} onClick={() => build()}>
                 {busy ? (
                   <span className="inline-flex items-center gap-2"><Spinner /> Building…</span>
                 ) : prewarmBusy ? (
