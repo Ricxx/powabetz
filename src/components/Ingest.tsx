@@ -109,12 +109,23 @@ export default function Ingest({ onClose }: { onClose: () => void }) {
 
   const endpoint = info ? `http://127.0.0.1:${info.port}/ingest` : "";
 
-  // Group by fixture (+ fixture date), keeping multiple sources for one match together.
+  // Group by fixture, merging slight label/date variations ("A vs B" == "B v A")
+  // so the same match never shows under two headings.
+  const fixtureKey = (label: string) =>
+    label
+      .toLowerCase()
+      .replace(/\bv(s|ersus)?\b/g, "|")
+      .replace(/[^a-z0-9|]/g, "")
+      .split("|")
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .sort()
+      .join("|");
   const groups = new Map<string, { label: string; date: string; items: IngestItem[] }>();
   for (const it of items) {
     const label = it.fixture_label || "Unmatched (process to tag a fixture)";
     const date = it.fixture_date || "";
-    const key = `${label}__${date}`;
+    const key = it.fixture_label ? fixtureKey(it.fixture_label) : "unmatched";
     if (!groups.has(key)) groups.set(key, { label, date, items: [] });
     groups.get(key)!.items.push(it);
   }

@@ -1538,24 +1538,112 @@ fn live_goal_sections(home: &str, away: &str, gh: i64, ga: i64, lh: f64, la: f64
     };
     let any_more = 1.0 - m[0][0];
 
+    // Goals — only the markets that ARE STILL LIVE (skip ones the score already
+    // settled: BTTS once both have scored, an over line already cleared).
+    let mut goal_lines = vec![mk("Another goal coming".into(), any_more)];
+    if cur < 3 {
+        goal_lines.push(mk("Over 2.5 total".into(), over25));
+    }
+    if !(gh >= 1 && ga >= 1) {
+        goal_lines.push(mk("Both teams to score".into(), btts));
+    }
+
     vec![
         ForecastSection {
             title: "Result (from here)".into(),
             lines: vec![mk(format!("{home} win"), ph), mk("Draw".into(), pd), mk(format!("{away} win"), pa)],
         },
-        ForecastSection {
-            title: "Goals (live-adjusted)".into(),
-            lines: vec![
-                mk("Another goal coming".into(), any_more),
-                mk("Over 2.5 total".into(), over25),
-                mk("Both teams to score".into(), btts),
-            ],
-        },
+        ForecastSection { title: "Goals (live-adjusted)".into(), lines: goal_lines },
         ForecastSection {
             title: "Most likely FINAL score".into(),
             lines: score_v.iter().take(4).map(|((h, a), p)| mk(format!("{h}-{a}"), *p)).collect(),
         },
     ]
+}
+
+/// If this fixture is IN-PLAY, mutate its forecast to be live-adjusted (live
+/// remaining-time + score-aware goal sections, stale ones removed) and inject the
+/// live situation into `pred_notes` so the model re-weighs for the current state.
+/// Returns true if it was live. Used by both Match Predictor and Simple mode.
+async fn live_adjust_forecast(
+    state: &AppState,
+    fx: &FixtureInput,
+    fc: &mut crate::models::MatchForecast,
+    pred_notes: &mut Vec<String>,
+) -> bool {
+    let now = af::now_ts();
+    let live_window = fx
+        .date_utc
+        .as_deref()
+        .and_then(|d| chrono::DateTime::parse_from_rfc3339(d).ok())
+        .map(|ko| now >= ko.timestamp() - 300 && now <= ko.timestamp() + 3 * 3600)
+        .unwrap_or(true);
+    if !live_window {
+        return false;
+    }
+    let lf = crate::models::LiveFixture {
+        fixture_id: fx.fixture_id,
+        league_id: fx.league_id,
+        league_name: String::new(),
+        season: fx.season,
+        home_team: fx.home_team.clone(),
+        away_team: fx.away_team.clone(),
+        home_team_id: fx.home_team_id,
+        away_team_id: fx.away_team_id,
+        status: String::new(),
+        elapsed: 0,
+        home_goals: 0,
+        away_goals: 0,
+        has_stats: false,
+    };
+    let snap = match live_snapshot_inner(state, lf).await {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let f = snap.fixture.clone();
+    let in_play = (f.elapsed > 0 || f.status == "HT")
+        && !matches!(f.status.as_str(), "FT" | "AET" | "PEN" | "NS" | "TBD" | "PST" | "CANC" | "ABD" | "AWD" | "WO" | "");
+    if !in_play {
+        return false;
+    }
+    fc.headline = format!("⚡ LIVE {}' · {} {}-{} {}", f.elapsed, f.home_team, f.home_goals, f.away_goals, f.away_team);
+    let remaining = (90 - f.elapsed).clamp(0, 90) as f64;
+    let frac = remaining / 90.0;
+    let h_ts = fetch_team_stats(state, fx.home_team_id, &fx.home_team, fx.league_id, fx.season).await.ok().flatten();
+    let a_ts = fetch_team_stats(state, fx.away_team_id, &fx.away_team, fx.league_id, fx.season).await.ok().flatten();
+    fc.sections.retain(|s| !matches!(s.title.as_str(), "Result" | "Goals" | "Most likely scores"));
+    let mut new_secs: Vec<crate::models::ForecastSection> = Vec::new();
+    let live_lines: Vec<crate::models::ForecastLine> = snap
+        .estimates
+        .iter()
+        .map(|e| crate::models::ForecastLine { label: e.label.clone(), pct: (e.prob * 100.0).round() })
+        .collect();
+    if !live_lines.is_empty() {
+        new_secs.push(crate::models::ForecastSection { title: format!("Live — remaining ~{}'", remaining as i64), lines: live_lines });
+    }
+    if let (Some(h), Some(a)) = (&h_ts, &a_ts) {
+        let lh = ((h.gf_avg + a.ga_avg) / 2.0).max(0.05) * frac;
+        let la = ((a.gf_avg + h.ga_avg) / 2.0).max(0.05) * frac;
+        new_secs.extend(live_goal_sections(&f.home_team, &f.away_team, f.home_goals, f.away_goals, lh, la));
+    }
+    new_secs.append(&mut fc.sections);
+    fc.sections = new_secs;
+    let stat_str = snap
+        .stats
+        .iter()
+        .map(|t| format!("{}: {}", t.team, t.stats.iter().map(|s| format!("{} {}", s.label, s.value)).collect::<Vec<_>>().join(", ")))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let ev_str = snap.events.iter().rev().take(8).map(|e| format!("{}' {} {}", e.minute, e.kind, e.player)).collect::<Vec<_>>().join("; ");
+    let est_str = snap.estimates.iter().map(|e| format!("{} {}%", e.label, (e.prob * 100.0).round() as i64)).collect::<Vec<_>>().join("; ");
+    pred_notes.push(format!(
+        "⚡ {} vs {} IS LIVE at {}-{} ({}', {}). Pre-match numbers are STALE — re-weigh for the CURRENT score, momentum and time left. Never suggest a bet the score has ALREADY settled (BTTS once both have scored; an over line already cleared). Live stats: {}. Events: {}. Live remaining estimates: {}.",
+        f.home_team, f.away_team, f.home_goals, f.away_goals, f.elapsed, f.status,
+        if stat_str.is_empty() { "(none)".into() } else { stat_str },
+        if ev_str.is_empty() { "(none)".into() } else { ev_str },
+        if est_str.is_empty() { "(none)".into() } else { est_str },
+    ));
+    true
 }
 
 /// Best (highest-prob) candidate in a market group matching a predicate.
@@ -1615,20 +1703,34 @@ fn forecast_from_candidates(all: &[Candidate], fixture_label: &str, home: &str, 
         });
     }
 
-    // Cards & corners
-    let mut cc = Vec::new();
+    // Cards — every line says exactly what it is.
+    let mut cards = Vec::new();
     if let Some(m) = fc_best(cands, "mostcards", |_| true) {
-        cc.push(mk(format!("Most cards: {}", m.subject), m.est_prob));
+        cards.push(mk(format!("Most cards: {}", m.subject), m.est_prob));
     }
     let both = prob("bothcards", &|_| true);
     if both > 0.0 {
-        cc.push(mk("Both teams carded".into(), both));
+        cards.push(mk("Both teams to be carded".into(), both));
     }
-    if let Some(co) = fc_best(cands, "tcorners", |c| c.line.to_lowercase().starts_with("over")) {
-        cc.push(mk(format!("{} {}", co.subject, co.line.to_lowercase()), co.est_prob));
+    // best team-card over per side
+    for team in [home, away] {
+        if let Some(c) = fc_best(cands, "tcards", |c| c.subject == team && c.line.to_lowercase().starts_with("over")) {
+            cards.push(mk(format!("{} {} cards", team, c.line.to_lowercase()), c.est_prob));
+        }
     }
-    if !cc.is_empty() {
-        sections.push(ForecastSection { title: "Cards & corners".into(), lines: cc });
+    if !cards.is_empty() {
+        sections.push(ForecastSection { title: "Cards".into(), lines: cards });
+    }
+
+    // Corners — labelled per team.
+    let mut corners = Vec::new();
+    for team in [home, away] {
+        if let Some(c) = fc_best(cands, "tcorners", |c| c.subject == team && c.line.to_lowercase().starts_with("over")) {
+            corners.push(mk(format!("{} {} corners", team, c.line.to_lowercase()), c.est_prob));
+        }
+    }
+    if !corners.is_empty() {
+        sections.push(ForecastSection { title: "Corners".into(), lines: corners });
     }
 
     // Likely players
@@ -2105,95 +2207,22 @@ pub async fn build_tickets(
         let fx = &selection.fixtures[0];
         let fl = format!("{} vs {}", fx.home_team, fx.away_team);
         let mut fc = forecast_from_candidates(&candidates, &fl, &fx.home_team, &fx.away_team);
-        let now = af::now_ts();
-        // In the kickoff window if we have a time; if no time was supplied (e.g.
-        // the one-tap predict from the Live screen) attempt the live pull anyway —
-        // the snapshot's status decides whether to actually adjust.
-        let live_window = fx
-            .date_utc
-            .as_deref()
-            .and_then(|d| chrono::DateTime::parse_from_rfc3339(d).ok())
-            .map(|ko| now >= ko.timestamp() - 300 && now <= ko.timestamp() + 3 * 3600)
-            .unwrap_or(true);
-        if live_window {
-            let lf = crate::models::LiveFixture {
-                fixture_id: fx.fixture_id,
-                league_id: fx.league_id,
-                league_name: String::new(),
-                season: fx.season,
-                home_team: fx.home_team.clone(),
-                away_team: fx.away_team.clone(),
-                home_team_id: fx.home_team_id,
-                away_team_id: fx.away_team_id,
-                status: String::new(),
-                elapsed: 0,
-                home_goals: 0,
-                away_goals: 0,
-                has_stats: false,
-            };
-            if let Ok(snap) = live_snapshot_inner(&state, lf).await {
-                let f = snap.fixture.clone();
-                // In-play if there's an elapsed minute and it isn't finished/not-started.
-                let in_play = (f.elapsed > 0 || f.status == "HT")
-                    && !matches!(f.status.as_str(), "FT" | "AET" | "PEN" | "NS" | "TBD" | "PST" | "CANC" | "ABD" | "AWD" | "WO" | "");
-                if in_play {
-                    fc.headline = format!("⚡ LIVE {}' · {} {}-{} {}", f.elapsed, f.home_team, f.home_goals, f.away_goals, f.away_team);
-                    // Rebuild the goal-derived sections from the CURRENT score +
-                    // remaining-time expectation, replacing the stale pre-match ones.
-                    let remaining = (90 - f.elapsed).clamp(0, 90) as f64;
-                    let frac = remaining / 90.0;
-                    let h_ts = fetch_team_stats(&state, fx.home_team_id, &fx.home_team, fx.league_id, fx.season).await.ok().flatten();
-                    let a_ts = fetch_team_stats(&state, fx.away_team_id, &fx.away_team, fx.league_id, fx.season).await.ok().flatten();
-                    fc.sections.retain(|s| !matches!(s.title.as_str(), "Result" | "Goals" | "Most likely scores"));
-                    let mut new_secs: Vec<crate::models::ForecastSection> = Vec::new();
-                    // Live remaining-time estimates first.
-                    let live_lines: Vec<crate::models::ForecastLine> = snap
-                        .estimates
-                        .iter()
-                        .map(|e| crate::models::ForecastLine { label: e.label.clone(), pct: (e.prob * 100.0).round() })
-                        .collect();
-                    if !live_lines.is_empty() {
-                        new_secs.push(crate::models::ForecastSection { title: format!("Live — remaining ~{}'", remaining as i64), lines: live_lines });
-                    }
-                    if let (Some(h), Some(a)) = (&h_ts, &a_ts) {
-                        let lh = ((h.gf_avg + a.ga_avg) / 2.0).max(0.05) * frac;
-                        let la = ((a.gf_avg + h.ga_avg) / 2.0).max(0.05) * frac;
-                        new_secs.extend(live_goal_sections(&f.home_team, &f.away_team, f.home_goals, f.away_goals, lh, la));
-                    }
-                    new_secs.append(&mut fc.sections); // keep Cards & corners + Likely players
-                    fc.sections = new_secs;
-                    let stat_str = snap
-                        .stats
-                        .iter()
-                        .map(|t| format!("{}: {}", t.team, t.stats.iter().map(|s| format!("{} {}", s.label, s.value)).collect::<Vec<_>>().join(", ")))
-                        .collect::<Vec<_>>()
-                        .join(" | ");
-                    let ev_str = snap.events.iter().rev().take(8).map(|e| format!("{}' {} {}", e.minute, e.kind, e.player)).collect::<Vec<_>>().join("; ");
-                    let est_str = snap.estimates.iter().map(|e| format!("{} {}%", e.label, (e.prob * 100.0).round() as i64)).collect::<Vec<_>>().join("; ");
-                    pred_notes.push(format!(
-                        "⚡ THIS MATCH IS LIVE: {} {}-{} {} at {}' ({}). The pre-match season-rate numbers in the table are NOW STALE — re-weigh EVERY suggestion for the CURRENT score, momentum and time remaining. Live stats: {}. Recent events: {}. Our live remaining-time estimates: {}. Favour bets that fit what is ACTUALLY happening (a side dominating shots to score next; a tight late game → lean unders; chasing team → more shots/corners/cards).",
-                        f.home_team, f.home_goals, f.away_goals, f.away_team, f.elapsed, f.status,
-                        if stat_str.is_empty() { "(none)".into() } else { stat_str },
-                        if ev_str.is_empty() { "(none)".into() } else { ev_str },
-                        if est_str.is_empty() { "(none)".into() } else { est_str },
-                    ));
-                }
-            }
-        }
+        live_adjust_forecast(&state, fx, &mut fc, &mut pred_notes).await;
         Some(fc)
     } else {
         None
     };
-    // Simple mode: a forecast for EVERY selected match.
+    // Simple mode: a forecast for EVERY selected match — live-adjusted per fixture
+    // so an in-play game shows the current-score read, not stale pre-match numbers.
     let simple_forecasts: Vec<crate::models::MatchForecast> = if selection.simple.unwrap_or(false) {
-        selection
-            .fixtures
-            .iter()
-            .map(|fx| {
-                let fl = format!("{} vs {}", fx.home_team, fx.away_team);
-                forecast_from_candidates(&candidates, &fl, &fx.home_team, &fx.away_team)
-            })
-            .collect()
+        let mut v = Vec::new();
+        for fx in &selection.fixtures {
+            let fl = format!("{} vs {}", fx.home_team, fx.away_team);
+            let mut fc = forecast_from_candidates(&candidates, &fl, &fx.home_team, &fx.away_team);
+            live_adjust_forecast(&state, fx, &mut fc, &mut pred_notes).await;
+            v.push(fc);
+        }
+        v
     } else {
         vec![]
     };
@@ -2235,7 +2264,7 @@ pub async fn build_tickets(
                         .unwrap_or_default();
                     if !detail.is_empty() {
                         pred_notes.push(format!(
-                            "{} vs {}: INGESTED 3rd-party data (from {}): {}",
+                            "{} vs {}: INGESTED page stats (3rd-party, from {}) — WEIGH these for the matching markets (corner numbers inform corner O/U, card/foul numbers inform card markets, shot numbers inform shots/SOT, form & xG inform result/goals): {}",
                             f.home_team, f.away_team, it.url, detail
                         ));
                         let _ = db::ingest_mark_used(&conn, it.id);
@@ -3063,6 +3092,20 @@ pub async fn evaluate_tickets(
         });
     }
     evals.truncate(n);
+    // Make per-leg ratings CONSISTENT — anchor each to the leg's (fixed) model
+    // probability so the SAME leg never flips between tickets. The model's NOTE is
+    // kept (it can still flag a rotation/trap caveat). est_prob already folds in
+    // availability (injured/suspended sink it), so a doubtful player bands low.
+    let band = |p: f64| if p >= 0.60 { "solid" } else if p >= 0.45 { "ok" } else if p >= 0.30 { "risky" } else { "trap" };
+    for (eval, t) in evals.iter_mut().zip(tickets.iter()) {
+        if let Ok(tk) = serde_json::from_value::<Ticket>(t.clone()) {
+            for (ln, leg) in eval.leg_notes.iter_mut().zip(tk.legs.iter()) {
+                if let Some(p) = leg.est_prob {
+                    ln.rating = band(p).to_string();
+                }
+            }
+        }
+    }
     Ok(evals)
 }
 
@@ -4017,7 +4060,7 @@ fn compact_ingest(v: &Value) -> String {
                     let val = e.get("value").and_then(|x| x.as_str())?;
                     Some(format!("{l}={val}"))
                 })
-                .take(8)
+                .take(12)
                 .collect()
         })
         .unwrap_or_default();

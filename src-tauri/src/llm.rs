@@ -64,7 +64,7 @@ CORRELATED & THEMATIC SGPs (STRONGLY PREFERRED): the best same-game builders tel
 - A "shots/attacking" theme: a high-volume side's two main shooters for shots + team shots over + team corners over.
 Pick legs that move in the SAME direction (positively correlated). NEVER stack contradictory or mutually-exclusive legs, and never two nested lines for the same player (a goal implies a shot).
 
-Rules: a player who hasn't scored recently is only a strong scorer pick when form_state="due_regression"; "cold_falling_off" means down-rank. Injured/suspended subjects cannot feature. If xg_source="proxy" or a leg carries a proxy/crude flag, lower confidence. NEVER stack nested/correlated legs for the SAME player in one ticket — a goal implies a shot on target which implies a shot, so pick only ONE of {anytime scorer, shots on target, player shots} per player (the others are redundant). Likewise never combine two lines of the same team goals/corners market.
+Rules: a player who hasn't scored recently is only a strong scorer pick when form_state="due_regression"; "cold_falling_off" means down-rank. Injured/suspended subjects cannot feature. If xg_source="proxy" or a leg carries a proxy/crude flag, lower confidence. NEVER stack nested/correlated legs for the SAME player in one ticket — a goal implies a shot on target which implies a shot, so pick only ONE of {anytime scorer, shots on target, player shots} per player (the others are redundant). Likewise never combine two lines of the same team goals/corners market. NEVER combine MUTUALLY-IMPLIED legs in one ticket: "Both teams to score" already GUARANTEES "Over 1.5 goals" (and almost always Over 0.5/1.5/the lower over lines) — pick ONE, not both; "Over 2.5" + "Over 1.5" is redundant (keep the higher); a team to win + that same team Double-Chance is redundant. Each leg in a ticket must add a GENUINELY new condition.
 
 CRITICAL for matching: in every leg, copy the row's "subject" verbatim into "selection" and the row's "market" verbatim into "market" (and its "line"). Do NOT put probabilities or odds in legs — those are filled in automatically afterwards. Treat predictions and the user's notes as soft context. Output strict JSON only."#;
 
@@ -550,7 +550,7 @@ Output ONLY this JSON, one entry per line in the same order:
     Ok((out, gin, gout))
 }
 
-const INGEST_SYSTEM: &str = r#"You turn a raw web page's text into structured, betting-relevant data for ONE football fixture. Identify which match it is about (home & away team, date if shown, competition) and pull the useful facts and any analyst read. Be faithful to the page — do NOT invent numbers. Output strict JSON only."#;
+const INGEST_SYSTEM: &str = r#"You turn a raw web page's text into structured, betting-relevant data for ONE football fixture. Identify which match it is about (home & away team, date if shown, competition). PULL EVERY STATISTIC the page shows — be a careful data-scraper, not a summariser. Capture team numbers (corners for/against per game, shots & shots-on-target per game, cards & fouls per game, possession %, xG / xGA, goals for/against per game, clean-sheet %, form W-D-L) and key-player numbers (goals, assists, shots/SOT per game), plus any predicted score / 1X2 % / analyst angle. Be faithful — copy numbers exactly, NEVER invent them. Output strict JSON only."#;
 
 /// Haiku-structure an ingested web page (its visible text) into fixture-tagged
 /// JSON. Honours an optional user note ("extract only xyz"). Returns the JSON
@@ -599,9 +599,11 @@ pub async fn extract_ingest(
 {text}{note_line}
 
 Return ONLY this JSON (omit unknown fields, keep values short):
-{{ "home": "home team", "away": "away team", "date": "YYYY-MM-DD or ''", "league": "competition or ''", "summary": "2-3 sentence real-world betting read from this page", "data": [ {{ "label": "e.g. Forebet 1X2 / predicted score / analyst note", "value": "the value or quote" }} ] }}"#
+{{ "home": "home team", "away": "away team", "date": "YYYY-MM-DD or ''", "league": "competition or ''", "summary": "2-3 sentence real-world betting read from this page", "data": [ {{ "label": "...", "value": "..." }} ] }}
+
+For "data": capture EVERY useful NUMBER, not just a few. Prefer STATS with a clear subject in the label, e.g. "Morocco corners/game 6.4", "Morocco corners against 4.1", "Netherlands shots on target/game 5.2", "Netherlands cards/game 1.8", "Morocco possession 47%", "Netherlands xG 1.7", "Morocco form WWDLW", "Hakimi shots/game 2.1", "Brobbey goals 4". Include team form, corners, shots/SOT, cards/fouls, possession, xG/xGA, goals for/against, and key players' goals/assists/shots — whatever the page shows. Also keep any predicted score, 1X2 %, or analyst note. Copy numbers EXACTLY; never invent."#
     );
-    let (resp, gin, gout) = chat_call(state, model, INGEST_SYSTEM, &user, 1500).await?;
+    let (resp, gin, gout) = chat_call(state, model, INGEST_SYSTEM, &user, 2200).await?;
     let start = resp.find('{').ok_or("model returned no JSON")?;
     let end = resp.rfind('}').ok_or("model returned no JSON")?;
     Ok((resp[start..=end].to_string(), gin, gout))
@@ -616,7 +618,9 @@ For EACH ticket return exactly these fields:
 - "risks": 1-3 short strings (the key things that sink it).
 - "recommendations": 1-3 short ACTIONABLE changes ("drop the rested-star leg", "swap X SOT for anytime scorer", "trim to a double"); if it's already good, a single "leave as-is — well constructed".
 
-Call out TRAPS explicitly (likely-rested star, public trap favourite, deceptively short price, nested/contradictory legs) via a "trap" rating. Be concrete and concise. Output strict JSON only."#;
+RATING MUST BE CONSISTENT AND ANCHORED TO THE LEG'S PROBABILITY (the "est"/"pin" given): est ≥ 0.60 → "solid"; 0.45-0.60 → "ok"; 0.30-0.45 → "risky"; < 0.30 OR genuinely contradicted/trap → "trap". A given leg gets the SAME rating no matter which ticket it appears in — do not flip Hakimi "2+ shots" between "risky" and "won't happen" across tickets; its probability is fixed. Only deviate from the probability band when there's a HARD real-world reason (player ruled out, obvious rotation, a real trap) — and then say it in the note. You are HELPING the user bet, not talking them out of it: flag genuine traps, but never reflexively rate a decent-probability leg as risky.
+
+Call out TRAPS explicitly (likely-rested star, public trap favourite, deceptively short price, nested/contradictory legs, or a bet the LIVE score has already settled) via a "trap" rating. Be concrete and concise. Output strict JSON only."#;
 
 /// Evaluate a set of tickets with a (usually cheaper) model. Returns the
 /// per-ticket analysis + token usage.

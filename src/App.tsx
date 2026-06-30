@@ -153,6 +153,19 @@ function AppInner() {
   const [settings, setSettings] = useState<SettingsView | null>(null);
   const [meter, setMeter] = useState<RequestMeter | null>(null);
 
+  // Count of ingested pages not yet processed by AI — for the 🧲 nav badge.
+  const [ingestPending, setIngestPending] = useState(0);
+  useEffect(() => {
+    const tick = () =>
+      api
+        .listIngested()
+        .then((items) => setIngestPending(items.filter((i) => i.status !== "processed").length))
+        .catch(() => {});
+    tick();
+    const h = setInterval(tick, 15000);
+    return () => clearInterval(h);
+  }, [overlay]);
+
   // One-time nudge when the daily request budget crosses 80%.
   useEffect(() => {
     if (!meter || meter.limit <= 0) return;
@@ -680,7 +693,7 @@ function AppInner() {
   // ----- overlays -----
   if (overlay === "settings" && settings) {
     return (
-      <Shell meter={meter} cost={settings?.usage.cost_usd ?? 0} grokCost={costBreak?.grok_lifetime ?? 0} onCoins={openCost} onNav={setOverlay} current="settings">
+      <Shell meter={meter} cost={settings?.usage.cost_usd ?? 0} grokCost={costBreak?.grok_lifetime ?? 0} onCoins={openCost} onNav={setOverlay} ingestBadge={ingestPending} current="settings">
         <Settings
           settings={settings}
           onSaved={(s) => {
@@ -696,28 +709,28 @@ function AppInner() {
   }
   if (overlay === "history") {
     return (
-      <Shell meter={meter} cost={settings?.usage.cost_usd ?? 0} grokCost={costBreak?.grok_lifetime ?? 0} onCoins={openCost} onNav={setOverlay} current="history">
+      <Shell meter={meter} cost={settings?.usage.cost_usd ?? 0} grokCost={costBreak?.grok_lifetime ?? 0} onCoins={openCost} onNav={setOverlay} ingestBadge={ingestPending} current="history">
         <History onClose={() => setOverlay(null)} />
       </Shell>
     );
   }
   if (overlay === "tracker") {
     return (
-      <Shell meter={meter} cost={settings?.usage.cost_usd ?? 0} grokCost={costBreak?.grok_lifetime ?? 0} onCoins={openCost} onNav={setOverlay} current="tracker">
+      <Shell meter={meter} cost={settings?.usage.cost_usd ?? 0} grokCost={costBreak?.grok_lifetime ?? 0} onCoins={openCost} onNav={setOverlay} ingestBadge={ingestPending} current="tracker">
         <Tracker onClose={() => setOverlay(null)} />
       </Shell>
     );
   }
   if (overlay === "newsfeed") {
     return (
-      <Shell meter={meter} cost={settings?.usage.cost_usd ?? 0} grokCost={costBreak?.grok_lifetime ?? 0} onCoins={openCost} onNav={setOverlay} current="newsfeed">
+      <Shell meter={meter} cost={settings?.usage.cost_usd ?? 0} grokCost={costBreak?.grok_lifetime ?? 0} onCoins={openCost} onNav={setOverlay} ingestBadge={ingestPending} current="newsfeed">
         <Newsfeed onClose={() => setOverlay(null)} />
       </Shell>
     );
   }
   if (overlay === "ledger") {
     return (
-      <Shell meter={meter} cost={settings?.usage.cost_usd ?? 0} grokCost={costBreak?.grok_lifetime ?? 0} onCoins={openCost} onNav={setOverlay} current="ledger">
+      <Shell meter={meter} cost={settings?.usage.cost_usd ?? 0} grokCost={costBreak?.grok_lifetime ?? 0} onCoins={openCost} onNav={setOverlay} ingestBadge={ingestPending} current="ledger">
         <Ledger onClose={() => setOverlay(null)} />
       </Shell>
     );
@@ -725,7 +738,7 @@ function AppInner() {
 
   if (overlay === "ingest") {
     return (
-      <Shell meter={meter} cost={settings?.usage.cost_usd ?? 0} grokCost={costBreak?.grok_lifetime ?? 0} onCoins={openCost} onNav={setOverlay} current="ingest">
+      <Shell meter={meter} cost={settings?.usage.cost_usd ?? 0} grokCost={costBreak?.grok_lifetime ?? 0} onCoins={openCost} onNav={setOverlay} ingestBadge={ingestPending} current="ingest">
         <Ingest onClose={() => setOverlay(null)} />
       </Shell>
     );
@@ -733,7 +746,7 @@ function AppInner() {
 
   if (overlay === "live") {
     return (
-      <Shell meter={meter} cost={settings?.usage.cost_usd ?? 0} grokCost={costBreak?.grok_lifetime ?? 0} onCoins={openCost} onNav={setOverlay} current="live">
+      <Shell meter={meter} cost={settings?.usage.cost_usd ?? 0} grokCost={costBreak?.grok_lifetime ?? 0} onCoins={openCost} onNav={setOverlay} ingestBadge={ingestPending} current="live">
         <Live
           onClose={() => setOverlay(null)}
           defaultStake={settings?.default_stake ?? 0.5}
@@ -751,6 +764,7 @@ function AppInner() {
       grokCost={costBreak?.grok_lifetime ?? 0}
       onCoins={openCost}
       onNav={setOverlay}
+      ingestBadge={ingestPending}
       current={null}
       onInspect={() => setShowInspector(true)}
       canInspect={selectedFixtures.length > 0}
@@ -1779,6 +1793,7 @@ function Shell({
   current,
   onInspect,
   canInspect,
+  ingestBadge = 0,
 }: {
   children: React.ReactNode;
   meter: RequestMeter | null;
@@ -1789,6 +1804,7 @@ function Shell({
   current?: Overlay;
   onInspect?: () => void;
   canInspect?: boolean;
+  ingestBadge?: number;
 }) {
   const navBtn = (active: boolean) =>
     `flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs whitespace-nowrap transition ${
@@ -1806,9 +1822,17 @@ function Shell({
         </div>
         <nav className="flex flex-wrap items-center gap-1 px-2 pb-2">
           {NAV_ITEMS.map((it) => (
-            <button key={it.label} className={navBtn(current === it.id)} onClick={() => onNav?.(it.id)}>
+            <button key={it.label} className={`relative ${navBtn(current === it.id)}`} onClick={() => onNav?.(it.id)}>
               <span>{it.icon}</span>
               <span>{it.label}</span>
+              {it.id === "ingest" && ingestBadge > 0 && (
+                <span
+                  className="absolute -top-1 -right-1 min-w-[15px] h-[15px] px-1 rounded-full bg-bad text-white text-[9px] font-bold flex items-center justify-center"
+                  title={`${ingestBadge} ingested page${ingestBadge > 1 ? "s" : ""} not yet processed by AI`}
+                >
+                  {ingestBadge}
+                </span>
+              )}
             </button>
           ))}
           {onInspect && (
