@@ -348,7 +348,7 @@ function TicketBuilder({ fixture, defaultStake, onPlaced }: { fixture: LiveFixtu
     };
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      await api.placeBet(ticketObj as any, s, comboOdds, false, "live");
+      await api.placeBet(ticketObj as any, s, comboOdds, false, false, "live");
     } catch (e) {
       toast.error(e);
       return;

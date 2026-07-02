@@ -54,7 +54,8 @@ pub fn start(db_path: PathBuf, token: String, port: u16) {
                 continue;
             }
             let is_post_ingest = method == tiny_http::Method::Post && req.url().starts_with("/ingest");
-            if !is_post_ingest {
+            let is_status = method == tiny_http::Method::Get && req.url().starts_with("/status");
+            if !is_post_ingest && !is_status {
                 let status = if req.url() == "/" { 200 } else { 404 };
                 let _ = req.respond(cors(status, "powabetz ingest"));
                 continue;
@@ -68,6 +69,21 @@ pub fn start(db_path: PathBuf, token: String, port: u16) {
                 .unwrap_or_default();
             if tok != token {
                 let _ = req.respond(cors(401, "{\"ok\":false,\"error\":\"unauthorized\"}"));
+                continue;
+            }
+            // GET /status?url=<encoded> → counts + whether THIS page is already
+            // ingested (drives the extension's floating research bar).
+            if is_status {
+                let url_param = req
+                    .url()
+                    .split_once('?')
+                    .map(|(_, q)| q)
+                    .unwrap_or("")
+                    .split('&')
+                    .find_map(|kv| kv.strip_prefix("url="))
+                    .map(url_decode)
+                    .unwrap_or_default();
+                let _ = req.respond(cors(200, &status_json(&conn, &url_param)));
                 continue;
             }
             let mut body = String::new();
@@ -108,11 +124,64 @@ fn handle(conn: &Connection, body: &str) -> Result<i64, String> {
     db::ingest_add(conn, now, url, &url_hash, title, &content, note)
 }
 
+/// Minimal percent-decoding for the status query param (no extra deps).
+fn url_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
+                if let Ok(v) = u8::from_str_radix(hex, 16) {
+                    out.push(v);
+                    i += 3;
+                    continue;
+                }
+                out.push(b'%');
+                i += 1;
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Status payload for the floating bar: total ingested, unprocessed count, and
+/// whether the given URL is already in (with its processing status).
+fn status_json(conn: &Connection, url: &str) -> String {
+    let total: i64 = conn
+        .query_row("SELECT COUNT(*) FROM ingested", [], |r| r.get(0))
+        .unwrap_or(0);
+    let new_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM ingested WHERE status != 'processed'", [], |r| r.get(0))
+        .unwrap_or(0);
+    let page_status: Option<String> = if url.is_empty() {
+        None
+    } else {
+        let hash = format!("{:x}", Sha256::digest(url.as_bytes()));
+        conn.query_row("SELECT status FROM ingested WHERE url_hash = ?1", [&hash], |r| r.get(0))
+            .ok()
+    };
+    format!(
+        "{{\"ok\":true,\"count\":{total},\"new_count\":{new_count},\"ingested\":{},\"status\":{}}}",
+        page_status.is_some(),
+        page_status.map(|s| format!("\"{s}\"")).unwrap_or_else(|| "null".to_string())
+    )
+}
+
 fn cors(status: u16, body: &str) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
     let mut resp = tiny_http::Response::from_string(body).with_status_code(status);
     for (k, val) in [
         ("Access-Control-Allow-Origin", "*"),
-        ("Access-Control-Allow-Methods", "POST, OPTIONS"),
+        ("Access-Control-Allow-Methods", "GET, POST, OPTIONS"),
         ("Access-Control-Allow-Headers", "content-type, x-ingest-token"),
         ("Content-Type", "application/json"),
     ] {

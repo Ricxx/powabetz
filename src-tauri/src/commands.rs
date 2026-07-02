@@ -1924,6 +1924,9 @@ pub async fn build_tickets(
     };
     let mut scout_candidates: Vec<Candidate> = Vec::new();
     let mut scout_any_match = false;
+    // Did ingested page data ACTUALLY feed this build (matched pages, not just
+    // the toggle)? Recorded on the ledger + placed bets for A/B comparison.
+    let mut ingest_used = false;
 
     for fx in &selection.fixtures {
         let fixture_label = format!("{} vs {}", fx.home_team, fx.away_team);
@@ -2230,6 +2233,7 @@ pub async fn build_tickets(
                 .collect();
             if !matched.is_empty() {
                 scout_any_match = true;
+                ingest_used = true;
                 // Stat lines the ingested page supports, derived + priced from its
                 // own numbers — added ALONGSIDE the engine's, both flagged by source.
                 let mut sc = crate::ingeststats::candidates_for_fixture(&matched, &fx.home_team, &fx.away_team, &fixture_label, fx.fixture_id);
@@ -2546,8 +2550,17 @@ pub async fn build_tickets(
     // Scout is built ON the ingested data, so always pull it in (and fully); the
     // other strategies only fold it in when use_ingest is on (and compactly).
     if selection.use_ingest.unwrap_or(true) || scout {
+        // Per-fixture PROMPT budget for pages. At scale (10 matches × 3 pages
+        // each) an uncapped loop injected EVERY page as its own note — the
+        // prompt drowned. Now: the 2 NEWEST pages per fixture speak in the
+        // prompt; older pages still count through the deterministic Scout
+        // stats (ingeststats AVERAGES every matched page's numbers), so no
+        // data is discarded — it's summarized by the math instead of prose.
+        const NOTES_PER_FIXTURE: usize = 2;
         let conn = state.db.lock().map_err(|_| "db lock")?;
         if let Ok(items) = db::ingest_for_fixture(&conn) {
+            // Group matched, non-archived pages per fixture (newest first).
+            let mut by_fix: HashMap<i64, Vec<(&db::IngestRow, Value, &crate::models::FixtureInput)>> = HashMap::new();
             for it in items.iter().filter(|i| i.status == "processed") {
                 let fl = crate::odds::fold(&it.fixture_label.clone().unwrap_or_default());
                 if fl.is_empty() {
@@ -2557,41 +2570,56 @@ pub async fn build_tickets(
                     it.fixture_id == Some(f.fixture_id)
                         || (crate::odds::team_match(&fl, &f.home_team) && crate::odds::team_match(&fl, &f.away_team))
                 });
-                if let Some(f) = m {
-                    // Self-heal: store the resolved fixture id so every later
-                    // consumer (scout, live, boards) matches this page exactly.
-                    if it.fixture_id != Some(f.fixture_id) {
-                        let _ = db::ingest_resolve_fixture(&conn, it.id, f.fixture_id);
-                    }
-                    let parsed = it.extracted_json.as_deref().and_then(|j| serde_json::from_str::<Value>(j).ok());
-                    // Skip ARCHIVED pages (their fixture day has passed) — never feed
-                    // a stale past-match page into a new build.
-                    if parsed.as_ref().map(|v| ingest_archived(v)).unwrap_or(false) {
+                let Some(f) = m else { continue };
+                // Self-heal: store the resolved fixture id so every later
+                // consumer (scout, live, boards) matches this page exactly.
+                if it.fixture_id != Some(f.fixture_id) {
+                    let _ = db::ingest_resolve_fixture(&conn, it.id, f.fixture_id);
+                }
+                let Some(parsed) = it.extracted_json.as_deref().and_then(|j| serde_json::from_str::<Value>(j).ok()) else { continue };
+                // Skip ARCHIVED pages (their fixture day has passed) — never feed
+                // a stale past-match page into a new build.
+                if ingest_archived(&parsed) {
+                    continue;
+                }
+                by_fix.entry(f.fixture_id).or_default().push((it, parsed, f));
+            }
+            let mut skipped_notes = 0usize;
+            for (_fid, mut pages) in by_fix {
+                pages.sort_by_key(|(it, _, _)| std::cmp::Reverse(it.created_at));
+                for (i, (it, parsed, f)) in pages.into_iter().enumerate() {
+                    ingest_used = true;
+                    let _ = db::ingest_mark_used(&conn, it.id);
+                    if i >= NOTES_PER_FIXTURE {
+                        skipped_notes += 1; // still in the Scout stat merge — just not prose
                         continue;
                     }
-                    let detail = parsed
-                        // Scout gets EVERYTHING the page yielded — but only on a
-                        // focused slate. Past 4 fixtures the full pages stack into
-                        // the token load that drowns the model, so big slates get
-                        // the tight digest per page instead (still fused, cheaper).
-                        .map(|v| if scout && selection.fixtures.len() <= 4 { compact_ingest_full(&v) } else { compact_ingest(&v) })
-                        .unwrap_or_default();
-                    if !detail.is_empty() {
-                        let note = if scout {
-                            format!(
-                                "{} vs {}: FULL INGESTED PAGE (3rd-party, from {}). This is the user's hand-fed intel — FUSE it with our table above: where our numbers and these AGREE, lean in; where they DIFFER, say which you trust and why; use the page's extra angles (form, xG, injuries, predictions, analyst reads) our table can't see. Data: {}",
-                                f.home_team, f.away_team, it.url, detail
-                            )
-                        } else {
-                            format!(
-                                "{} vs {}: INGESTED page stats (3rd-party, from {}) — WEIGH these for the matching markets (corner numbers inform corner O/U, card/foul numbers inform card markets, shot numbers inform shots/SOT, form & xG inform result/goals): {}",
-                                f.home_team, f.away_team, it.url, detail
-                            )
-                        };
-                        pred_notes.push(note);
-                        let _ = db::ingest_mark_used(&conn, it.id);
+                    let detail = if scout && selection.fixtures.len() <= 4 {
+                        compact_ingest_full(&parsed)
+                    } else {
+                        compact_ingest(&parsed)
+                    };
+                    if detail.is_empty() {
+                        continue;
                     }
+                    let note = if scout {
+                        format!(
+                            "{} vs {}: FULL INGESTED PAGE (3rd-party, from {}). This is the user's hand-fed intel — FUSE it with our table above: where our numbers and these AGREE, lean in; where they DIFFER, say which you trust and why; use the page's extra angles (form, xG, injuries, predictions, analyst reads) our table can't see. Data: {}",
+                            f.home_team, f.away_team, it.url, detail
+                        )
+                    } else {
+                        format!(
+                            "{} vs {}: INGESTED page stats (3rd-party, from {}) — WEIGH these for the matching markets (corner numbers inform corner O/U, card/foul numbers inform card markets, shot numbers inform shots/SOT, form & xG inform result/goals): {}",
+                            f.home_team, f.away_team, it.url, detail
+                        )
+                    };
+                    pred_notes.push(note);
                 }
+            }
+            if skipped_notes > 0 {
+                det_extra.push(format!(
+                    "Ingest at scale: {skipped_notes} older page(s) summarized into the Scout stats instead of injected as prose (2 newest per fixture speak in the prompt)."
+                ));
             }
         }
     }
@@ -2674,6 +2702,7 @@ pub async fn build_tickets(
             let mut r = call.result;
             r.from_cache = false;
             r.grok_used = grok_used;
+            r.ingest_used = ingest_used;
             r.grok_digest = grok_digest.clone();
             if two_stage {
                 r.data_quality_notes.push(format!("Two-stage build: {draft_model} drafted, {model} finalised."));
@@ -2719,7 +2748,7 @@ pub async fn build_tickets(
                 .collect();
             sig.sort();
             if let Ok(tj) = serde_json::to_string(t) {
-                let _ = db::gen_add(&conn, af::now_ts(), &day, &strategy, grok_used, &t.kind, &sig.join("##"), &tj, t.combined_odds);
+                let _ = db::gen_add(&conn, af::now_ts(), &day, &strategy, grok_used, ingest_used, &t.kind, &sig.join("##"), &tj, t.combined_odds);
             }
         }
     }
@@ -3407,7 +3436,7 @@ pub async fn build_ladder(
                 .collect();
             sig.sort();
             if let Ok(tj) = serde_json::to_string(t) {
-                let _ = db::gen_add(&conn, af::now_ts(), &day, "ladder", false, &t.kind, &sig.join("##"), &tj, t.combined_odds);
+                let _ = db::gen_add(&conn, af::now_ts(), &day, "ladder", false, false, &t.kind, &sig.join("##"), &tj, t.combined_odds);
             }
         }
     }
@@ -3438,6 +3467,7 @@ pub async fn build_ladder(
         context_notes: vec![],
         from_cache: false,
         grok_used: false,
+        ingest_used: false,
         grok_digest: None,
     })
 }
@@ -3656,6 +3686,7 @@ fn row_to_bet(r: &db::PlacedRow) -> Result<PlacedBet, String> {
         leg_results,
         settled: r.settled,
         grok_used: r.grok_used,
+        ingest_used: r.ingest_used,
         strategy: r.strategy.clone(),
         clv: r.clv,
     })
@@ -3668,6 +3699,7 @@ pub fn place_bet(
     stake: f64,
     odds: Option<f64>,
     grok_used: Option<bool>,
+    ingest_used: Option<bool>,
     strategy: Option<String>,
 ) -> Result<i64, String> {
     // Inject the actual odds the user took (if given) so P&L is accurate.
@@ -3687,6 +3719,7 @@ pub fn place_bet(
         &ticket_json,
         stake,
         grok_used.unwrap_or(false),
+        ingest_used.unwrap_or(false),
         strategy.as_deref().unwrap_or("value"),
     )
 }
@@ -3910,6 +3943,36 @@ pub fn generated_report(state: State<AppState>, since_days: Option<i64>) -> Resu
     build_gen_report(&state, since_days)
 }
 
+/// Paper-ledger A/B: does ingested data help? Two rows (with / without),
+/// void-aware and windowed like the strategy report.
+#[tauri::command]
+pub fn generated_ingest_split(state: State<AppState>, since_days: Option<i64>) -> Result<Vec<GenReportRow>, String> {
+    let since = since_days.map(|d| af::now_ts() - d.max(1) * 86_400).unwrap_or(0);
+    let conn = state.db.lock().map_err(|_| "db lock")?;
+    Ok(db::gen_ingest_split(&conn, since)?
+        .into_iter()
+        .map(|(ingest, total, settled, won, priced_n, ret_sum)| {
+            let hit_rate = if settled > 0 { won as f64 / settled as f64 } else { 0.0 };
+            let roi = if priced_n > 0 {
+                Some(((ret_sum - priced_n as f64) / priced_n as f64 * 1000.0).round() / 1000.0)
+            } else {
+                None
+            };
+            GenReportRow {
+                strategy: if ingest { "🧲 with ingested" } else { "without" }.to_string(),
+                grok_used: false,
+                total,
+                settled,
+                won,
+                hit_rate,
+                roi,
+                voided: 0,
+                predicted_hit: None,
+            }
+        })
+        .collect())
+}
+
 /// Same report but grouped by ticket KIND (Single / SGP / SGP+).
 #[tauri::command]
 pub fn generated_report_by_kind(state: State<AppState>) -> Result<Vec<GenReportRow>, String> {
@@ -4034,9 +4097,10 @@ pub fn export_extension(app: tauri::AppHandle) -> Result<String, String> {
         .map_err(|e| format!("no folder: {e}"))?
         .join("powabetz-extension");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let files: [(&str, &[u8]); 5] = [
+    let files: [(&str, &[u8]); 6] = [
         ("manifest.json", include_bytes!("../../extension/manifest.json")),
         ("background.js", include_bytes!("../../extension/background.js")),
+        ("content.js", include_bytes!("../../extension/content.js")),
         ("popup.html", include_bytes!("../../extension/popup.html")),
         ("popup.js", include_bytes!("../../extension/popup.js")),
         ("icon.png", include_bytes!("../../extension/icon.png")),
@@ -4601,18 +4665,39 @@ fn compact_ingest_full(v: &Value) -> String {
     out.chars().take(1600).collect()
 }
 
-fn to_ingest_item(r: &db::IngestRow) -> IngestItem {
+fn to_ingest_item(state: &AppState, r: &db::IngestRow) -> IngestItem {
     let v = r
         .extracted_json
         .as_deref()
         .and_then(|j| serde_json::from_str::<Value>(j).ok())
         .unwrap_or_else(|| serde_json::json!({}));
     let summary = v.get("summary").and_then(|s| s.as_str()).unwrap_or_default().to_string();
-    let fixture_date = v
-        .get("date")
-        .and_then(|s| s.as_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string());
+    // The page PRINTS its date in the SITE's timezone — a 10pm local kickoff
+    // shows as "tomorrow" on a UTC/European listing. Once the page is resolved
+    // to a real fixture, use the actual kickoff converted to the USER'S
+    // timezone instead (cache-only lookup — 0 requests).
+    let resolved_date = r.fixture_id.and_then(|fid| {
+        let j = peek(state, "/fixtures", vec![("id", fid.to_string())])?;
+        let iso = response_array(&j)
+            .first()?
+            .get("fixture")
+            .and_then(|f| f.get("date"))
+            .and_then(|d| d.as_str())?
+            .to_string();
+        let dt = chrono::DateTime::parse_from_rfc3339(&iso).ok()?;
+        let tzname = state.keys.lock().ok().and_then(|k| k.timezone.clone()).unwrap_or_default();
+        Some(match tzname.parse::<chrono_tz::Tz>() {
+            Ok(z) => dt.with_timezone(&z).format("%Y-%m-%d").to_string(),
+            Err(_) => dt.with_timezone(&chrono::Utc).format("%Y-%m-%d").to_string(),
+        })
+    });
+    let date_source = if resolved_date.is_some() { "fixture" } else { "page" }.to_string();
+    let fixture_date = resolved_date.or_else(|| {
+        v.get("date")
+            .and_then(|s| s.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    });
     let data: Vec<IngestKV> = v
         .get("data")
         .and_then(|d| d.as_array())
@@ -4632,6 +4717,7 @@ fn to_ingest_item(r: &db::IngestRow) -> IngestItem {
         created_at: r.created_at,
         url: r.url.clone(),
         title: r.title.clone(),
+        date_source,
         note: r.note.clone(),
         status: r.status.clone(),
         fixture_label: r.fixture_label.clone(),
@@ -4665,7 +4751,7 @@ pub fn ingest_info(state: State<AppState>) -> Result<IngestInfo, String> {
 #[tauri::command]
 pub fn list_ingested(state: State<AppState>) -> Result<Vec<IngestItem>, String> {
     let conn = state.db.lock().map_err(|_| "db lock")?;
-    Ok(db::ingest_list(&conn)?.iter().map(to_ingest_item).collect())
+    Ok(db::ingest_list(&conn)?.iter().map(|r| to_ingest_item(&state, r)).collect())
 }
 
 #[tauri::command]
@@ -4714,7 +4800,7 @@ pub async fn process_ingested(
     }
     let conn = state.db.lock().map_err(|_| "db lock")?;
     let updated = db::ingest_get(&conn, id)?.ok_or_else(|| "not found".to_string())?;
-    Ok(to_ingest_item(&updated))
+    Ok(to_ingest_item(&state, &updated))
 }
 
 #[tauri::command]
@@ -5145,7 +5231,7 @@ pub async fn darwin_sweep(
                 .collect();
             sig.sort();
             if let Ok(tj) = serde_json::to_string(t) {
-                let _ = db::gen_add(&conn, af::now_ts(), &day, name, false, &t.kind, &sig.join("##"), &tj, t.combined_odds);
+                let _ = db::gen_add(&conn, af::now_ts(), &day, name, false, false, &t.kind, &sig.join("##"), &tj, t.combined_odds);
                 *counts.entry(name).or_insert(0) += 1;
             }
         }

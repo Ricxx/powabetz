@@ -235,6 +235,7 @@ export default function Ledger({ onClose }: { onClose: () => void }) {
   // bury what's working NOW under months-old results.
   const [windowDays, setWindowDays] = useState<number | null>(null);
   const [byKind, setByKind] = useState<GenReportRow[]>([]);
+  const [ingestSplit, setIngestSplit] = useState<GenReportRow[]>([]);
   const [byMarket, setByMarket] = useState<MarketReportRow[]>([]);
   const [byPurpose, setByPurpose] = useState<ModelPurposeRow[]>([]);
   const [busy, setBusy] = useState(false);
@@ -242,6 +243,7 @@ export default function Ledger({ onClose }: { onClose: () => void }) {
 
   function loadAgg() {
     api.generatedReportByKind().then(setByKind).catch(() => {});
+    api.generatedIngestSplit(windowDays).then(setIngestSplit).catch(() => {});
     api.generatedReportByMarket().then(setByMarket).catch(() => {});
     api.usageByPurpose().then(setByPurpose).catch(() => {});
   }
@@ -333,6 +335,7 @@ export default function Ledger({ onClose }: { onClose: () => void }) {
         <>
           <ReportTable rows={rows} label="By strategy" />
           <ReportTable rows={byKind} label="By ticket type" labelFn={(s) => s} />
+      <ReportTable rows={ingestSplit} label="Does ingested data help? 🧲" labelFn={(s) => s} />
           <MarketTable rows={byMarket} />
           <p className="text-[10px] text-slate-500">
             Hit = all legs landed. ROI = notional return at 1 unit/ticket on priced tickets only

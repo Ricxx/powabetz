@@ -1,9 +1,14 @@
 const $ = (id) => document.getElementById(id);
 
-chrome.storage.local.get(["endpoint", "token"]).then((c) => {
+chrome.storage.local.get(["endpoint", "token", "barEnabled"]).then((c) => {
   $("endpoint").value = c.endpoint || "http://127.0.0.1:8765/ingest";
   $("token").value = c.token || "";
+  $("bar").checked = !!c.barEnabled;
 });
+
+// The floating bar toggles LIVE on every open tab (content scripts listen to
+// storage changes) — no reloads needed; off removes it everywhere.
+$("bar").onchange = () => chrome.storage.local.set({ barEnabled: $("bar").checked });
 
 $("save").onclick = async () => {
   await chrome.storage.local.set({

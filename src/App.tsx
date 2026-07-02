@@ -685,7 +685,7 @@ function AppInner() {
   async function placeTicket(t: Ticket, stake: number, odds: number | null, strategyOverride?: string) {
     const strat = strategyOverride ?? buildStrategy;
     try {
-      await api.placeBet(t, stake, odds, result?.grok_used ?? false, strat);
+      await api.placeBet(t, stake, odds, result?.grok_used ?? false, result?.ingest_used ?? false, strat);
       const n = t.legs.length;
       toast.success(`Bet placed — $${stake.toFixed(2)} · ${n} leg${n > 1 ? "s" : ""}`);
     } catch (e) {
@@ -1553,6 +1553,15 @@ function AppInner() {
               </div>
             </div>
             <div>
+              <Toggle label="🧲 Use ingested data" on={useIngest} onChange={setUseIngest} />
+              {useIngest && (
+                <p className="text-[10px] text-slate-500 mt-1 mb-2">
+                  Feeds your processed pages into the build. Tracked on every ticket (🧲) so the
+                  Ledger can show whether your ingested data actually helps.
+                </p>
+              )}
+            </div>
+            <div>
               <Toggle label="🍀 Feeling Lucky" on={feelingLucky} onChange={setFeelingLucky} />
               {feelingLucky && (
                 <p className="text-[10px] text-slate-500 mt-1">
@@ -1808,7 +1817,6 @@ function AppInner() {
               judgement (also speeds up the build). The markets you pick above already decide which
               player/team stats are used.
             </p>
-            <Toggle label="Include ingested page data as context" on={useIngest} onChange={setUseIngest} />
             <Toggle label="Real xG — recent form (slower, more requests)" on={useXg} onChange={setUseXg} />
             <Toggle label="Coach & tactics play-style (Haiku, cached)" on={useTactics} onChange={setUseTactics} />
             <Toggle label="Confirmed lineups (starting XI only)" on={useLineups} onChange={setUseLineups} />

@@ -165,6 +165,8 @@ export interface BuildResult {
   context_notes?: string[];
   from_cache: boolean;
   grok_used?: boolean;
+  /// Ingested page data actually fed this build — carried to bets/ledger (A/B).
+  ingest_used?: boolean;
   grok_digest?: string | null;
 }
 
@@ -245,6 +247,8 @@ export interface IngestItem {
   status: string; // new | processed
   fixture_label?: string | null;
   fixture_date?: string | null;
+  /// "fixture" = real kickoff in YOUR timezone; "page" = date as the site printed it.
+  date_source?: string;
   summary: string;
   data: IngestKV[];
   model?: string | null;
@@ -354,6 +358,7 @@ export interface PlacedBet {
   leg_results: LegResult[];
   settled: boolean;
   grok_used: boolean;
+  ingest_used?: boolean;
   strategy: string;
   /// Closing-line value: avg (placed/close − 1) across priced legs. Positive =
   /// beat the close — the fastest-converging proof of real edge.

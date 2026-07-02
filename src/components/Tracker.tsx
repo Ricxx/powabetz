@@ -63,6 +63,11 @@ function BetCard({ bet, onSettle, onDelete, onUpdated }: { bet: PlacedBet; onSet
               🔍
             </span>
           )}
+          {bet.ingest_used && (
+            <span className="badge bg-accent/20 text-accent" title="Ingested page data fed this build">
+              🧲
+            </span>
+          )}
           {bet.clv != null && (
             <span
               className={`badge ${bet.clv >= 0 ? "bg-accent/20 text-accent" : "bg-bad/20 text-bad"}`}

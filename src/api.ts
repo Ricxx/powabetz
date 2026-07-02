@@ -149,6 +149,9 @@ export const api = {
   darwinSweep: (fixtures: FixtureInput[], markets: string[]) =>
     invoke<string[]>("darwin_sweep", { fixtures, markets }),
   generatedReportByKind: () => invoke<GenReportRow[]>("generated_report_by_kind"),
+  // A/B: does ingested data help? (paper ledger, void-aware, windowed)
+  generatedIngestSplit: (sinceDays?: number | null) =>
+    invoke<GenReportRow[]>("generated_ingest_split", { sinceDays: sinceDays ?? null }),
   generatedReportByMarket: () => invoke<MarketReportRow[]>("generated_report_by_market"),
 
   evaluateTickets: (
@@ -203,8 +206,9 @@ export const api = {
     stake: number,
     odds: number | null,
     grokUsed: boolean,
+    ingestUsed: boolean,
     strategy: string
-  ) => invoke<number>("place_bet", { ticket, stake, odds, grokUsed, strategy }),
+  ) => invoke<number>("place_bet", { ticket, stake, odds, grokUsed, ingestUsed, strategy }),
   listBets: () => invoke<PlacedBet[]>("list_bets"),
   deleteBet: (id: number) => invoke<void>("delete_bet", { id }),
   settleBet: (id: number) => invoke<PlacedBet>("settle_bet", { id }),

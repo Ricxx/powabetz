@@ -2,10 +2,8 @@
 // to the local Powabetz app. Because it runs in YOUR browser, there's no
 // bot-detection / Cloudflare wall — the page is already rendered.
 
-const MENU = [
-  { id: "ingest", title: "Add to Powabetz" },
-  { id: "ingest-note", title: "Ingest with note…" },
-];
+// ONE menu item, one click — notes are added in the app before processing.
+const MENU = [{ id: "ingest", title: "Add to Powabetz" }];
 
 chrome.runtime.onInstalled.addListener(() => {
   chrome.contextMenus.removeAll(() => {
@@ -15,18 +13,16 @@ chrome.runtime.onInstalled.addListener(() => {
   });
 });
 
-async function grab(tabId, askNote) {
+async function grab(tabId) {
   const [res] = await chrome.scripting.executeScript({
     target: { tabId },
-    func: (ask) => {
-      const note = ask ? window.prompt("Note for Haiku — what should it extract?", "") || "" : "";
+    func: () => {
       // Prefer the main content region so we skip nav/header/footer token-busters.
       const root =
         document.querySelector("main, article, [role=main], #content, .content, #main") || document.body;
       const content = ((root && root.innerText) || "").replace(/\n{3,}/g, "\n\n").trim();
-      return { url: location.href, title: document.title, content, note };
+      return { url: location.href, title: document.title, content, note: "" };
     },
-    args: [askNote],
   });
   return res.result;
 }
@@ -48,10 +44,38 @@ function badge(text, ok) {
   setTimeout(() => chrome.action.setBadgeText({ text: "" }), 2500);
 }
 
+// Floating-bar messaging: the content script can't reach localhost from an
+// https page (mixed content), so the service worker does the fetches.
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  (async () => {
+    const cfg = await chrome.storage.local.get(["endpoint", "token"]);
+    const endpoint = cfg.endpoint || "http://127.0.0.1:8765/ingest";
+    const base = endpoint.replace(/\/ingest\/?$/, "");
+    try {
+      if (msg?.type === "pbz-status") {
+        const r = await fetch(`${base}/status?url=${encodeURIComponent(msg.url || "")}`, {
+          headers: { "x-ingest-token": cfg.token || "" },
+        });
+        sendResponse(r.ok ? await r.json() : null);
+        return;
+      }
+      if (msg?.type === "pbz-ingest") {
+        const ok = await send(msg.payload);
+        badge(ok ? "✓" : "!", ok);
+        sendResponse({ ok });
+        return;
+      }
+    } catch {
+      sendResponse(null);
+    }
+  })();
+  return true; // async sendResponse
+});
+
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (!tab?.id) return;
   try {
-    const data = await grab(tab.id, info.menuItemId === "ingest-note");
+    const data = await grab(tab.id);
     const ok = await send(data);
     badge(ok ? "✓" : "!", ok);
   } catch (e) {

@@ -397,7 +397,7 @@ function PlaceRow({
       }
       const o = parseFloat(odds);
       try {
-        await api.placeBet(ticket, s, Number.isFinite(o) && o > 0 ? o : null, false, "board");
+        await api.placeBet(ticket, s, Number.isFinite(o) && o > 0 ? o : null, false, false, "board");
       } catch (e) {
         toast.error(e);
         return;

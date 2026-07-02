@@ -480,4 +480,52 @@ looks stellar in the ledger while predicting nothing.
     (ink background, edge border, readable text, styled placeholder, accent
     focus ring); the preset input is pill-shaped to sit in the chip row.
 
+## Round 15 — "Use ingested data" toggle + full A/B tracking, one-click extension
+
+- [x] **🧲 Use ingested data** toggle now sits directly above 🍀 Feeling Lucky
+  (moved from the buried data-sources card, relabelled).
+- [x] **Tracked end-to-end like Grok**: `ingest_used` is set when ingested
+  pages ACTUALLY feed a build (matched pages, not just the toggle), carried on
+  BuildResult → recorded on every generated ticket (new column) and every
+  placed bet (new column + place_bet param). Tracker shows a 🧲 badge per bet;
+  the Ledger gains a **"Does ingested data help? 🧲"** table (with/without —
+  void-aware, respects the 7d/30d/All window) so the hand-fed-data edge is
+  measurable, not assumed.
+- [x] **Extension simplified to one click** — the "Ingest with note…" context
+  item removed (its `window.prompt` was the unsupported-dialog pattern anyway,
+  and notes are added in the app before processing). One item: "Add to
+  Powabetz".
+
+## Round 16 — floating research bar + large-ingest data flow
+
+- [x] **Floating research bar** (extension v1.2.0): toggled from the popup
+  ("Floating research bar"), it mounts on every page via a content script in a
+  closed shadow root (page CSS can't touch it). Shows: page status dot +
+  "✓ ingested"/"not ingested", the 🧲 total (+ new count), a one-click
+  **Ingest** button (turns amber **Update** when the page is already in),
+  and a chevron that minimizes it to an edge pull-tab (state persists).
+  Turning the toggle off unmounts it from every open tab instantly (storage
+  listener) — no tab reloads. Fetches go through the service worker (mixed
+  content blocks localhost from https pages); new token-gated `GET /status`
+  on the local ingest server returns counts + per-URL status.
+- [x] **Large-ingest prompt budget** — the notes injection was UNCAPPED per
+  fixture (10 matches × 3 pages = 30 prose notes drowning the prompt). Now
+  the 2 NEWEST pages per fixture speak in the prompt; older pages still
+  count — ingeststats AVERAGES every matched page's numbers into the
+  deterministic Scout candidates, so extra pages sharpen the math instead of
+  bloating the prose. A data-quality note reports how many were summarized.
+
+## Round 17 — ingest dates in YOUR timezone
+
+- [x] **"Shows tomorrow but kicks off 10pm today"** — the ingest list trusted
+  the date as the SOURCE PAGE printed it (the site's timezone: a 10pm UTC-5
+  kickoff is July 3 on a UTC/European listing). Once a page is resolved to a
+  real fixture (id stored by the self-healing matcher), `to_ingest_item` now
+  converts the ACTUAL kickoff to the user's configured timezone (cache-only
+  fixture lookup, 0 requests) and that date wins — so the group reads "Today".
+  New `date_source` field ("fixture" vs "page"); unresolved groups show a
+  "· site date" hint with a tooltip explaining it snaps to your timezone
+  after the first build using the page. Grouping prefers a resolved date over
+  page-printed ones; archiving inherits the same corrected dates.
+
 ## Remaining deferred (small)

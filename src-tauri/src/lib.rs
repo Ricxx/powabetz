@@ -232,6 +232,7 @@ pub fn run() {
             commands::settle_generated,
             commands::generated_report,
             commands::darwin_sweep,
+            commands::generated_ingest_split,
             commands::generated_report_by_kind,
             commands::generated_report_by_market,
             commands::export_data,

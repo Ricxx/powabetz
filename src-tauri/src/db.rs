@@ -458,6 +458,9 @@ fn init(conn: &Connection) -> Result<(), String> {
     let _ = conn.execute("ALTER TABLE placed_bets ADD COLUMN clv REAL", []);
     // All-void generated tickets (pushes) — excluded from hit/ROI (migration).
     let _ = conn.execute("ALTER TABLE generated_tickets ADD COLUMN voided INTEGER NOT NULL DEFAULT 0", []);
+    // Whether ingested page data fed the build (A/B tracking, like grok_used).
+    let _ = conn.execute("ALTER TABLE generated_tickets ADD COLUMN ingest_used INTEGER NOT NULL DEFAULT 0", []);
+    let _ = conn.execute("ALTER TABLE placed_bets ADD COLUMN ingest_used INTEGER NOT NULL DEFAULT 0", []);
     let _ = conn.execute("ALTER TABLE placed_bets ADD COLUMN clv_json TEXT", []);
     // Calibration + settle scan the ledger by settled-state on every build/run —
     // index it so the ever-growing ledger stays cheap to scan.
@@ -747,6 +750,7 @@ pub struct PlacedRow {
     pub leg_results_json: String,
     pub settled: bool,
     pub grok_used: bool,
+    pub ingest_used: bool,
     pub strategy: String,
     /// Closing-line value: avg (placed_odds / closing_odds − 1) across priced
     /// legs. Positive = beat the close — the fastest-converging edge signal.
@@ -760,12 +764,13 @@ pub fn place_bet(
     ticket_json: &str,
     stake: f64,
     grok_used: bool,
+    ingest_used: bool,
     strategy: &str,
 ) -> Result<i64, String> {
     conn.execute(
-        "INSERT INTO placed_bets (created_at, day, ticket_json, stake, status, returns, leg_results_json, settled, grok_used, strategy)
-         VALUES (?1, ?2, ?3, ?4, 'open', 0, '[]', 0, ?5, ?6)",
-        params![created_at, day, ticket_json, stake, grok_used as i64, strategy],
+        "INSERT INTO placed_bets (created_at, day, ticket_json, stake, status, returns, leg_results_json, settled, grok_used, ingest_used, strategy)
+         VALUES (?1, ?2, ?3, ?4, 'open', 0, '[]', 0, ?5, ?6, ?7)",
+        params![created_at, day, ticket_json, stake, grok_used as i64, ingest_used as i64, strategy],
     )
     .map_err(|e| e.to_string())?;
     Ok(conn.last_insert_rowid())
@@ -785,11 +790,12 @@ fn row_to_placed(r: &rusqlite::Row) -> rusqlite::Result<PlacedRow> {
         grok_used: r.get::<_, i64>(9)? != 0,
         strategy: r.get(10)?,
         clv: r.get(11)?,
+        ingest_used: r.get::<_, i64>(12)? != 0,
     })
 }
 
 const PLACED_COLS: &str =
-    "id, created_at, day, ticket_json, stake, status, returns, leg_results_json, settled, grok_used, strategy, clv";
+    "id, created_at, day, ticket_json, stake, status, returns, leg_results_json, settled, grok_used, strategy, clv, ingest_used";
 
 pub fn list_placed(conn: &Connection) -> Result<Vec<PlacedRow>, String> {
     let sql = format!("SELECT {PLACED_COLS} FROM placed_bets ORDER BY created_at DESC");
@@ -862,6 +868,7 @@ pub fn gen_add(
     day: &str,
     strategy: &str,
     grok_used: bool,
+    ingest_used: bool,
     kind: &str,
     sig: &str,
     ticket_json: &str,
@@ -869,12 +876,45 @@ pub fn gen_add(
 ) -> Result<(), String> {
     conn.execute(
         "INSERT OR IGNORE INTO generated_tickets
-         (created_at, day, strategy, grok_used, kind, sig, ticket_json, combined_odds)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![now, day, strategy, grok_used as i64, kind, sig, ticket_json, combined_odds],
+         (created_at, day, strategy, grok_used, ingest_used, kind, sig, ticket_json, combined_odds)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![now, day, strategy, grok_used as i64, ingest_used as i64, kind, sig, ticket_json, combined_odds],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Paper-ledger A/B: with vs without ingested data (void-aware, windowed).
+/// Returns (ingest_used, total, settled, won, priced_n, return_sum).
+pub fn gen_ingest_split(conn: &Connection, since: i64) -> Result<Vec<(bool, i64, i64, i64, i64, f64)>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT ingest_used,
+                    COUNT(*),
+                    SUM(CASE WHEN settled=1 AND voided=0 THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN voided=0 THEN COALESCE(won,0) ELSE 0 END),
+                    SUM(CASE WHEN settled=1 AND voided=0 AND combined_odds IS NOT NULL THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN settled=1 AND voided=0 AND combined_odds IS NOT NULL AND won=1 THEN combined_odds ELSE 0 END)
+             FROM generated_tickets WHERE created_at >= ?1 GROUP BY ingest_used",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![since], |r| {
+            Ok((
+                r.get::<_, i64>(0)? != 0,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, f64>(5)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| e.to_string())?);
+    }
+    Ok(out)
 }
 
 /// Aggregate by ticket KIND (Single/SGP/SGP+): (kind, total, settled, won, priced_n, return_sum).

@@ -158,13 +158,21 @@ export default function Ingest({ onClose }: { onClose: () => void }) {
       .filter(Boolean)
       .sort()
       .join("|");
-  const groups = new Map<string, { label: string; date: string; items: IngestItem[] }>();
+  const groups = new Map<string, { label: string; date: string; resolved: boolean; items: IngestItem[] }>();
   for (const it of items) {
     const label = it.fixture_label || "Unmatched (process to tag a fixture)";
     const date = it.fixture_date || "";
+    const resolved = it.date_source === "fixture";
     const key = it.fixture_label ? fixtureKey(it.fixture_label) : "unmatched";
-    if (!groups.has(key)) groups.set(key, { label, date, items: [] });
-    groups.get(key)!.items.push(it);
+    if (!groups.has(key)) groups.set(key, { label, date, resolved, items: [] });
+    const g = groups.get(key)!;
+    g.items.push(it);
+    // A fixture-RESOLVED date (real kickoff in YOUR timezone) beats whatever
+    // date the page printed (site timezone — often a day ahead for late games).
+    if (resolved && !g.resolved) {
+      g.date = date;
+      g.resolved = true;
+    }
   }
   // Active = matches today/upcoming (or undated); Archive = day already passed.
   // Use LOCAL calendar dates (not UTC) so an evening kickoff isn't pushed to
@@ -413,7 +421,14 @@ export default function Ingest({ onClose }: { onClose: () => void }) {
           return (
             <div key={g.label + g.date} className="space-y-2">
               {showDay && (
-                <div className="text-[11px] font-bold text-accent uppercase tracking-wide pt-1 px-1">📅 {dayLabel(g.date)}</div>
+                <div className="text-[11px] font-bold text-accent uppercase tracking-wide pt-1 px-1">
+                  📅 {dayLabel(g.date)}
+                  {g.date && !g.resolved && (
+                    <span className="text-slate-500 normal-case font-normal" title="This is the date as the SOURCE PAGE printed it (its timezone, often a day ahead for late kickoffs). It snaps to the real kickoff in YOUR timezone after the first build that uses this page.">
+                      {" "}· site date
+                    </span>
+                  )}
+                </div>
               )}
               {renderGroup(g)}
             </div>

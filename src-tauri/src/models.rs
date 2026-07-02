@@ -225,6 +225,10 @@ pub struct BuildResult {
     pub from_cache: bool,
     #[serde(default)]
     pub grok_used: bool,
+    /// Whether ingested page data actually fed this build (matched pages) —
+    /// carried onto placed bets / the ledger for A/B tracking like grok_used.
+    #[serde(default)]
+    pub ingest_used: bool,
     #[serde(default)]
     pub grok_digest: Option<String>,
 }
@@ -524,6 +528,9 @@ pub struct IngestItem {
     pub status: String, // new | processed
     pub fixture_label: Option<String>,
     pub fixture_date: Option<String>, // date of the fixture the page is about
+    /// "fixture" = real kickoff converted to the user's timezone (page resolved
+    /// to a fixture id); "page" = the date as the site printed it (site tz!).
+    pub date_source: String,
     pub summary: String,
     pub data: Vec<IngestKV>, // the structured extraction, viewable to verify it isn't garbage
     pub model: Option<String>,
@@ -585,6 +592,8 @@ pub struct PlacedBet {
     pub leg_results: Vec<LegResult>,
     pub settled: bool,
     pub grok_used: bool,
+    #[serde(default)]
+    pub ingest_used: bool,
     pub strategy: String, // strategy key (value/oracle/scout/… or board/live/custom)
     /// Closing-line value: avg (placed / close − 1) across priced legs.
     /// Positive = beat the close — the fastest-converging proof of edge.
