@@ -53,6 +53,13 @@
   .card {
     @apply rounded-2xl bg-panel border border-edge p-4;
   }
+  /* Themed text input — this class was referenced but never DEFINED, so those
+     inputs rendered as raw native white boxes with faint default text. */
+  .input {
+    @apply rounded-lg bg-ink text-slate-100 border border-edge px-2.5 py-2 text-sm
+      placeholder:text-slate-500 outline-none transition-colors
+      focus:border-accent/70 focus:ring-1 focus:ring-accent/40;
+  }
   .badge {
     @apply rounded-md px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide;
   }

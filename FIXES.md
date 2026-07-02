@@ -389,4 +389,95 @@ Verified sound, left alone:
 - The manual fixture-reassignment path (label + date patch-through into the
   extracted JSON) — a good escape hatch; now interoperates with auto-resolution.
 
+## Round 11 — Ledger review (tracking accuracy + usefulness)
+
+Findings (fixed):
+- [x] **Void tickets counted as losses** — all-void (pushed) tickets were
+  settled `won=false` and the SQL report counted them in settled/hit/ROI,
+  dragging every strategy's numbers down. New `voided` column set at settle;
+  both reports (by strategy, by kind) exclude pushes from hit/ROI and the UI
+  shows them as "+N∅".
+- [x] **No per-strategy calibration** — the single most useful missing metric:
+  each settled ticket carries its own predicted combined hit chance, and the
+  report now shows avg `pred X%` under the actual hit rate (amber when the gap
+  exceeds 10pts). This answers "is Jackpot actually hitting the ~3% it
+  claims?" per strategy — the honesty check that hit-rate alone can't give.
+- [x] **Lifetime-only aggregation** — edges decay; months-old results buried
+  what's working NOW. The strategy report takes a `since_days` window with a
+  7d / 30d / All toggle in the Ledger header.
+- [x] **Small-sample noise sorted to the top** — a 3-ticket 100%-hit strategy
+  ranked above a 40-ticket +8% one. Sorting now tiers by sample size (10+ /
+  4+ / fewer) before ROI, and settled<10 rows carry a ⚠ "treat as noise"
+  marker. This also makes the Darwin leaderboard honest — a variant can't
+  look like a champion off three lucky tickets.
+
+Judged sound: ROI's flat-1-unit-per-priced-ticket basis; the per-market table
+(predicted vs actual + margins + near-misses — already strong); the AI-spend
+breakdown; settle dedup via day+strategy+sig.
+
+## Round 12 — trivial-leg policy (near-certainties are negative value)
+
+The economics: a 1.02–1.10 leg adds ≤10% payout while its REAL failure chance
+in a parlay is comparable — risk with no return. And its "wins" carry no
+signal: "Goals Range 1-6" lands in ~90% of games, so any strategy stacking it
+looks stellar in the ledger while predicting nothing.
+
+- [x] **Always-on trivial-leg filter** in builds: legs with est > 93% or
+  priced ≤ 1.10 are dropped before the model/shortlist/apex, with a
+  data-quality note counting them. The user's Safety-ceiling slider still
+  narrows further; its "off" label now reads "default (near-certainties >93%
+  always dropped)".
+- [x] **Same policy in the Acca Ladder** (a rung at 1.05 pads hit% for
+  nothing) and in **Darwin** (a paper variant padded with near-certainties
+  would fake exactly the ledger pollution Darwin exists to avoid).
+- [x] **"Goals Range 1-6" no longer generated** — the worst offender priced
+  nothing worth knowing (the filter would drop it anyway; now it doesn't even
+  exist). Other wide bands stay and are caught by the probability filter when
+  trivial.
+- [x] **Prompt insurance**: the builder prompt now states that a near-certainty
+  never earns a parlay slot ("risk without return; every leg must EARN its
+  place with meaningful odds") — covers unpriced legs the odds test can't see.
+- [x] **Forecasts keep the full distribution** — dropped trivial legs are
+  retained for the Match Predictor / Simple forecast panels (a 95% favourite
+  belongs in a "likely result" display even though it's a worthless bet leg).
+
+## Round 13 — Data viewer UX + data-clarity review
+
+- [x] **One panel, four tabs, one close** — the Data viewer was three
+  half-joined systems: `boardMode` (all/bankers) fighting `dataTab`
+  (picks/inspector/ingested), Bankers hiding the tab bar entirely, every child
+  owning a Done button that killed the whole panel, and the Inspector being a
+  separate slide-in drawer whose BACKDROP click also closed everything. Now:
+  a single sticky header (📊 Data · Picks | Bankers | Inspector | Ingested ·
+  ✕ Done); tabs switch freely and never close; only ✕ closes. Children lost
+  their own chrome; Inspector is inline content, not a drawer.
+- [x] **Picks↔Bankers stale-data race fixed for real** — PicksBoard's fetch
+  was pinned to mount, so flipping modes showed the other list's data (round-1
+  audit 1.5). `key={dataTab}` remounts it per tab: correct fetch, every time.
+- [x] **Data-clarity pass on the board**: the Pinnacle de-vigged probability
+  (the sharpest datum in the app) is now shown per priced row ("pin X%");
+  model-sourced EV carries the same `*` distinction as the Results screen
+  (sharp EV and model EV looked identical — they are not equally
+  trustworthy); a footnote explains pin / EV* / cache-first data age.
+
+## Round 14 — Feeling Lucky simplified + market presets
+
+- [x] **Feeling Lucky → one toggle** — the three 0-3 counters are gone; ON adds
+  2 of each tier (safe ~75%+ / moderate ~40% / risky ~10%+, 6 extra parlays),
+  OFF adds none. Backend unchanged (counts still flow through lucky_safe/
+  moderate/risky, so caching and prompts are untouched).
+- [x] **Quick mode → named presets** — the three hardcoded combos became
+  starter presets. "＋ Save current…" stores the selected markets under any
+  name (same name overwrites), tap applies, × deletes, the active-matching
+  preset highlights. Persisted in localStorage (`powabet.marketPresets`),
+  starter presets restorable by clearing that key.
+  - Fix: naming uses an INLINE input (Enter saves, Esc cancels) —
+    `window.prompt()` does not exist in Tauri's webview, so the first version
+    silently did nothing.
+  - Fix: the `.input` CSS class was referenced (preset name, Tracker add-odds)
+    but NEVER DEFINED — those inputs rendered as raw native white boxes with
+    faint default text on the dark theme. Now a proper themed component class
+    (ink background, edge border, readable text, styled placeholder, accent
+    focus ring); the preset input is pill-shaped to sit in the chip row.
+
 ## Remaining deferred (small)

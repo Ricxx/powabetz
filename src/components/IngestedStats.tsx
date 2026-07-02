@@ -27,7 +27,7 @@ const teamMatch = (labelRaw: string, team: string): boolean => {
 };
 
 // The scraped stat rows from your ingested pages, matched to the selected fixtures.
-export default function IngestedStats({ fixtures, onClose }: { fixtures: FixtureInput[]; onClose: () => void }) {
+export default function IngestedStats({ fixtures }: { fixtures: FixtureInput[] }) {
   const [items, setItems] = useState<IngestItem[]>([]);
   const [err, setErr] = useState<string | null>(null);
   useEffect(() => {
@@ -44,12 +44,6 @@ export default function IngestedStats({ fixtures, onClose }: { fixtures: Fixture
 
   return (
     <div className="space-y-3">
-      <div className="flex items-center justify-between">
-        <h2 className="text-lg font-bold">🧲 Ingested stats</h2>
-        <button className="btn btn-ghost text-sm py-2" onClick={onClose}>
-          Done
-        </button>
-      </div>
       <p className="text-[11px] text-slate-500">
         The stats scraped from the pages you ingested, matched to your selected fixtures. Feeds Scout and the model as
         context. Fix a mis-tagged page in the 🧲 Ingest screen.

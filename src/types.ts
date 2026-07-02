@@ -214,6 +214,11 @@ export interface GenReportRow {
   won: number;
   hit_rate: number;
   roi: number | null;
+  /// All-void tickets (pushes) — settled but excluded from hit/ROI.
+  voided?: number;
+  /// Avg PREDICTED combined hit chance of the settled tickets — vs hit_rate =
+  /// the strategy's honesty (per-strategy calibration).
+  predicted_hit?: number | null;
 }
 
 export interface MarketReportRow {

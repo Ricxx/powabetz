@@ -71,23 +71,15 @@ function PlayerDetail({ p, onBack }: { p: PlayerInspect; onBack: () => void }) {
   );
 }
 
-export default function Inspector({
-  fixtures,
-  onClose,
-}: {
-  fixtures: FixtureInput[];
-  onClose: () => void;
-}) {
+export default function Inspector({ fixtures }: { fixtures: FixtureInput[] }) {
   const [data, setData] = useState<InspectFixture[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
-  const [shown, setShown] = useState(false);
   const [openTeam, setOpenTeam] = useState<string | null>(null);
   const [player, setPlayer] = useState<PlayerInspect | null>(null);
   const [loadingPlayer, setLoadingPlayer] = useState(false);
   const [teamLoading, setTeamLoading] = useState<Set<string>>(new Set());
 
   useEffect(() => {
-    setShown(true);
     api.inspectFixtures(fixtures).then(setData).catch((e) => setErr(errMsg(e)));
   }, []);
 
@@ -129,21 +121,8 @@ export default function Inspector({
   }
 
   return (
-    <div className="fixed inset-0 z-40">
-      <div className="absolute inset-0 bg-black/60" onClick={onClose} />
-      <div
-        className={`absolute top-0 right-0 h-full w-[88%] max-w-md bg-ink border-l border-edge shadow-2xl transition-transform duration-200 ${
-          shown ? "translate-x-0" : "translate-x-full"
-        } flex flex-col`}
-      >
-        <div className="flex items-center justify-between px-4 py-3 border-b border-edge">
-          <div className="font-bold">Data viewer</div>
-          <button className="btn btn-ghost text-sm py-2" onClick={onClose}>
-            Close
-          </button>
-        </div>
+    <div className="space-y-4">
 
-        <div className="flex-1 overflow-y-auto p-4 space-y-4">
           {err && (
             <div className="text-xs text-warn">
               {err}
@@ -228,8 +207,6 @@ export default function Inspector({
               </p>
             </>
           )}
-        </div>
-      </div>
     </div>
   );
 }

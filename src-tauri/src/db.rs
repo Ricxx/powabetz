@@ -456,6 +456,8 @@ fn init(conn: &Connection) -> Result<(), String> {
     );
     // CLV (closing-line value) per placed bet (migration).
     let _ = conn.execute("ALTER TABLE placed_bets ADD COLUMN clv REAL", []);
+    // All-void generated tickets (pushes) — excluded from hit/ROI (migration).
+    let _ = conn.execute("ALTER TABLE generated_tickets ADD COLUMN voided INTEGER NOT NULL DEFAULT 0", []);
     let _ = conn.execute("ALTER TABLE placed_bets ADD COLUMN clv_json TEXT", []);
     // Calibration + settle scan the ledger by settled-state on every build/run —
     // index it so the ever-growing ledger stays cheap to scan.
@@ -879,9 +881,11 @@ pub fn gen_add(
 pub fn gen_report_by_kind(conn: &Connection) -> Result<Vec<(String, i64, i64, i64, i64, f64)>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT kind, COUNT(*), SUM(settled), SUM(COALESCE(won,0)),
-                    SUM(CASE WHEN settled=1 AND combined_odds IS NOT NULL THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN settled=1 AND combined_odds IS NOT NULL AND won=1 THEN combined_odds ELSE 0 END)
+            "SELECT kind, COUNT(*),
+                    SUM(CASE WHEN settled=1 AND voided=0 THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN voided=0 THEN COALESCE(won,0) ELSE 0 END),
+                    SUM(CASE WHEN settled=1 AND voided=0 AND combined_odds IS NOT NULL THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN settled=1 AND voided=0 AND combined_odds IS NOT NULL AND won=1 THEN combined_odds ELSE 0 END)
              FROM generated_tickets GROUP BY kind",
         )
         .map_err(|e| e.to_string())?;
@@ -929,31 +933,34 @@ pub fn gen_unsettled(conn: &Connection) -> Result<Vec<GenRow>, String> {
     Ok(out)
 }
 
-pub fn gen_mark_settled(conn: &Connection, id: i64, won: bool, leg_results_json: &str) -> Result<(), String> {
+pub fn gen_mark_settled(conn: &Connection, id: i64, won: bool, voided: bool, leg_results_json: &str) -> Result<(), String> {
     conn.execute(
-        "UPDATE generated_tickets SET settled = 1, won = ?2, leg_results_json = ?3 WHERE id = ?1",
-        params![id, won as i64, leg_results_json],
+        "UPDATE generated_tickets SET settled = 1, won = ?2, voided = ?3, leg_results_json = ?4 WHERE id = ?1",
+        params![id, won as i64, voided as i64, leg_results_json],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
 }
 
-/// Aggregate by strategy (Grok variants COMBINED): (strategy, grok=false, total,
-/// settled, won, priced_n, return_sum). One row per strategy.
-pub fn gen_report(conn: &Connection) -> Result<Vec<(String, bool, i64, i64, i64, i64, f64)>, String> {
+/// Aggregate by strategy since `since` (unix ts; 0 = lifetime): (strategy,
+/// grok=false, total, settled, won, priced_n, return_sum, voided). VOIDED
+/// tickets (all-void = push, stake refunded) are excluded from settled/won/
+/// ROI — counting a push as a loss dragged every hit-rate down.
+pub fn gen_report(conn: &Connection, since: i64) -> Result<Vec<(String, bool, i64, i64, i64, i64, f64, i64)>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT strategy, 0,
                     COUNT(*),
-                    SUM(settled),
-                    SUM(COALESCE(won,0)),
-                    SUM(CASE WHEN settled=1 AND combined_odds IS NOT NULL THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN settled=1 AND combined_odds IS NOT NULL AND won=1 THEN combined_odds ELSE 0 END)
-             FROM generated_tickets GROUP BY strategy",
+                    SUM(CASE WHEN settled=1 AND voided=0 THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN voided=0 THEN COALESCE(won,0) ELSE 0 END),
+                    SUM(CASE WHEN settled=1 AND voided=0 AND combined_odds IS NOT NULL THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN settled=1 AND voided=0 AND combined_odds IS NOT NULL AND won=1 THEN combined_odds ELSE 0 END),
+                    SUM(CASE WHEN settled=1 AND voided=1 THEN 1 ELSE 0 END)
+             FROM generated_tickets WHERE created_at >= ?1 GROUP BY strategy",
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map([], |r| {
+        .query_map(params![since], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, i64>(1)? != 0,
@@ -962,7 +969,26 @@ pub fn gen_report(conn: &Connection) -> Result<Vec<(String, bool, i64, i64, i64,
                 r.get::<_, i64>(4)?,
                 r.get::<_, i64>(5)?,
                 r.get::<_, f64>(6)?,
+                r.get::<_, i64>(7)?,
             ))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| e.to_string())?);
+    }
+    Ok(out)
+}
+
+/// Settled non-void tickets with strategy + predicted combined_prob inputs —
+/// for the per-strategy predicted-vs-actual comparison.
+pub fn gen_settled_strat(conn: &Connection, since: i64) -> Result<Vec<(String, String, bool)>, String> {
+    let mut stmt = conn
+        .prepare("SELECT strategy, ticket_json, COALESCE(won,0) FROM generated_tickets WHERE settled=1 AND voided=0 AND created_at >= ?1")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![since], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)? != 0))
         })
         .map_err(|e| e.to_string())?;
     let mut out = Vec::new();

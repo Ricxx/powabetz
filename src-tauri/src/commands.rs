@@ -2262,12 +2262,32 @@ pub async fn build_tickets(
         ));
     }
 
-    // Safety ceiling: drop legs more likely than the cap so the slate isn't all
-    // chalk — pushes the model toward less-obvious picks.
-    if let Some(cap) = selection.max_leg_prob {
-        if cap < 0.999 {
-            candidates.retain(|c| c.est_prob <= cap);
+    // TRIVIAL-LEG policy (always on) + the user's optional safety ceiling.
+    // A near-certainty (est ≥ ~93%, or priced ≤ ~1.10) is negative-value in a
+    // parlay: it adds ≤10% payout while its real-world failure chance is
+    // comparable — risk with no return. It also poisons the ledger: "Goals
+    // Range 1-6" lands in ~90% of games, so a strategy stacking it LOOKS
+    // stellar while predicting nothing.
+    let cap = selection.max_leg_prob.unwrap_or(1.0).min(TRIVIAL_PROB);
+    // Dropped legs are KEPT aside for the deterministic forecast display — a
+    // 95% favourite belongs in a "likely result" panel even though it's a
+    // worthless bet leg.
+    let mut trivial_dropped: Vec<Candidate> = Vec::new();
+    let before_trivial = candidates.len();
+    candidates.retain(|c| {
+        let keep = c.est_prob <= cap && !matches!(c.book_odds, Some(o) if o <= TRIVIAL_ODDS);
+        if !keep {
+            trivial_dropped.push(c.clone());
         }
+        keep
+    });
+    if candidates.len() < before_trivial {
+        det_extra.push(format!(
+            "Trivial-leg filter: dropped {} near-certainty leg(s) (est >{:.0}% or priced ≤{:.2}) — payout ≤ risk, zero information.",
+            before_trivial - candidates.len(),
+            cap * 100.0,
+            TRIVIAL_ODDS
+        ));
     }
 
     // Per-leg odds sweet-spot: when set, keep only PRICED legs inside [min,max]
@@ -2404,10 +2424,16 @@ pub async fn build_tickets(
     // the shortlist trims it). If the match is IN-PLAY, pull live state, fold a
     // live section into the forecast, and inject the live situation so the model
     // adjusts its suggestions to what's actually happening.
+    // Forecasts read the FULL distribution (filtered legs + the trivial ones).
+    let forecast_pool: Vec<Candidate> = if predictor || selection.simple.unwrap_or(false) {
+        candidates.iter().cloned().chain(trivial_dropped.into_iter()).collect()
+    } else {
+        Vec::new()
+    };
     let forecast = if predictor {
         let fx = &selection.fixtures[0];
         let fl = format!("{} vs {}", fx.home_team, fx.away_team);
-        let mut fc = forecast_from_candidates(&candidates, &fl, &fx.home_team, &fx.away_team);
+        let mut fc = forecast_from_candidates(&forecast_pool, &fl, &fx.home_team, &fx.away_team);
         live_adjust_forecast(&state, fx, &mut fc, &mut pred_notes).await;
         Some(fc)
     } else {
@@ -2419,7 +2445,7 @@ pub async fn build_tickets(
         let mut v = Vec::new();
         for fx in &selection.fixtures {
             let fl = format!("{} vs {}", fx.home_team, fx.away_team);
-            let mut fc = forecast_from_candidates(&candidates, &fl, &fx.home_team, &fx.away_team);
+            let mut fc = forecast_from_candidates(&forecast_pool, &fl, &fx.home_team, &fx.away_team);
             live_adjust_forecast(&state, fx, &mut fc, &mut pred_notes).await;
             v.push(fc);
         }
@@ -3244,6 +3270,9 @@ pub async fn build_ladder(
         .into_iter()
         .filter(|c| !excl_subj.contains(&crate::odds::fold(&c.subject)))
         .filter(|c| !band_active || c.book_odds.map_or(true, |o| o >= odds_lo && o <= odds_hi))
+        // Trivial-leg policy: near-certainties pad a ladder's hit% while adding
+        // ≤10% payout against real risk — never useful rungs.
+        .filter(|c| c.est_prob <= TRIVIAL_PROB && !matches!(c.book_odds, Some(o) if o <= TRIVIAL_ODDS))
         .collect();
     if legs.is_empty() {
         return Err("No usable lines for the selected markets and matches.".to_string());
@@ -3807,19 +3836,37 @@ fn calibration_shrink(state: &AppState) -> (f64, i64) {
 
 // ---------- generated-tickets ledger ----------
 
-fn build_gen_report(state: &AppState) -> Result<Vec<GenReportRow>, String> {
+fn build_gen_report(state: &AppState, since_days: Option<i64>) -> Result<Vec<GenReportRow>, String> {
+    let since = since_days.map(|d| af::now_ts() - d.max(1) * 86_400).unwrap_or(0);
     let conn = state.db.lock().map_err(|_| "db lock")?;
-    let rows = db::gen_report(&conn)?;
+    let rows = db::gen_report(&conn, since)?;
+    // Per-strategy predicted-vs-actual: average the tickets' own predicted
+    // combined hit chance — the gap to the actual hit rate is the strategy's
+    // honesty (a Jackpot claiming ~3% should HIT ~3%).
+    let mut pred: HashMap<String, (f64, i64)> = HashMap::new();
+    for (strategy, tj, _won) in db::gen_settled_strat(&conn, since)?.into_iter() {
+        if let Ok(t) = serde_json::from_str::<Ticket>(&tj) {
+            if let Some(p) = t.combined_prob {
+                let e = pred.entry(strategy).or_insert((0.0, 0));
+                e.0 += p;
+                e.1 += 1;
+            }
+        }
+    }
     Ok(rows
         .into_iter()
-        .map(|(strategy, grok_used, total, settled, won, priced_n, ret_sum)| {
+        .map(|(strategy, grok_used, total, settled, won, priced_n, ret_sum, voided)| {
             let hit_rate = if settled > 0 { won as f64 / settled as f64 } else { 0.0 };
             let roi = if priced_n > 0 {
                 Some(((ret_sum - priced_n as f64) / priced_n as f64 * 1000.0).round() / 1000.0)
             } else {
                 None
             };
-            GenReportRow { strategy, grok_used, total, settled, won, hit_rate, roi }
+            let predicted_hit = pred
+                .get(&strategy)
+                .filter(|(_, n)| *n > 0)
+                .map(|(sum, n)| ((sum / *n as f64) * 1000.0).round() / 1000.0);
+            GenReportRow { strategy, grok_used, total, settled, won, hit_rate, roi, voided, predicted_hit }
         })
         .collect())
 }
@@ -3850,16 +3897,17 @@ pub async fn settle_generated(state: State<'_, AppState>) -> Result<Vec<GenRepor
         // it as won=false but its leg_results carry `void`, so report/calibration
         // readers can exclude it.
         let won = !live.is_empty() && live.iter().all(|r| r.won == Some(true));
+        let voided = live.is_empty(); // all legs void → push, not a loss
         let lr = serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string());
         let conn = state.db.lock().map_err(|_| "db lock")?;
-        let _ = db::gen_mark_settled(&conn, row.id, won, &lr);
+        let _ = db::gen_mark_settled(&conn, row.id, won, voided, &lr);
     }
-    build_gen_report(&state)
+    build_gen_report(&state, None)
 }
 
 #[tauri::command]
-pub fn generated_report(state: State<AppState>) -> Result<Vec<GenReportRow>, String> {
-    build_gen_report(&state)
+pub fn generated_report(state: State<AppState>, since_days: Option<i64>) -> Result<Vec<GenReportRow>, String> {
+    build_gen_report(&state, since_days)
 }
 
 /// Same report but grouped by ticket KIND (Single / SGP / SGP+).
@@ -3877,7 +3925,7 @@ pub fn generated_report_by_kind(state: State<AppState>) -> Result<Vec<GenReportR
                 None
             };
             // Reuse the row shape: strategy holds the kind label.
-            GenReportRow { strategy: kind, grok_used: false, total, settled, won, hit_rate, roi }
+            GenReportRow { strategy: kind, grok_used: false, total, settled, won, hit_rate, roi, voided: 0, predicted_hit: None }
         })
         .collect())
 }
@@ -4778,6 +4826,11 @@ async fn settle_bet_inner(
     }
 }
 
+/// Near-certainty cutoffs: a leg this likely (or this short) contributes less
+/// payout than the real-world risk it adds, and its "wins" carry no signal.
+const TRIVIAL_PROB: f64 = 0.93;
+const TRIVIAL_ODDS: f64 = 1.10;
+
 /// Today's date in the USER'S configured timezone (Settings → timezone), for
 /// every user-facing day boundary: bet/ledger days, Grok digest date, ingest
 /// archiving. The REQUEST METER intentionally stays UTC — API-Football's quota
@@ -4942,7 +4995,10 @@ pub async fn darwin_sweep(
     } else {
         markets
     };
-    let cands = gather_candidates(&state, &fixtures, &markets, &books).await;
+    let mut cands = gather_candidates(&state, &fixtures, &markets, &books).await;
+    // Trivial-leg policy — a paper variant padded with near-certainties would
+    // fake a stellar hit rate (the exact ledger pollution Darwin must avoid).
+    cands.retain(|c| c.est_prob <= TRIVIAL_PROB && !matches!(c.book_odds, Some(o) if o <= TRIVIAL_ODDS));
     if cands.is_empty() {
         return Err("No candidate legs for these fixtures/markets.".to_string());
     }

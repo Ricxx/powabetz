@@ -658,6 +658,14 @@ pub struct GenReportRow {
     pub won: i64,
     pub hit_rate: f64,
     pub roi: Option<f64>,
+    /// All-void tickets (pushes) — settled but excluded from hit/ROI.
+    #[serde(default)]
+    pub voided: i64,
+    /// Avg PREDICTED combined hit chance of the settled tickets — compare with
+    /// hit_rate to see whether the strategy's claims are honest (per-strategy
+    /// calibration: Jackpot claiming ~3% should HIT ~3%).
+    #[serde(default)]
+    pub predicted_hit: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]

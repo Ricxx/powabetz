@@ -187,6 +187,49 @@ function AppInner() {
   const [selFixtureIds, setSelFixtureIds] = useState<Set<number>>(new Set());
 
   const [selMarkets, setSelMarkets] = useState<Set<string>>(new Set(["scorer"]));
+  // Named MARKET presets — persisted locally; tap to apply, × to delete,
+  // "＋ Save current…" stores the current selection under a name. Ships with
+  // the old Quick-mode combos as starter presets (deletable).
+  type MarketPreset = { name: string; markets: string[] };
+  const DEFAULT_PRESETS: MarketPreset[] = [
+    { name: "⚽ Scorers only", markets: ["scorer"] },
+    { name: "🎯 Score + Assist + Result", markets: ["scorer", "assists", "win"] },
+    { name: "Player props", markets: [...playerMarketKeys] },
+  ];
+  const [marketPresets, setMarketPresets] = useState<MarketPreset[]>(() => {
+    try {
+      const raw = localStorage.getItem("powabet.marketPresets");
+      if (raw) return JSON.parse(raw) as MarketPreset[];
+    } catch {
+      // corrupted → fall back to defaults
+    }
+    return DEFAULT_PRESETS;
+  });
+  function persistPresets(next: MarketPreset[]) {
+    setMarketPresets(next);
+    try {
+      localStorage.setItem("powabet.marketPresets", JSON.stringify(next));
+    } catch {
+      // storage full/unavailable — presets stay for this session only
+    }
+  }
+  const sameMarkets = (mk: string[]) => mk.length === selMarkets.size && mk.every((k) => selMarkets.has(k));
+  // Inline naming UI — window.prompt() does NOT exist in Tauri's webview (the
+  // native dialogs are disabled), so the save button reveals an input instead.
+  const [presetNaming, setPresetNaming] = useState(false);
+  const [presetName, setPresetName] = useState("");
+  function savePreset() {
+    const name = presetName.trim();
+    if (!name || selMarkets.size === 0) return;
+    const next = marketPresets.filter((p) => p.name !== name); // same name = overwrite
+    persistPresets([...next, { name, markets: [...selMarkets] }]);
+    toast.success(`Preset “${name}” saved (${selMarkets.size} market${selMarkets.size > 1 ? "s" : ""}).`);
+    setPresetName("");
+    setPresetNaming(false);
+  }
+  function deletePreset(name: string) {
+    persistPresets(marketPresets.filter((p) => p.name !== name));
+  }
   const [reasoning, setReasoning] = useState(true);
   const [impliedProb, setImpliedProb] = useState(true);
   const [notes, setNotes] = useState("");
@@ -259,9 +302,9 @@ function AppInner() {
   // Cherry-picked legs pulled from across different tickets into one custom slip.
   const [cart, setCart] = useState<TicketLeg[]>([]);
   const [buildTab, setBuildTab] = useState<"regular" | "acca" | "board" | "bankers">("regular");
-  const [luckySafe, setLuckySafe] = useState(0);
-  const [luckyModerate, setLuckyModerate] = useState(1);
-  const [luckyRisky, setLuckyRisky] = useState(2);
+  // 🍀 Feeling Lucky: one switch — on adds 2 extra parlays of EACH risk band
+  // (safe ~75%+, moderate ~40%, risky ~10%+) on top of the main slate.
+  const [feelingLucky, setFeelingLucky] = useState(false);
   const [variation, setVariation] = useState(0);
   // What kind of build produced the current result — so "Generate a new set"
   // replays the same thing (Simple stays Simple; a ladder re-ladders).
@@ -273,8 +316,8 @@ function AppInner() {
   const [usage, setUsage] = useState<BuildUsage | null>(null);
   const [model, setModel] = useState("claude-haiku-4-5");
   const [showBoard, setShowBoard] = useState(false);
-  const [dataTab, setDataTab] = useState<"picks" | "inspector" | "ingested">("picks");
-  const [boardMode, setBoardMode] = useState<"all" | "bankers">("all");
+  const [dataTab, setDataTab] = useState<"picks" | "bankers" | "inspector" | "ingested">("picks");
+
   const [bankroll, setBankroll] = useState(0);
   const [buildStrategy, setBuildStrategy] = useState("value");
   const [saved, setSaved] = useState(false);
@@ -501,9 +544,9 @@ function AppInner() {
         use_predictions: simple ? true : usePredictions,
         use_xg: simple ? true : useXg,
         use_tactics: simple ? false : useTactics,
-        lucky_safe: simple ? rk.safe : luckySafe,
-        lucky_moderate: simple ? rk.mod : luckyModerate,
-        lucky_risky: simple ? rk.risky : luckyRisky,
+        lucky_safe: simple ? rk.safe : feelingLucky ? 2 : 0,
+        lucky_moderate: simple ? rk.mod : feelingLucky ? 2 : 0,
+        lucky_risky: simple ? rk.risky : feelingLucky ? 2 : 0,
         use_ingest: simple ? true : useIngest,
         min_legs: simple ? null : regMinLegs > 1 ? regMinLegs : null,
         min_odds: simple ? null : oddsMin > 1.01 ? oddsMin : null,
@@ -821,7 +864,7 @@ function AppInner() {
       onNav={setOverlay}
       ingestBadge={ingestPending}
       current={null}
-      onInspect={() => { setBoardMode("all"); setDataTab("picks"); setShowBoard(true); }}
+      onInspect={() => { setDataTab("picks"); setShowBoard(true); }}
       canInspect={selectedFixtures.length > 0}
     >
       {showCost && (
@@ -852,17 +895,25 @@ function AppInner() {
       {showBoard && selectedFixtures.length > 0 && (
         <div className="fixed inset-0 z-40 bg-ink overflow-y-auto">
           <div className="max-w-md mx-auto p-4">
-            {/* Data view — 3 tabs: the picks table, raw inspector, ingested stats. */}
-            {boardMode === "all" && (
-              <div className="flex gap-1.5 mb-3">
+            {/* Data viewer — ONE header, four tabs, one close. Tabs never close
+                the panel; only ✕ does, so back-and-forth browsing is free. */}
+            <div className="sticky top-0 z-10 bg-ink pb-2 -mx-4 px-4 pt-1 border-b border-edge mb-3">
+              <div className="flex items-center justify-between mb-2">
+                <h2 className="text-lg font-bold">📊 Data</h2>
+                <button className="btn btn-ghost text-sm py-2" onClick={() => setShowBoard(false)}>
+                  ✕ Done
+                </button>
+              </div>
+              <div className="flex gap-1.5">
                 {([
                   ["picks", "📊 Picks"],
+                  ["bankers", "🏦 Bankers"],
                   ["inspector", "🔍 Inspector"],
                   ["ingested", "🧲 Ingested"],
                 ] as const).map(([id, label]) => (
                   <button
                     key={id}
-                    className={`flex-1 text-center text-sm rounded-lg py-2 ${
+                    className={`flex-1 text-center text-xs rounded-lg py-2 ${
                       dataTab === id ? "bg-accent text-ink font-semibold" : "bg-panel border border-edge text-slate-300"
                     }`}
                     onClick={() => setDataTab(id)}
@@ -871,25 +922,21 @@ function AppInner() {
                   </button>
                 ))}
               </div>
-            )}
-            {(boardMode === "bankers" || dataTab === "picks") && (
+            </div>
+            {(dataTab === "picks" || dataTab === "bankers") && (
               <PicksBoard
+                key={dataTab}
                 fixtures={toFixtureInputs(selectedFixtures)}
                 markets={[...selMarkets]}
                 bankroll={bankroll}
                 kellyFraction={settings?.kelly_fraction ?? 0}
                 defaultStake={settings?.default_stake ?? 0.5}
-                mode={boardMode}
-                onClose={() => setShowBoard(false)}
+                mode={dataTab === "bankers" ? "bankers" : "all"}
                 onPlaced={() => api.getBankroll().then((b) => setBankroll(b.current)).catch(() => {})}
               />
             )}
-            {boardMode === "all" && dataTab === "inspector" && (
-              <Inspector fixtures={toFixtureInputs(selectedFixtures)} onClose={() => setShowBoard(false)} />
-            )}
-            {boardMode === "all" && dataTab === "ingested" && (
-              <IngestedStats fixtures={toFixtureInputs(selectedFixtures)} onClose={() => setShowBoard(false)} />
-            )}
+            {dataTab === "inspector" && <Inspector fixtures={toFixtureInputs(selectedFixtures)} />}
+            {dataTab === "ingested" && <IngestedStats fixtures={toFixtureInputs(selectedFixtures)} />}
           </div>
         </div>
       )}
@@ -1145,11 +1192,11 @@ function AppInner() {
           )}
 
           {mode === "advanced" && (<>
-          <p className="text-xs text-slate-400 -mt-1">Step 3 of 4 — pick what to bet on, then choose how to build below (or use a quick preset).</p>
+          <p className="text-xs text-slate-400 -mt-1">Step 3 of 4 — pick what to bet on (or tap a preset), then choose how to build below.</p>
 
           <div>
             <div className="flex items-center justify-between mb-2">
-              <div className="text-xs font-semibold text-slate-400">Quick mode</div>
+              <div className="text-xs font-semibold text-slate-400">Presets</div>
               <div className="flex gap-2">
                 <button className="text-[11px] text-accent underline" onClick={() => setSelMarkets(new Set(allMarketKeys))}>
                   select all
@@ -1160,15 +1207,67 @@ function AppInner() {
               </div>
             </div>
             <div className="flex flex-wrap gap-2">
-              <button className="chip" onClick={() => setSelMarkets(new Set(["scorer"]))}>
-                ⚽ Scorers only
-              </button>
-              <button className="chip" onClick={() => setSelMarkets(new Set(["scorer", "assists", "win"]))}>
-                🎯 Score + Assist + Result
-              </button>
-              <button className="chip" onClick={() => setSelMarkets(new Set(playerMarketKeys))}>
-                Player props
-              </button>
+              {marketPresets.map((p) => (
+                <span key={p.name} className="inline-flex items-center">
+                  <button
+                    className={`chip rounded-r-none ${sameMarkets(p.markets) ? "chip-on" : ""}`}
+                    title={p.markets.join(", ")}
+                    onClick={() => setSelMarkets(new Set(p.markets))}
+                  >
+                    {p.name}
+                  </button>
+                  <button
+                    className="chip rounded-l-none border-l-0 px-1.5 text-slate-500"
+                    title={`Delete preset “${p.name}”`}
+                    onClick={() => deletePreset(p.name)}
+                  >
+                    ×
+                  </button>
+                </span>
+              ))}
+              {presetNaming ? (
+                <span className="inline-flex items-center gap-1">
+                  <input
+                    className="input text-xs w-36 py-1.5 rounded-full px-3"
+                    placeholder="Preset name…"
+                    autoFocus
+                    value={presetName}
+                    onChange={(e) => setPresetName(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") savePreset();
+                      if (e.key === "Escape") {
+                        setPresetNaming(false);
+                        setPresetName("");
+                      }
+                    }}
+                  />
+                  <button
+                    className="chip text-accent"
+                    disabled={!presetName.trim() || selMarkets.size === 0}
+                    onClick={savePreset}
+                  >
+                    Save
+                  </button>
+                  <button
+                    className="chip text-slate-500"
+                    onClick={() => {
+                      setPresetNaming(false);
+                      setPresetName("");
+                    }}
+                  >
+                    ✕
+                  </button>
+                </span>
+              ) : (
+                <button
+                  className="chip border-dashed text-accent"
+                  title="Save the currently selected markets as a named preset"
+                  onClick={() => setPresetNaming(true)}
+                  disabled={selMarkets.size === 0}
+                >
+                  ＋ Save current…
+                </button>
+              )}
             </div>
           </div>
 
@@ -1363,7 +1462,9 @@ function AppInner() {
             <div>
               <div className="text-[11px] text-slate-500 mb-1">
                 Safety ceiling —{" "}
-                {maxLegProb >= 0.999 ? "off (any leg)" : `drop legs over ${Math.round(maxLegProb * 100)}% likely`}
+                {maxLegProb >= 0.999
+                  ? "default (near-certainties >93% always dropped)"
+                  : `drop legs over ${Math.round(maxLegProb * 100)}% likely`}
               </div>
               <input
                 type="range"
@@ -1452,35 +1553,12 @@ function AppInner() {
               </div>
             </div>
             <div>
-              <div className="text-xs font-semibold text-slate-400 mb-1">🍀 Feeling Lucky</div>
-              <p className="text-[11px] text-slate-500 mb-2">
-                Extra parlays by risk band — how many of each to add.
-              </p>
-              {(
-                [
-                  ["Safe", "stays above ~75%", luckySafe, setLuckySafe],
-                  ["Moderate", "around ~40%", luckyModerate, setLuckyModerate],
-                  ["Risky", "above ~10% (longshot)", luckyRisky, setLuckyRisky],
-                ] as const
-              ).map(([name, hint, val, set]) => (
-                <div key={name} className="flex items-center gap-2 mb-1.5">
-                  <div className="w-28 shrink-0">
-                    <div className="text-sm">{name}</div>
-                    <div className="text-[10px] text-slate-500">{hint}</div>
-                  </div>
-                  <div className="flex gap-1.5 flex-1">
-                    {[0, 1, 2, 3].map((n) => (
-                      <button
-                        key={n}
-                        className={`chip flex-1 text-center ${val === n ? "chip-on" : ""}`}
-                        onClick={() => set(n)}
-                      >
-                        {n === 0 ? "off" : n}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              ))}
+              <Toggle label="🍀 Feeling Lucky" on={feelingLucky} onChange={setFeelingLucky} />
+              {feelingLucky && (
+                <p className="text-[10px] text-slate-500 mt-1">
+                  Adds 6 extra parlays on top of the main slate: 2 safe (~75%+), 2 moderate (~40%), 2 risky (~10%+ longshots).
+                </p>
+              )}
             </div>
           </div>
 
@@ -1793,12 +1871,12 @@ function AppInner() {
               </button>
             )}
             {buildTab === "board" && (
-              <button className="btn btn-primary w-full" disabled={busy || prewarmBusy} onClick={() => { setBoardMode("all"); setShowBoard(true); }}>
+              <button className="btn btn-primary w-full" disabled={busy || prewarmBusy} onClick={() => { setDataTab("picks"); setShowBoard(true); }}>
                 {prewarmBusy ? "🔒 Pre-scoring…" : "🧮 Open picks board"}
               </button>
             )}
             {buildTab === "bankers" && (
-              <button className="btn btn-primary w-full" disabled={busy || prewarmBusy} onClick={() => { setBoardMode("bankers"); setShowBoard(true); }}>
+              <button className="btn btn-primary w-full" disabled={busy || prewarmBusy} onClick={() => { setDataTab("bankers"); setShowBoard(true); }}>
                 {prewarmBusy ? "🔒 Pre-scoring…" : "🏦 Open bankers board"}
               </button>
             )}

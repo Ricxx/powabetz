@@ -144,7 +144,7 @@ export const api = {
     invoke<number>("prewarm_plausibility", { fixture, markets }),
 
   settleGenerated: () => invoke<GenReportRow[]>("settle_generated"),
-  generatedReport: () => invoke<GenReportRow[]>("generated_report"),
+  generatedReport: (sinceDays?: number | null) => invoke<GenReportRow[]>("generated_report", { sinceDays: sinceDays ?? null }),
   // 🧬 Darwin: paper-trade a population of deterministic micro-strategies (0 tokens).
   darwinSweep: (fixtures: FixtureInput[], markets: string[]) =>
     invoke<string[]>("darwin_sweep", { fixtures, markets }),

@@ -1025,7 +1025,10 @@ pub fn build_team_candidates(
                 // the DC score grid: tight bands pay more, wide bands are safer.
                 // Covers the common book lines (e.g. 2-4, 1-6) so they can anchor an
                 // SGP with player props.
-                for (lo, hi) in [(0i64, 1i64), (1, 2), (2, 3), (3, 4), (1, 3), (2, 4), (3, 5), (1, 4), (2, 5), (1, 6)] {
+                // NOTE: no ultra-wide bands (e.g. 1-6 lands in ~90% of games —
+                // a "prediction" with no information; the trivial-leg filter
+                // would drop it anyway, so don't even price it).
+                for (lo, hi) in [(0i64, 1i64), (1, 2), (2, 3), (3, 4), (1, 3), (2, 4), (3, 5), (1, 4), (2, 5)] {
                     let p = (p_total_le(hi) - p_total_le(lo - 1)).clamp(0.0, 1.0);
                     out.push(mk("Match", "Goals Range", "goalsrange", &format!("{lo}-{hi} goals"), total, clampp(p), sup.clone()));
                 }

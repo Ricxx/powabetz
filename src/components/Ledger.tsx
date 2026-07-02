@@ -90,7 +90,12 @@ function ReportTable({
   label: string;
   labelFn?: (s: string) => string;
 }) {
-  const sorted = rows.slice().sort((a, b) => (b.roi ?? -99) - (a.roi ?? -99) || b.hit_rate - a.hit_rate);
+  // Sort: real sample sizes first (a 3-ticket 100% is noise, not a champion),
+  // then ROI, then hit rate.
+  const tier = (r: GenReportRow) => (r.settled >= 10 ? 2 : r.settled >= 4 ? 1 : 0);
+  const sorted = rows
+    .slice()
+    .sort((a, b) => tier(b) - tier(a) || (b.roi ?? -99) - (a.roi ?? -99) || b.hit_rate - a.hit_rate);
   if (sorted.length === 0) return null;
   return (
     <div className="card">
@@ -113,6 +118,14 @@ function ReportTable({
               </td>
               <td className="text-right text-slate-400">
                 {r.settled}/{r.total}
+                {(r.voided ?? 0) > 0 && (
+                  <span className="text-slate-600" title="All-void pushes — excluded from hit/ROI"> +{r.voided}∅</span>
+                )}
+                {r.settled > 0 && r.settled < 10 && (
+                  <span className="text-warn ml-0.5" title="Small sample — treat hit/ROI as noise until ~10+ settled">
+                    ⚠
+                  </span>
+                )}
               </td>
               <td className="text-right">
                 {r.settled > 0 ? (
@@ -121,6 +134,14 @@ function ReportTable({
                   </b>
                 ) : (
                   <span className="text-slate-500">—</span>
+                )}
+                {r.settled > 0 && r.predicted_hit != null && (
+                  <span
+                    className={`block text-[10px] ${Math.abs(r.hit_rate - r.predicted_hit) <= 0.1 ? "text-slate-500" : "text-warn"}`}
+                    title="The tickets' own predicted hit chance — a big gap from the actual hit rate means the strategy's claims are off"
+                  >
+                    pred {Math.round(r.predicted_hit * 100)}%
+                  </span>
                 )}
               </td>
               <td className="text-right">
@@ -210,6 +231,9 @@ function MarketTable({ rows }: { rows: MarketReportRow[] }) {
 
 export default function Ledger({ onClose }: { onClose: () => void }) {
   const [rows, setRows] = useState<GenReportRow[] | null>(null);
+  // Recency window for the strategy report — edges decay, and lifetime totals
+  // bury what's working NOW under months-old results.
+  const [windowDays, setWindowDays] = useState<number | null>(null);
   const [byKind, setByKind] = useState<GenReportRow[]>([]);
   const [byMarket, setByMarket] = useState<MarketReportRow[]>([]);
   const [byPurpose, setByPurpose] = useState<ModelPurposeRow[]>([]);
@@ -221,11 +245,14 @@ export default function Ledger({ onClose }: { onClose: () => void }) {
     api.generatedReportByMarket().then(setByMarket).catch(() => {});
     api.usageByPurpose().then(setByPurpose).catch(() => {});
   }
-  function load() {
-    api.generatedReport().then(setRows).catch((e) => setErr(errMsg(e)));
+  function load(days: number | null = windowDays) {
+    api.generatedReport(days).then(setRows).catch((e) => setErr(errMsg(e)));
     loadAgg();
   }
-  useEffect(load, []);
+  useEffect(() => {
+    load(windowDays);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [windowDays]);
 
   async function settleAll() {
     setBusy(true);
@@ -235,7 +262,8 @@ export default function Ledger({ onClose }: { onClose: () => void }) {
       const updated = await api.settleGenerated();
       const after = updated.reduce((a, r) => a + (r.total - r.settled), 0);
       const settled = Math.max(0, before - after);
-      setRows(updated);
+      if (windowDays == null) setRows(updated);
+      else load(windowDays); // settle returns the lifetime view — refetch the window
       loadAgg();
       toast[settled > 0 ? "success" : "info"](
         settled > 0
@@ -256,6 +284,21 @@ export default function Ledger({ onClose }: { onClose: () => void }) {
     <div className="space-y-3">
       <div className="flex items-center justify-between">
         <h2 className="text-lg font-bold">Strategy ledger</h2>
+        <div className="flex items-center gap-1">
+          {([
+            [7, "7d"],
+            [30, "30d"],
+            [null, "All"],
+          ] as [number | null, string][]).map(([d, label]) => (
+            <button
+              key={label}
+              className={`chip text-xs ${windowDays === d ? "chip-on" : ""}`}
+              onClick={() => setWindowDays(d)}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
         <button className="btn btn-ghost text-sm py-2" onClick={onClose}>
           Done
         </button>

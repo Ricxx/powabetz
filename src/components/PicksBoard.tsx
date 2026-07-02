@@ -40,7 +40,6 @@ export default function PicksBoard({
   kellyFraction = 0,
   defaultStake = 0,
   mode = "all",
-  onClose,
   onPlaced,
 }: {
   fixtures: FixtureInput[];
@@ -49,7 +48,6 @@ export default function PicksBoard({
   kellyFraction?: number;
   defaultStake?: number;
   mode?: "all" | "bankers";
-  onClose: () => void;
   onPlaced: () => void;
 }) {
   const bankers = mode === "bankers";
@@ -155,16 +153,14 @@ export default function PicksBoard({
 
   return (
     <div className="space-y-3 pb-40">
-      <div className="flex items-center justify-between">
-        <h2 className="text-lg font-bold">{bankers ? "🏦 Bankers board" : "📊 All picks — data board"}</h2>
-        <button className="btn btn-ghost text-sm py-2" onClick={onClose}>
-          Done
-        </button>
-      </div>
       <p className="text-[11px] text-slate-500">
         {bankers
           ? "The safest, most repeatable legs across your slate — ranked by likelihood, recurring events and recent form, must-play only. Anchor an accumulator with these, then evaluate."
           : "Every prop (match + player) across your slate, grouped by fixture and sorted by OUR true probability (not the odds). Cherry-pick any legs → build tickets → evaluate. Toggle Prob/EV to re-sort."}
+      </p>
+      <p className="text-[10px] text-slate-600">
+        pin = Pinnacle de-vigged (sharp) · EV* = vs our model (no sharp price — treat softer) · data is cache-first
+        (odds up to ~1h old).
       </p>
 
       {/* built tickets */}
@@ -329,10 +325,15 @@ export default function PicksBoard({
                     {ev != null && (
                       <span className={ev > 0 ? "text-accent ml-1" : "text-slate-500 ml-1"}>
                         {ev > 0 ? "+" : ""}
-                        {(ev * 100).toFixed(0)}%
+                        {(ev * 100).toFixed(0)}%{c.ev_source !== "sharp" ? "*" : ""}
                       </span>
                     )}
                   </div>
+                  {c.pinnacle_prob != null && (
+                    <div className="text-[9px] text-slate-600" title="Pinnacle's de-vigged true probability — the sharpest public estimate">
+                      pin {pct(c.pinnacle_prob)}
+                    </div>
+                  )}
                 </div>
               </div>
             </button>
