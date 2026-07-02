@@ -20,9 +20,13 @@ The frontend **never** calls an external API. It only invokes Rust commands.
 ## Hard rules (from spec — never break)
 
 1. **Request budget**: every external call goes through `apifootball::cached_get`. Never
-   hit the network if a fresh cached row exists. The daily meter blocks fresh calls at 100.
-2. **Token budget**: the model is called at most once per Build. Output is cached by a
-   hash of its input. Never loop the model per player/match.
+   hit the network if a fresh cached row exists. The daily meter counts every request
+   ATTEMPT (failures and rate-limit retries included) and blocks fresh calls at the
+   configured limit (`keys.daily_limit`; default 7500 = paid plan, set 100 on free tier).
+2. **Token budget**: the MAIN build model is called at most once per Build (plus one
+   optional refine pass). Output is cached by a hash of its input. Never loop the main
+   model per player/match. Cheap cached helpers (plausibility per fixture, Grok digest,
+   ingest extraction) are allowed but must each be cached by input hash.
 3. **Click-driven**: no required typing except the optional notes box and API keys.
 4. **Deterministic numbers, LLM synthesis**: all arithmetic in `features.rs`. The model
    only weighs/ranks/explains — it never invents a probability.

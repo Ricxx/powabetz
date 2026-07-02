@@ -44,7 +44,7 @@ pub async fn cached_get(
     params: Vec<(&str, String)>,
     ttl: i64,
 ) -> Result<Value, String> {
-    cached_get_inner(state, endpoint, params, ttl, false).await
+    cached_get_inner(state, endpoint, params, ttl, false, false).await
 }
 
 /// Like `cached_get` but ALWAYS hits the network (skips the cache read), then
@@ -57,7 +57,33 @@ pub async fn fetch_fresh(
     params: Vec<(&str, String)>,
     ttl: i64,
 ) -> Result<Value, String> {
-    cached_get_inner(state, endpoint, params, ttl, true).await
+    cached_get_inner(state, endpoint, params, ttl, true, false).await
+}
+
+/// Cache-first, but BYPASSES the daily budget gate on a miss. Reserved for
+/// SETTLING already-finished matches — reading a final, immutable result (once,
+/// then cached for a week) is essential and must not be blocked just because the
+/// speculative build budget is spent. Still records the call in the meter.
+pub async fn fetch_priority(
+    state: &AppState,
+    endpoint: &str,
+    params: Vec<(&str, String)>,
+    ttl: i64,
+) -> Result<Value, String> {
+    cached_get_inner(state, endpoint, params, ttl, false, true).await
+}
+
+/// ALWAYS fresh (skips the cache read) AND bypasses the budget gate. For LIVE
+/// state that must reflect the CURRENT score/minute — a stale long-TTL cache row
+/// (e.g. one written pre-kickoff) would otherwise make an in-play game look like
+/// it hasn't started. Use sparingly (the live status, not every sub-fetch).
+pub async fn fetch_live(
+    state: &AppState,
+    endpoint: &str,
+    params: Vec<(&str, String)>,
+    ttl: i64,
+) -> Result<Value, String> {
+    cached_get_inner(state, endpoint, params, ttl, true, true).await
 }
 
 async fn cached_get_inner(
@@ -66,6 +92,7 @@ async fn cached_get_inner(
     params: Vec<(&str, String)>,
     ttl: i64,
     force_refresh: bool,
+    bypass_budget: bool,
 ) -> Result<Value, String> {
     let key = cache_key(endpoint, &params);
     let now = now_ts();
@@ -78,7 +105,11 @@ async fn cached_get_inner(
         }
     }
 
-    // 2. budget gate — block fresh calls at the configured daily limit
+    // 2. budget gate + count. The meter counts ATTEMPTS: a failed, errored or
+    // rate-limited request still consumed provider quota, so we increment BEFORE
+    // the request — and inside the same lock scope as the gate check, closing
+    // the race where two concurrent builds both pass at limit-1. (Slight
+    // over-count on pure network failures is the safe direction.)
     let day = today();
     let limit = {
         let keys = state.keys.lock().map_err(|_| "keys lock")?;
@@ -86,12 +117,15 @@ async fn cached_get_inner(
     };
     {
         let conn = state.db.lock().map_err(|_| "db lock")?;
-        let count = db::meter_count(&conn, &day)?;
-        if count >= limit {
-            return Err(format!(
-                "Daily request budget reached ({count}/{limit}). Cached data still works; fresh fetches resume tomorrow."
-            ));
+        if !bypass_budget {
+            let count = db::meter_count(&conn, &day)?;
+            if count >= limit {
+                return Err(format!(
+                    "Daily request budget reached ({count}/{limit}). Cached data still works; fresh fetches resume tomorrow."
+                ));
+            }
         }
+        db::meter_increment(&conn, &day)?;
     }
 
     // 3. key (or proxy). In server mode the proxy holds the real key.
@@ -144,6 +178,10 @@ async fn cached_get_inner(
             if attempt < RATELIMIT_WAITS.len() {
                 tokio::time::sleep(Duration::from_secs(RATELIMIT_WAITS[attempt])).await;
                 attempt += 1;
+                // Each retry is another real request against provider quota.
+                if let Ok(conn) = state.db.lock() {
+                    let _ = db::meter_increment(&conn, &day);
+                }
                 continue;
             }
             *last = Instant::now();
@@ -166,10 +204,9 @@ async fn cached_get_inner(
     *last = Instant::now();
     drop(last);
 
-    // 5. count + store
+    // 5. store (the meter already counted this attempt up front)
     {
         let conn = state.db.lock().map_err(|_| "db lock")?;
-        db::meter_increment(&conn, &day)?;
         db::cache_put(&conn, &key, endpoint, &text, now, ttl)?;
     }
 

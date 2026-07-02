@@ -6,4 +6,9 @@ compatibility_date = "2024-11-01"
 #   wrangler secret put API_FOOTBALL_KEY
 #   wrangler secret put ANTHROPIC_KEY
 #   wrangler secret put XAI_KEY
+#   wrangler secret put OPENAI_KEY
+#   wrangler secret put DEEPSEEK_KEY     # DeepSeek (deterministic draft/ingest model)
 #   wrangler secret put PROXY_TOKENS     # comma-separated user tokens
+#
+# Adding/renaming a ROUTE requires `wrangler deploy` (routes are code);
+# setting a secret alone does NOT need a redeploy.

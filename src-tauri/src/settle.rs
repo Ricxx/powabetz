@@ -9,7 +9,7 @@ use crate::apifootball::{self as af, response_array};
 use crate::models::{LegResult, TicketLeg};
 use crate::AppState;
 
-const TTL_RESULT: i64 = 7 * 24 * 3600;
+pub const TTL_RESULT: i64 = 7 * 24 * 3600;
 
 #[derive(Default)]
 struct PlayerLine {
@@ -27,6 +27,12 @@ struct PlayerLine {
 
 struct FixtureResult {
     finished: bool,
+    /// Match will never finish (postponed/cancelled/abandoned/awarded/walkover)
+    /// → every leg is void, and we must stop re-fetching it.
+    terminal_void: bool,
+    /// Match went to extra time (AET/PEN). We grade on the 90-minute score, but
+    /// player stats from the API cover the whole match — flag that honestly.
+    extra_time: bool,
     first_scorer_team: Option<String>,
     home_name: String,
     away_name: String,
@@ -62,15 +68,25 @@ fn opt_num(v: Option<&Value>) -> Option<f64> {
 /// status can never poison the long result cache.
 const TTL_RECHECK: i64 = 300;
 
-fn parse_finished(j: &Value) -> bool {
+fn parse_status(j: &Value) -> String {
     response_array(j)
         .first()
         .and_then(|e| e.get("fixture"))
         .and_then(|f| f.get("status"))
         .and_then(|s| s.get("short"))
         .and_then(|v| v.as_str())
-        .map(|s| matches!(s, "FT" | "AET" | "PEN"))
-        .unwrap_or(false)
+        .unwrap_or("")
+        .to_string()
+}
+
+fn parse_finished(j: &Value) -> bool {
+    matches!(parse_status(j).as_str(), "FT" | "AET" | "PEN")
+}
+
+/// Statuses that mean the match will NEVER reach full time — the bet is void at
+/// the book and re-fetching forever would just burn budget.
+fn is_terminal_void(status: &str) -> bool {
+    matches!(status, "PST" | "CANC" | "ABD" | "AWD" | "WO")
 }
 
 /// Is the match expected to have ENDED (kickoff + ~2.5h passed)? Used to avoid
@@ -82,7 +98,10 @@ fn expected_ended(j: &Value) -> bool {
         .and_then(|f| f.get("date"))
         .and_then(|v| v.as_str())
         .and_then(|d| chrono::DateTime::parse_from_rfc3339(d).ok())
-        .map(|dt| af::now_ts() >= dt.timestamp() + 150 * 60)
+        // ~100 min after kickoff a match is normally at/near full time. Force a
+        // fresh result check from here (a still-live game just returns not-finished
+        // and retries later) — 150 min was too late and left ended games stuck.
+        .map(|dt| af::now_ts() >= dt.timestamp() + 100 * 60)
         .unwrap_or(true) // no date → don't block
 }
 
@@ -99,9 +118,11 @@ async fn fetch_result(state: &AppState, fixture_id: i64) -> Option<FixtureResult
     .await
     .ok()?;
     let mut forced = false;
-    if !parse_finished(&fj) && expected_ended(&fj) {
+    if !parse_finished(&fj) && !is_terminal_void(&parse_status(&fj)) && expected_ended(&fj) {
+        // Priority: reading a finished result must not be blocked by the daily
+        // build budget (that's what leaves ended matches stuck "pending").
         if let Ok(fresh) =
-            af::fetch_fresh(state, "/fixtures", vec![("id", fixture_id.to_string())], TTL_RECHECK).await
+            af::fetch_live(state, "/fixtures", vec![("id", fixture_id.to_string())], TTL_RECHECK).await
         {
             fj = fresh;
             forced = true;
@@ -117,10 +138,59 @@ async fn fetch_result(state: &AppState, fixture_id: i64) -> Option<FixtureResult
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let finished = matches!(status, "FT" | "AET" | "PEN");
+    let extra_time = matches!(status, "AET" | "PEN");
 
+    // Postponed/cancelled/abandoned: return a void marker immediately — no
+    // player/stats/events fetches (nothing to grade, and it would loop forever).
+    if is_terminal_void(status) {
+        let teams = e.get("teams");
+        let name = |side: &str| {
+            teams
+                .and_then(|t| t.get(side))
+                .and_then(|h| h.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        return Some(FixtureResult {
+            finished: false,
+            terminal_void: true,
+            extra_time: false,
+            first_scorer_team: None,
+            home_name: name("home"),
+            away_name: name("away"),
+            home_goals: 0.0,
+            away_goals: 0.0,
+            ht_home: None,
+            ht_away: None,
+            home_corners: None,
+            away_corners: None,
+            home_shots: None,
+            away_shots: None,
+            home_outbox: None,
+            away_outbox: None,
+            home_inbox: None,
+            away_inbox: None,
+            home_offsides: None,
+            away_offsides: None,
+            home_cards: 0.0,
+            away_cards: 0.0,
+            players: HashMap::new(),
+        });
+    }
+
+    // 90-MINUTE score: books settle standard markets on full time, but `goals`
+    // is the final aggregate INCLUDING extra time for AET/PEN. Prefer
+    // score.fulltime; fall back to goals for leagues that omit it.
+    let ft = e.get("score").and_then(|s| s.get("fulltime"));
     let goals = e.get("goals");
-    let home_goals = goals.and_then(|g| g.get("home")).map(num).unwrap_or(0.0);
-    let away_goals = goals.and_then(|g| g.get("away")).map(num).unwrap_or(0.0);
+    let goal_of = |side: &str| {
+        opt_num(ft.and_then(|f| f.get(side)))
+            .or_else(|| opt_num(goals.and_then(|g| g.get(side))))
+            .unwrap_or(0.0)
+    };
+    let home_goals = goal_of("home");
+    let away_goals = goal_of("away");
     let ht = e.get("score").and_then(|s| s.get("halftime"));
     let ht_home = opt_num(ht.and_then(|h| h.get("home")));
     let ht_away = opt_num(ht.and_then(|h| h.get("away")));
@@ -141,9 +211,12 @@ async fn fetch_result(state: &AppState, fixture_id: i64) -> Option<FixtureResult
 
     // Player stats for the fixture — pull fresh too if we just forced the result
     // (a match that only finished after an earlier settle would have stale stats).
+    // If we just forced the result and the match IS finished, the fresh player
+    // stats are final — cache them for the full week, not the 300s recheck.
+    let forced_ttl = if finished { TTL_RESULT } else { TTL_RECHECK };
     let players_params = vec![("fixture", fixture_id.to_string())];
     let pj_res = if forced {
-        af::fetch_fresh(state, "/fixtures/players", players_params, TTL_RECHECK).await
+        af::fetch_live(state, "/fixtures/players", players_params, forced_ttl).await
     } else {
         af::cached_get(state, "/fixtures/players", players_params, TTL_RESULT).await
     };
@@ -199,7 +272,7 @@ async fn fetch_result(state: &AppState, fixture_id: i64) -> Option<FixtureResult
     let (mut home_offsides, mut away_offsides) = (None, None);
     let stats_params = vec![("fixture", fixture_id.to_string())];
     let sj_res = if forced {
-        af::fetch_fresh(state, "/fixtures/statistics", stats_params, TTL_RECHECK).await
+        af::fetch_live(state, "/fixtures/statistics", stats_params, forced_ttl).await
     } else {
         af::cached_get(state, "/fixtures/statistics", stats_params, TTL_RESULT).await
     };
@@ -234,7 +307,11 @@ async fn fetch_result(state: &AppState, fixture_id: i64) -> Option<FixtureResult
     // skip missed/cancelled penalties). None if 0-0 or events unavailable.
     let mut first_scorer_team: Option<String> = None;
     if home_goals + away_goals > 0.0 {
-        if let Ok(ej) = af::cached_get(state, "/fixtures/events", vec![("fixture", fixture_id.to_string())], TTL_RESULT).await {
+        // Finished-match events are immutable: cache-first (a week), but still
+        // budget-exempt so a maxed build budget can't stall settlement. This used
+        // to be fetch_live (always-network) — every settle pass burned a fresh
+        // request per fixture with goals.
+        if let Ok(ej) = af::fetch_priority(state, "/fixtures/events", vec![("fixture", fixture_id.to_string())], TTL_RESULT).await {
             let mut best: Option<(i64, String)> = None;
             for ev in response_array(&ej) {
                 let kind = ev.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -254,6 +331,8 @@ async fn fetch_result(state: &AppState, fixture_id: i64) -> Option<FixtureResult
 
     Some(FixtureResult {
         finished,
+        terminal_void: false,
+        extra_time,
         first_scorer_team,
         home_name,
         away_name,
@@ -286,29 +365,70 @@ fn threshold(line: &str) -> f64 {
 }
 
 fn won(b: bool, detail: String) -> LegResult {
-    LegResult { won: Some(b), detail, margin: None }
+    LegResult { won: Some(b), detail, margin: None, void: false }
 }
 /// O/U-style result: `over` = the bet direction, `actual`/`thr` the value & line.
 /// Records the signed gap to the line (positive = cleared it, negative = missed).
 fn won_ou(over: bool, actual: f64, thr: f64, detail: String) -> LegResult {
     let hit = if over { actual > thr } else { actual < thr };
     let margin = if over { actual - thr } else { thr - actual };
-    LegResult { won: Some(hit), detail, margin: Some((margin * 100.0).round() / 100.0) }
+    LegResult { won: Some(hit), detail, margin: Some((margin * 100.0).round() / 100.0), void: false }
 }
 fn ungraded(detail: &str) -> LegResult {
-    LegResult { won: None, detail: detail.to_string(), margin: None }
+    LegResult { won: None, detail: detail.to_string(), margin: None, void: false }
+}
+/// Book-refunded leg: doesn't count toward win/lose; an all-void ticket pushes.
+fn voided(detail: &str) -> LegResult {
+    LegResult { won: None, detail: detail.to_string(), margin: None, void: true }
 }
 
-fn lookup_player<'a>(players: &'a HashMap<String, PlayerLine>, name: &str) -> Option<&'a PlayerLine> {
+/// UNAMBIGUOUS player lookup. Exact folded-name match first; then a containment
+/// match, then a last-name match — but a fuzzy match only counts if EXACTLY ONE
+/// player fits. Two Silvas in a match must never grade each other's props (the
+/// old first-match-wins over a HashMap picked one at random).
+enum Lookup<'a> {
+    Found(&'a PlayerLine),
+    /// Multiple players fit the name — refuse to guess (leave ungraded).
+    Ambiguous,
+    /// Nobody fits — the player did not feature (void at the book).
+    Absent,
+}
+fn lookup_player<'a>(players: &'a HashMap<String, PlayerLine>, name: &str) -> Lookup<'a> {
     let n = crate::odds::fold(name);
     if let Some(p) = players.get(&n) {
-        return Some(p);
+        return Lookup::Found(p);
+    }
+    let contains: Vec<&PlayerLine> = players
+        .iter()
+        .filter(|(k, _)| k.contains(&n) || n.contains(k.as_str()))
+        .map(|(_, v)| v)
+        .collect();
+    if contains.len() == 1 {
+        return Lookup::Found(contains[0]);
+    }
+    if !contains.is_empty() {
+        return Lookup::Ambiguous;
     }
     let last = n.rsplit(' ').next().unwrap_or(&n);
-    players.iter().find(|(k, _)| k.contains(&n) || k.contains(last)).map(|(_, v)| v)
+    if last.len() >= 4 {
+        let by_last: Vec<&PlayerLine> = players
+            .iter()
+            .filter(|(k, _)| k.rsplit(' ').next() == Some(last))
+            .map(|(_, v)| v)
+            .collect();
+        match by_last.len() {
+            1 => return Lookup::Found(by_last[0]),
+            0 => {}
+            _ => return Lookup::Ambiguous,
+        }
+    }
+    Lookup::Absent
 }
 
 fn grade_leg(leg: &TicketLeg, r: &FixtureResult) -> LegResult {
+    if r.terminal_void {
+        return voided("match postponed/cancelled — void");
+    }
     if !r.finished {
         return ungraded("not finished");
     }
@@ -461,9 +581,14 @@ fn grade_leg(leg: &TicketLeg, r: &FixtureResult) -> LegResult {
             _ => ungraded("no half-time score"),
         },
         "Match Result" => {
+            let ft = format!("FT {}-{}", r.home_goals as i64, r.away_goals as i64);
+            let sel = leg.selection.to_lowercase();
+            if sel == "draw" || sel == "x" || sel == "the draw" {
+                return won(r.home_goals == r.away_goals, ft);
+            }
             let is_home = leg.selection.eq_ignore_ascii_case(&r.home_name);
             let (gf, ga) = if is_home { (r.home_goals, r.away_goals) } else { (r.away_goals, r.home_goals) };
-            won(gf > ga, format!("FT {}-{}", r.home_goals as i64, r.away_goals as i64))
+            won(gf > ga, ft)
         }
         "First Team to Score" => {
             let total = (r.home_goals + r.away_goals) as i64;
@@ -501,21 +626,34 @@ fn grade_leg(leg: &TicketLeg, r: &FixtureResult) -> LegResult {
         "Anytime Scorer" | "Anytime Assist" | "Shots on Target" | "Player Shots" | "Tackles"
         | "Fouls Committed" | "Fouls Drawn" | "To Be Carded" | "Passes Completed" | "Goalkeeper Saves" => {
             let p = match lookup_player(&r.players, &leg.selection) {
-                Some(p) => p,
-                None => return ungraded("no player stats"),
+                Lookup::Found(p) => p,
+                Lookup::Ambiguous => return ungraded("ambiguous player name — grade manually"),
+                Lookup::Absent => {
+                    // We HAVE the match's player stats but this player isn't in
+                    // them → they never featured → books void the prop. An empty
+                    // map means the league has no stats coverage → ungradeable.
+                    return if r.players.is_empty() {
+                        ungraded("no player stats")
+                    } else {
+                        voided("did not feature — void")
+                    };
+                }
             };
             let k = threshold(&line);
+            // API player stats cover the WHOLE match; for AET games books settle
+            // props on 90 min — we can't split, so grade but say so (honest-data).
+            let et = if r.extra_time { " (incl. ET)" } else { "" };
             match market {
-                "Anytime Scorer" => won(p.goals >= 1.0, format!("{} goals", p.goals as i64)),
-                "Anytime Assist" => won(p.assists >= 1.0, format!("{} assists", p.assists as i64)),
-                "Shots on Target" => won(p.sot >= k, format!("{} on target", p.sot as i64)),
-                "Player Shots" => won(p.shots >= k, format!("{} shots", p.shots as i64)),
-                "Tackles" => won(p.tackles >= k, format!("{} tackles", p.tackles as i64)),
-                "Fouls Committed" => won(p.fouls_committed >= k, format!("{} fouls", p.fouls_committed as i64)),
-                "Fouls Drawn" => won(p.fouls_drawn >= k, format!("{} drawn", p.fouls_drawn as i64)),
-                "To Be Carded" => won(p.cards >= 1.0, format!("{} cards", p.cards as i64)),
-                "Passes Completed" => won(p.passes >= k, format!("{} passes", p.passes as i64)),
-                "Goalkeeper Saves" => won(p.saves >= k, format!("{} saves", p.saves as i64)),
+                "Anytime Scorer" => won(p.goals >= 1.0, format!("{} goals{et}", p.goals as i64)),
+                "Anytime Assist" => won(p.assists >= 1.0, format!("{} assists{et}", p.assists as i64)),
+                "Shots on Target" => won(p.sot >= k, format!("{} on target{et}", p.sot as i64)),
+                "Player Shots" => won(p.shots >= k, format!("{} shots{et}", p.shots as i64)),
+                "Tackles" => won(p.tackles >= k, format!("{} tackles{et}", p.tackles as i64)),
+                "Fouls Committed" => won(p.fouls_committed >= k, format!("{} fouls{et}", p.fouls_committed as i64)),
+                "Fouls Drawn" => won(p.fouls_drawn >= k, format!("{} drawn{et}", p.fouls_drawn as i64)),
+                "To Be Carded" => won(p.cards >= 1.0, format!("{} cards{et}", p.cards as i64)),
+                "Passes Completed" => won(p.passes >= k, format!("{} passes{et}", p.passes as i64)),
+                "Goalkeeper Saves" => won(p.saves >= k, format!("{} saves{et}", p.saves as i64)),
                 _ => ungraded("unsupported"),
             }
         }
@@ -523,19 +661,39 @@ fn grade_leg(leg: &TicketLeg, r: &FixtureResult) -> LegResult {
     }
 }
 
-/// Grade every leg of a ticket. Fetches each distinct fixture's result once.
-pub async fn grade_legs(state: &AppState, legs: &[TicketLeg]) -> Vec<LegResult> {
-    let mut results_by_fixture: HashMap<i64, Option<FixtureResult>> = HashMap::new();
+/// Per-run fixture-result cache. Settling N tickets that share a fixture must
+/// cost ONE result fetch, not N — pass one of these across the whole run.
+#[derive(Default)]
+pub struct ResultCache(HashMap<i64, Option<FixtureResult>>);
+
+impl ResultCache {
+    /// Home team of a fixture already graded this run (for CLV odds matching).
+    pub fn home_of(&self, fixture_id: i64) -> Option<String> {
+        self.0
+            .get(&fixture_id)
+            .and_then(|o| o.as_ref())
+            .map(|r| r.home_name.clone())
+            .filter(|s| !s.is_empty())
+    }
+}
+
+/// Grade every leg of a ticket, reusing (and filling) the shared `cache`.
+pub async fn grade_legs_cached(
+    state: &AppState,
+    legs: &[TicketLeg],
+    cache: &mut ResultCache,
+) -> Vec<LegResult> {
     for leg in legs {
-        if leg.fixture_id != 0 && !results_by_fixture.contains_key(&leg.fixture_id) {
+        if leg.fixture_id != 0 && !cache.0.contains_key(&leg.fixture_id) {
             let r = fetch_result(state, leg.fixture_id).await;
-            results_by_fixture.insert(leg.fixture_id, r);
+            cache.0.insert(leg.fixture_id, r);
         }
     }
     legs.iter()
-        .map(|leg| match results_by_fixture.get(&leg.fixture_id).and_then(|o| o.as_ref()) {
+        .map(|leg| match cache.0.get(&leg.fixture_id).and_then(|o| o.as_ref()) {
             Some(r) => grade_leg(leg, r),
             None => ungraded("no result data"),
         })
         .collect()
 }
+

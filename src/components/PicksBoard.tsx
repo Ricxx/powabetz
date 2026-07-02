@@ -1,14 +1,11 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { errMsg, toast } from "../toast";
 import { api } from "../api";
 import Hint from "./Hint";
 import StakeBumps from "./StakeBumps";
-import { kellyStake, shortTeam } from "../types";
+import { classifyTicket, kellyStake, pct, shortTeam } from "../types";
 import type { Candidate, FixtureInput, Ticket, TicketEval } from "../types";
 
-function pct(p?: number | null): string {
-  return p == null ? "—" : `${Math.round(p * 100)}%`;
-}
 function conf(p: number): string {
   if (p > 0.78) return "Very High";
   if (p > 0.6) return "High";
@@ -30,7 +27,8 @@ interface Built {
 }
 
 const EVAL_MODELS = [
-  { id: "claude-sonnet-4-6", label: "Sonnet" },
+  { id: "deepseek-v4-pro", label: "DeepSeek" },
+  { id: "claude-sonnet-5", label: "Sonnet" },
   { id: "claude-haiku-4-5", label: "Haiku" },
   { id: "claude-opus-4-8", label: "Opus" },
 ];
@@ -59,11 +57,11 @@ export default function PicksBoard({
   const [err, setErr] = useState<string | null>(null);
   const [sel, setSel] = useState<Set<number>>(new Set());
   const [search, setSearch] = useState("");
-  const [sortBy, setSortBy] = useState<"ev" | "prob">(bankers ? "prob" : "ev");
+  const [sortBy, setSortBy] = useState<"ev" | "prob">("prob"); // our TRUE probability, high→low
   const [valueOnly, setValueOnly] = useState(false);
 
   const [built, setBuilt] = useState<Built[]>([]);
-  const [evalModel, setEvalModel] = useState("claude-sonnet-4-6");
+  const [evalModel, setEvalModel] = useState("claude-haiku-4-5");
   const [evaluating, setEvaluating] = useState(false);
 
   useEffect(() => {
@@ -84,13 +82,15 @@ export default function PicksBoard({
           c.market.toLowerCase().includes(q) ||
           c.fixture.toLowerCase().includes(q)
       );
-    // Bankers arrive pre-ranked by the banker score — keep that order.
+    // Bankers arrive pre-ranked by the banker score — keep that order. Otherwise
+    // GROUP BY FIXTURE, then sort by the chosen metric within each fixture.
     if (!bankers) {
-      rows.sort((a, b) =>
-        sortBy === "ev" ? (b.c.ev ?? -9) - (a.c.ev ?? -9) : b.c.est_prob - a.c.est_prob
-      );
+      rows.sort((a, b) => {
+        if (a.c.fixture !== b.c.fixture) return a.c.fixture.localeCompare(b.c.fixture);
+        return sortBy === "ev" ? (b.c.ev ?? -9) - (a.c.ev ?? -9) : b.c.est_prob - a.c.est_prob;
+      });
     }
-    return rows.slice(0, 120);
+    return rows.slice(0, 400);
   }, [cands, search, sortBy, valueOnly, bankers]);
 
   const slip = useMemo(() => (cands ? [...sel].map((i) => cands[i]).filter(Boolean) : []), [cands, sel]);
@@ -108,10 +108,8 @@ export default function PicksBoard({
 
   function addTicket() {
     if (slip.length === 0) return;
-    const fixturesSet = new Set(slip.map((c) => c.fixture));
-    const type = slip.length <= 1 ? "Single" : fixturesSet.size <= 1 ? "SGP" : "SGP+";
     const ticket: Ticket = {
-      type,
+      type: classifyTicket(slip.map((c) => c.fixture)),
       title: slip.map((c) => c.subject).slice(0, 3).join(" + ") + (slip.length > 3 ? "…" : ""),
       confidence: conf(slipProb),
       legs: slip.map((c) => ({
@@ -158,7 +156,7 @@ export default function PicksBoard({
   return (
     <div className="space-y-3 pb-40">
       <div className="flex items-center justify-between">
-        <h2 className="text-lg font-bold">{bankers ? "🏦 Bankers board" : "Picks board"}</h2>
+        <h2 className="text-lg font-bold">{bankers ? "🏦 Bankers board" : "📊 All picks — data board"}</h2>
         <button className="btn btn-ghost text-sm py-2" onClick={onClose}>
           Done
         </button>
@@ -166,7 +164,7 @@ export default function PicksBoard({
       <p className="text-[11px] text-slate-500">
         {bankers
           ? "The safest, most repeatable legs across your slate — ranked by likelihood, recurring events and recent form, must-play only. Anchor an accumulator with these, then evaluate."
-          : 'Tap picks → "Add as ticket" to build several. Select tickets and Evaluate to get model analysis + risks. +EV uses best book price vs Pinnacle.'}
+          : "Every prop (match + player) across your slate, grouped by fixture and sorted by OUR true probability (not the odds). Cherry-pick any legs → build tickets → evaluate. Toggle Prob/EV to re-sort."}
       </p>
 
       {/* built tickets */}
@@ -267,12 +265,16 @@ export default function PicksBoard({
       {!cands && !err && <div className="text-sm text-slate-400">Loading picks…</div>}
 
       <div className="space-y-1.5">
-        {shown.map(({ c, i }) => {
+        {shown.map(({ c, i }, ri) => {
           const on = sel.has(i);
           const ev = c.ev;
+          const showFixture = !bankers && (ri === 0 || c.fixture !== shown[ri - 1].c.fixture);
           return (
+            <div key={i}>
+            {showFixture && (
+              <div className="text-[10px] font-bold text-accent uppercase tracking-wide pt-2 pb-0.5 px-0.5">⚽ {c.fixture}</div>
+            )}
             <button
-              key={i}
               className={`w-full text-left rounded-lg border px-2.5 py-1.5 ${on ? "border-accent bg-accent/10" : "border-edge bg-ink"}`}
               onClick={() => toggle(i)}
             >
@@ -298,6 +300,23 @@ export default function PicksBoard({
                       ) : null;
                     })()}
                   </div>
+                  {/* Honest-data rule: proxy/crude/availability flags must be
+                      VISIBLE wherever est_prob is shown, not filtered out. */}
+                  {(c.xg_source === "proxy" || (c.flags?.some((f) => !f.startsWith("style:")) ?? false)) && (
+                    <div className="text-[9px] text-slate-500 truncate">
+                      {c.xg_source === "proxy" && (
+                        <span className="text-warn bg-warn/10 rounded px-1 py-0.5 mr-1">proxy xG</span>
+                      )}
+                      {c.flags
+                        ?.filter((f) => !f.startsWith("style:"))
+                        .slice(0, 2)
+                        .map((f, fi) => (
+                          <span key={fi} className="bg-edge/60 rounded px-1 py-0.5 mr-1">
+                            {f}
+                          </span>
+                        ))}
+                    </div>
+                  )}
                 </div>
                 <div className="text-right shrink-0">
                   {c.book_odds != null ? (
@@ -317,6 +336,7 @@ export default function PicksBoard({
                 </div>
               </div>
             </button>
+            </div>
           );
         })}
       </div>
@@ -362,23 +382,31 @@ function PlaceRow({
   const [stake, setStake] = useState(initStake > 0 ? initStake.toFixed(2) : "");
   const [odds, setOdds] = useState(ticket.combined_odds != null ? String(ticket.combined_odds) : "");
   const [placed, setPlaced] = useState(false);
+  const placingRef = useRef(false); // sync double-tap guard
 
   async function place() {
-    const s = parseFloat(stake);
-    if (!Number.isFinite(s) || s <= 0) {
-      toast.error("Enter a stake greater than 0.");
-      return;
-    }
-    const o = parseFloat(odds);
+    // Sync guard before the await — double-tap used to place duplicate bets.
+    if (placingRef.current || placed) return;
+    placingRef.current = true;
     try {
-      await api.placeBet(ticket, s, Number.isFinite(o) && o > 0 ? o : null, false, "board");
-    } catch (e) {
-      toast.error(e);
-      return;
+      const s = parseFloat(stake);
+      if (!Number.isFinite(s) || s <= 0) {
+        toast.error("Enter a stake greater than 0.");
+        return;
+      }
+      const o = parseFloat(odds);
+      try {
+        await api.placeBet(ticket, s, Number.isFinite(o) && o > 0 ? o : null, false, "board");
+      } catch (e) {
+        toast.error(e);
+        return;
+      }
+      toast.success(`Bet placed — $${s.toFixed(2)}`);
+      setPlaced(true);
+      onPlaced();
+    } finally {
+      placingRef.current = false;
     }
-    toast.success(`Bet placed — $${s.toFixed(2)}`);
-    setPlaced(true);
-    onPlaced();
   }
 
   return (

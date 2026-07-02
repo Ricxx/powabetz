@@ -82,6 +82,11 @@ pub struct Candidate {
     /// probability. None = not scored. The one-line reason lives in `support`.
     #[serde(default)]
     pub plausibility: Option<u8>,
+    /// The RAW engine probability before any calibration shrink / adjustment.
+    /// Calibration must be measured against this (measuring the shrunk value
+    /// makes the loop re-correct its own correction). None = never adjusted.
+    #[serde(default)]
+    pub raw_prob: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -104,6 +109,7 @@ pub struct SettingsView {
     pub has_anthropic_key: bool,
     pub has_grok_key: bool,
     pub has_openai_key: bool,
+    pub has_deepseek_key: bool,
     pub has_parlay_key: bool,
     pub model: String,
     pub books: Vec<String>,
@@ -151,6 +157,9 @@ pub struct TicketLeg {
     pub ev: Option<f64>,
     #[serde(default)]
     pub ev_source: Option<String>,
+    /// Raw engine probability before calibration shrink (see Candidate::raw_prob).
+    #[serde(default)]
+    pub raw_prob: Option<f64>,
 }
 
 /// One ticket: a single bet or a multi-leg SGP / SGP+, produced by the model and
@@ -197,7 +206,7 @@ pub struct MatchForecast {
     pub sections: Vec<ForecastSection>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BuildResult {
     pub tickets: Vec<Ticket>,
     /// Single-match forecast (Match Predictor mode only).
@@ -277,6 +286,10 @@ pub struct BuildSelection {
     /// Ticket signatures to avoid when generating a new variation.
     #[serde(default)]
     pub exclude: Vec<String>,
+    /// Subjects (players/teams) the user VOIDED on the results screen — dropped
+    /// from the candidate pool so they can't return in the next set.
+    #[serde(default)]
+    pub exclude_subjects: Vec<String>,
     /// Bias bet builders toward priced markets (so combined odds/EV are real).
     #[serde(default)]
     pub bias_builders: bool,
@@ -292,6 +305,10 @@ pub struct BuildSelection {
     /// can be, pushing toward less-obvious picks.
     #[serde(default)]
     pub max_leg_prob: Option<f64>,
+    /// Deterministic forecasts ONLY — skip the model call entirely (0 tokens).
+    /// Used by the Live screen's match-predict, which only shows the forecast.
+    #[serde(default)]
+    pub forecast_only: bool,
     /// Run the Grok X/news sentiment precursor for this query.
     #[serde(default)]
     pub use_grok: bool,
@@ -341,6 +358,9 @@ pub struct BuildSelection {
     /// Run the per-fixture Haiku plausibility pre-score (cached) and blend it into ranking.
     #[serde(default)]
     pub use_plausibility: Option<bool>,
+    /// Minimum plausibility (1-5) to keep a candidate. None/1 = no filter.
+    #[serde(default)]
+    pub min_plausibility: Option<u8>,
     /// Feed matched browser-ingested page data into the build as labeled context.
     #[serde(default)]
     pub use_ingest: Option<bool>,
@@ -389,13 +409,18 @@ pub struct UsageBreakdown {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LegResult {
-    pub won: Option<bool>, // None = not yet gradeable
+    pub won: Option<bool>, // None = not yet gradeable (or void — see `void`)
     pub detail: String,
     /// For O/U-style legs: signed gap to the line in the bet's favour (actual −
     /// line for an over, line − actual for an under). +0.5 = won by half a unit;
     /// −0.5 = a near-miss loss. None for non-O/U markets.
     #[serde(default)]
     pub margin: Option<f64>,
+    /// Books refund a leg that can't action (player never featured, match
+    /// postponed/abandoned). A void leg is settled — it just doesn't count
+    /// toward win/lose; an all-void ticket returns the stake.
+    #[serde(default)]
+    pub void: bool,
 }
 
 // ---------- in-play / live ----------
@@ -560,7 +585,11 @@ pub struct PlacedBet {
     pub leg_results: Vec<LegResult>,
     pub settled: bool,
     pub grok_used: bool,
-    pub strategy: String, // value | likely | board
+    pub strategy: String, // strategy key (value/oracle/scout/… or board/live/custom)
+    /// Closing-line value: avg (placed / close − 1) across priced legs.
+    /// Positive = beat the close — the fastest-converging proof of edge.
+    #[serde(default)]
+    pub clv: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,14 +1,14 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import TicketAnalysis from "./TicketAnalysis";
 import StakeBumps from "./StakeBumps";
 import { api } from "../api";
-import { kellyStake, legKey, shortTeam } from "../types";
+import { classifyTicket, kellyStake, legKey, pct, shortTeam } from "../types";
 import ForecastPanel from "./ForecastPanel";
 import type { BuildResult, BuildUsage, SgpPrice, Ticket, TicketLeg } from "../types";
 
 function modelLabel(id: string): string {
   if (id.includes("opus")) return "Opus 4.8";
-  if (id.includes("sonnet")) return "Sonnet 4.6";
+  if (id.includes("sonnet")) return "Sonnet 5";
   if (id.includes("haiku")) return "Haiku 4.5";
   return id;
 }
@@ -21,9 +21,6 @@ function confidenceColor(c: string): string {
   return "bg-edge text-slate-300";
 }
 
-function pct(p?: number | null): string {
-  return p == null ? "—" : `${Math.round(p * 100)}%`;
-}
 
 function GrokBanner({ digest }: { digest?: string | null }) {
   const [open, setOpen] = useState(false);
@@ -72,6 +69,7 @@ function TicketCard({
 }) {
   const [open, setOpen] = useState(true);
   const [placed, setPlaced] = useState(false);
+  const placingRef = useRef(false); // sync double-tap guard for confirm()
   const [removed, setRemoved] = useState<Set<number>>(new Set());
   const [stake, setStake] = useState("");
 
@@ -81,13 +79,7 @@ function TicketCard({
   const combinedProb = allEst ? active.reduce((a, l) => a * (l.est_prob as number), 1) : null;
   const allPriced = active.length > 0 && active.every((l) => l.book_odds != null);
   const combinedOdds = allPriced ? active.reduce((a, l) => a * (l.book_odds as number), 1) : null;
-  // SGP+ only if a fixture actually contributes 2+ legs (a same-game core);
-  // a multi-fixture ticket with 1 leg each is just a cross-game Acca.
-  const fixCounts = active.reduce<Record<string, number>>((m, l) => ((m[l.match] = (m[l.match] || 0) + 1), m), {});
-  const nFix = Object.keys(fixCounts).length;
-  const maxPerFix = Math.max(0, ...Object.values(fixCounts));
-  const kind =
-    active.length <= 1 ? "Single" : nFix <= 1 ? "SGP" : maxPerFix >= 2 ? "SGP+" : "Acca";
+  const kind = classifyTicket(active.map((l) => l.match));
   const modified: Ticket = {
     ...t,
     legs: active,
@@ -121,11 +113,19 @@ function TicketCard({
   }, [recStake, combinedOdds, placed, defaultStake]);
 
   async function confirm() {
-    const s = parseFloat(stake);
-    if (!Number.isFinite(s) || s <= 0 || active.length === 0) return;
-    const o = parseFloat(odds);
-    await onPlace?.(modified, s, Number.isFinite(o) && o > 0 ? o : null);
-    setPlaced(true);
+    // Synchronous guard BEFORE the await — a double-tap during the invoke used
+    // to place the same bet twice (duplicate ledger rows, corrupted bankroll).
+    if (placingRef.current || placed) return;
+    placingRef.current = true;
+    try {
+      const s = parseFloat(stake);
+      if (!Number.isFinite(s) || s <= 0 || active.length === 0) return;
+      const o = parseFloat(odds);
+      await onPlace?.(modified, s, Number.isFinite(o) && o > 0 ? o : null);
+      setPlaced(true);
+    } finally {
+      placingRef.current = false;
+    }
   }
 
   return (
@@ -161,10 +161,15 @@ function TicketCard({
       {open && (
         <>
       <div className="space-y-1.5">
-        {t.legs.map((l, i) => {
+        {(() => {
+          // Bet365-style: group legs under a per-fixture header when the ticket
+          // spans more than one match (SGP+ / acca) so it reads cleanly.
+          const multiFixture = new Set(t.legs.map((x) => x.match)).size > 1;
+          return t.legs.map((l, i) => {
           const ev = l.ev != null ? l.ev : null;
           const sharp = l.ev_source === "sharp";
           const isVoid = removed.has(i);
+          const showFixture = multiFixture && (i === 0 || l.match !== t.legs[i - 1].match);
           const toggleVoid = () => {
             const willVoid = !removed.has(i);
             setRemoved((prev) => {
@@ -176,8 +181,11 @@ function TicketCard({
             onVoidSubject?.(l.selection, willVoid);
           };
           return (
+            <div key={i}>
+            {showFixture && (
+              <div className="text-[10px] font-bold text-accent uppercase tracking-wide pt-1 pb-0.5 px-0.5">⚽ {l.match}</div>
+            )}
             <div
-              key={i}
               className={`rounded-lg bg-ink border border-edge px-2.5 py-1.5 ${isVoid ? "opacity-45" : ""}`}
             >
               <div className="flex items-center justify-between gap-2">
@@ -192,7 +200,8 @@ function TicketCard({
                   </div>
                   <div className="text-[11px] text-slate-400 break-words">
                     {l.market}
-                    {l.line ? ` · ${l.line}` : ""} — {l.match}
+                    {l.line ? ` · ${l.line}` : ""}
+                    {!multiFixture ? ` — ${l.match}` : ""}
                   </div>
                 </div>
                 <div className="text-right shrink-0">
@@ -240,8 +249,10 @@ function TicketCard({
                 </div>
               </div>
             </div>
+            </div>
           );
-        })}
+          });
+        })()}
       </div>
 
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs pt-0.5">

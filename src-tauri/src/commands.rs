@@ -19,13 +19,14 @@ use crate::{db, AppState};
 
 #[tauri::command]
 pub fn get_settings(state: State<AppState>) -> Result<SettingsView, String> {
-    let (has_af, has_anthropic, has_grok, has_openai, has_parlay, model, limit, books, kelly, default_stake, timezone, proxy_url, has_proxy_token) = {
+    let (has_af, has_anthropic, has_grok, has_openai, has_deepseek, has_parlay, model, limit, books, kelly, default_stake, timezone, proxy_url, has_proxy_token) = {
         let keys = state.keys.lock().map_err(|_| "keys lock")?;
         (
             keys.api_football.is_some(),
             keys.anthropic.is_some(),
             keys.grok.is_some(),
             keys.openai.is_some(),
+            keys.deepseek.is_some(),
             keys.parlay.is_some(),
             keys.model.clone().unwrap_or_else(|| llm::DEFAULT_MODEL.to_string()),
             keys.daily_limit.unwrap_or(db::DEFAULT_DAILY_LIMIT),
@@ -54,6 +55,7 @@ pub fn get_settings(state: State<AppState>) -> Result<SettingsView, String> {
         has_anthropic_key: has_anthropic,
         has_grok_key: has_grok,
         has_openai_key: has_openai,
+        has_deepseek_key: has_deepseek,
         has_parlay_key: has_parlay,
         model,
         books,
@@ -78,6 +80,7 @@ pub fn save_settings(
     anthropic_key: Option<String>,
     grok_key: Option<String>,
     openai_key: Option<String>,
+    deepseek_key: Option<String>,
     parlay_key: Option<String>,
     model: Option<String>,
     daily_limit: Option<i64>,
@@ -116,6 +119,9 @@ pub fn save_settings(
         }
         if let Some(k) = openai_key {
             keys.openai = non_empty(k);
+        }
+        if let Some(k) = deepseek_key {
+            keys.deepseek = non_empty(k);
         }
         if let Some(k) = parlay_key {
             keys.parlay = non_empty(k);
@@ -833,29 +839,6 @@ async fn fetch_team_cards(
     (Some(cf / nf), Some(ca / nf), Some(both as f64 / nf), Some(most as f64 / nf))
 }
 
-/// Estimate a referee's strictness (avg cards/game) via a cheap cached Haiku call.
-/// There's no referee-stats endpoint, so this is a MODEL ESTIMATE (flagged as
-/// such on the picks) — used to nudge card markets, not presented as measured.
-async fn fetch_ref_strictness(state: &AppState, referee: &str) -> Option<f64> {
-    let key = format!("ref-cards-v1:{}", crate::odds::fold(referee));
-    if let Ok(conn) = state.db.lock() {
-        if let Ok(Some(v)) = db::ai_get(&conn, &key) {
-            return v.parse::<f64>().ok();
-        }
-    }
-    let model = "claude-haiku-4-5";
-    let sys = "You estimate a football referee's disciplinary strictness. Reply with ONLY a single number: the average total cards (yellows + reds) this referee shows per match. If you don't know the referee, reply 4.";
-    let user = format!("Referee: {referee}. Average cards per match?");
-    let (txt, gin, gout) = llm::chat_call(state, model, sys, &user, 20).await.ok()?;
-    let num: f64 = txt.chars().filter(|c| c.is_ascii_digit() || *c == '.').collect::<String>().parse().ok()?;
-    let num = num.clamp(2.0, 7.5);
-    if let Ok(conn) = state.db.lock() {
-        let _ = db::usage_add(&conn, af::now_ts(), model, gin, gout, "referee");
-        let _ = db::ai_put(&conn, &key, &num.to_string(), model, af::now_ts());
-    }
-    Some(num)
-}
-
 /// Formation per team from the (cached) lineups response.
 async fn fetch_formations(state: &AppState, fixture_id: i64) -> HashMap<i64, String> {
     let mut out = HashMap::new();
@@ -913,10 +896,10 @@ async fn team_tactics(state: &AppState, team: &str, coach: Option<&str>, formati
         let coach_s = coach.map(|c| format!(" under coach {c}")).unwrap_or_default();
         let form_s = formation.map(|f| format!(" (lined up {f})")).unwrap_or_default();
         let user = format!(
-            "Describe {team}'s typical tactical style{coach_s}{form_s}. Reply in exactly this shape:\nSTYLE: <2-3 word label, e.g. low-block / high-press / possession / counter-attacking>\n<one or two short sentences: how they build up, where they create and concede shots (inside vs outside box), and pace on transitions>. Factual and concise."
+            "Describe {team}'s typical tactical style{coach_s}{form_s}. Reply in exactly this shape:\nSTYLE: <2-3 word label, e.g. low-block / high-press / possession / counter-attacking>\n<one or two short sentences: how they build up, where they create and concede shots (inside vs outside box), and pace on transitions>. Factual and concise. If you do NOT reliably know this team's current setup, reply exactly STYLE: unknown and nothing else — never guess."
         );
         let (text, gin, gout) =
-            llm::anthropic_call(state, "claude-haiku-4-5", "You are a concise, factual football tactics analyst.", &user, 220)
+            llm::anthropic_call(state, llm::QUAL_MODEL, "You are a concise, factual football tactics analyst.", &user, 220)
                 .await
                 .ok()?;
         let text = text.trim().to_string();
@@ -924,11 +907,16 @@ async fn team_tactics(state: &AppState, team: &str, coach: Option<&str>, formati
             return None;
         }
         let conn = state.db.lock().ok()?;
-        let _ = db::usage_add(&conn, now, "claude-haiku-4-5", gin, gout, "tactics");
+        let _ = db::usage_add(&conn, now, llm::QUAL_MODEL, gin, gout, "tactics");
         let _ = db::cache_put(&conn, &key, "tactics", &text, now, 14 * 24 * 3600);
         text
     };
     let (tag, profile) = parse_style(&raw);
+    // The model was told to answer "STYLE: unknown" when it can't place the
+    // team — treat that as no data, not as a tactics read.
+    if tag.to_lowercase().contains("unknown") || profile.to_lowercase().starts_with("unknown") {
+        return None;
+    }
     if !tag.is_empty() {
         if let Ok(conn) = state.db.lock() {
             let _ = db::cache_put(&conn, &format!("tactics_tag:{}", team.to_lowercase()), "tactics_tag", &tag, now, 14 * 24 * 3600);
@@ -973,11 +961,10 @@ fn map_availability(kind: &str, reason: &str) -> String {
 
 // ---------- build tickets ----------
 
-const ALL_MARKETS: [&str; 30] = [
-    "scorer", "sot", "pshots", "assists", "tackles", "fouls", "cards", "passes", "win", "dc",
-    "btts", "half1", "half2", "ou25", "tgoals", "tcorners", "tshots", "ahandicap", "h1goals",
-    "h2goals", "exactscore", "goalsrange", "saves", "toffsides", "tcards", "bothcards", "mostcards",
-    "mostcorners", "mostshots", "firstscore",
+const ALL_MARKETS: [&str; 23] = [
+    "scorer", "sot", "pshots", "assists", "tackles", "fouls", "cards", "win", "dc",
+    "btts", "half1", "half2", "ou25", "tgoals", "tcorners", "tshots", "h1goals",
+    "h2goals", "exactscore", "toffsides", "tcards", "bothcards", "mostcards",
 ];
 
 /// Fetch a team's full player list + season stats (paged), for auto candidate
@@ -1097,9 +1084,21 @@ fn reground_tickets(
         for mut leg in t.legs.drain(..) {
             let sel = leg.selection.to_lowercase();
             let mkt = leg.market.to_lowercase();
-            let cand = cands
-                .iter()
-                .find(|c| c.subject.to_lowercase() == sel && c.market.to_lowercase() == mkt)
+            // Exact (subject, market, LINE) first: engine and scout rows can share
+            // subject+market with DIFFERENT lines/probs — first-match-wins was
+            // silently swapping the model's chosen (often ingested) line for the
+            // engine's row. Fall back to (subject, market), then subject.
+            let line_l = leg.line.clone().unwrap_or_default().to_lowercase();
+            let cand = (!line_l.is_empty())
+                .then(|| {
+                    cands.iter().find(|c| {
+                        c.subject.to_lowercase() == sel
+                            && c.market.to_lowercase() == mkt
+                            && c.line.to_lowercase() == line_l
+                    })
+                })
+                .flatten()
+                .or_else(|| cands.iter().find(|c| c.subject.to_lowercase() == sel && c.market.to_lowercase() == mkt))
                 .or_else(|| cands.iter().find(|c| c.subject.to_lowercase() == sel));
             if let Some(c) = cand {
                 let sig = format!("{}|{}|{}", c.market, c.subject, c.line);
@@ -1116,6 +1115,7 @@ fn reground_tickets(
                 leg.team = team_badge_of(c);
                 leg.line = Some(c.line.clone());
                 leg.est_prob = Some(c.est_prob);
+                leg.raw_prob = Some(c.raw_prob.unwrap_or(c.est_prob));
                 leg.pinnacle_prob = c.pinnacle_prob;
                 leg.book_odds = c.book_odds;
                 leg.book = c.book.clone();
@@ -1267,20 +1267,68 @@ fn round4(x: f64) -> f64 {
 /// Stable PER-LINE cache key for a candidate's plausibility, independent of which
 /// other lines are in the batch — so a background prewarm and the later build/
 /// ladder share the same cache even after filtering changes the set.
-fn plaus_key(model: &str, c: &Candidate) -> String {
+fn plaus_key(model: &str, c: &Candidate, has_ctx: bool) -> String {
     let mut h = Sha256::new();
     h.update(c.fixture_id.to_le_bytes());
     h.update(crate::odds::fold(&c.subject).as_bytes());
     h.update(c.market.as_bytes());
-    h.update(c.line.as_bytes());
+    // Deliberately NO line label: the engine picks lines dynamically from live
+    // data ("1+ SOT" flips to "2+ SOT" as rates move), so a line-keyed cache
+    // missed on every data refresh and re-scored fixtures the user had already
+    // prewarmed. Plausibility is a read of subject+market fit for THIS match
+    // (role, rotation, matchup) — threshold-agnostic by nature.
     h.update(model.as_bytes());
-    h.update(b"plaus-line-v2");
+    // Context marker: when confirmed lineups/injuries are cached the score is
+    // MUCH sharper (trap detection is mostly a lineups question), so lines
+    // re-score exactly ONCE when that context appears.
+    h.update(if has_ctx { b"plaus-v3-ctx" as &[u8] } else { b"plaus-v3" });
     format!("{:x}", h.finalize())
+}
+
+/// Cache-only real-world context for a fixture's plausibility scoring:
+/// confirmed XI + injury list. Costs ZERO requests (`peek` never touches the
+/// network); empty until a build/board has cached the data.
+fn plaus_context(state: &AppState, fixture_id: i64) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(j) = peek(state, "/fixtures/lineups", vec![("fixture", fixture_id.to_string())]) {
+        for team in response_array(&j) {
+            let tname = team.get("team").and_then(|t| t.get("name")).and_then(|v| v.as_str()).unwrap_or("");
+            let formation = team.get("formation").and_then(|v| v.as_str()).unwrap_or("?");
+            let xi: Vec<&str> = team
+                .get("startXI")
+                .and_then(|x| x.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|p| p.get("player").and_then(|x| x.get("name")).and_then(|v| v.as_str()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !xi.is_empty() {
+                parts.push(format!("{tname} XI [{formation}]: {}", xi.join(", ")));
+            }
+        }
+    }
+    if let Some(j) = peek(state, "/injuries", vec![("fixture", fixture_id.to_string())]) {
+        let names: Vec<String> = response_array(&j)
+            .iter()
+            .filter_map(|e| {
+                let n = e.get("player").and_then(|p| p.get("name")).and_then(|v| v.as_str())?;
+                let t = e.get("player").and_then(|p| p.get("type")).and_then(|v| v.as_str()).unwrap_or("out");
+                Some(format!("{n} ({t})"))
+            })
+            .take(12)
+            .collect();
+        if !names.is_empty() {
+            parts.push(format!("Out/doubtful: {}", names.join(", ")));
+        }
+    }
+    let s = parts.join(" | ");
+    s.chars().take(700).collect()
 }
 
 /// Per-fixture Haiku plausibility pre-score (1-5 + reason) for each candidate
 /// line — one cheap call PER FIXTURE (never per player). Scores are cached
-/// PER LINE so a background prewarm warms exactly what the build/ladder reads.
+/// per (fixture, subject, market) so a prewarm sticks across re-selections.
 /// `call_if_missing=false` means cache-only (used by the deterministic ladder, so
 /// it stays model-call-free). Returns (input_tokens, output_tokens) spent.
 async fn attach_plausibility(
@@ -1294,14 +1342,18 @@ async fn attach_plausibility(
         by_fix.entry(c.fixture_id).or_default().push(i);
     }
     let (mut tin, mut tout) = (0i64, 0i64);
-    for (_fix, idxs) in by_fix {
+    for (fix, idxs) in by_fix {
         if idxs.is_empty() {
             continue;
         }
+        // Cache-only lineups/injuries context (0 requests) — sharpens trap
+        // detection once posted; its presence keys a one-time re-score.
+        let ctx = plaus_context(state, fix);
+        let has_ctx = !ctx.is_empty();
         // 1) Apply whatever is already cached per line; collect the misses.
         let mut uncached: Vec<usize> = Vec::new();
         for &i in &idxs {
-            let key = plaus_key(model, &candidates[i]);
+            let key = plaus_key(model, &candidates[i], has_ctx);
             let hit = state.db.lock().ok().and_then(|c| db::ai_get(&c, &key).ok().flatten());
             match hit.and_then(|js| serde_json::from_str::<Value>(&js).ok()) {
                 Some(v) => apply_plaus(&mut candidates[i], &v),
@@ -1324,7 +1376,7 @@ async fn attach_plausibility(
             })
             .collect();
         let lines_compact = serde_json::to_string(&lines).unwrap_or_default();
-        if let Ok((sc, gin, gout)) = llm::score_plausibility(state, model, &label, "", &lines_compact).await {
+        if let Ok((sc, gin, gout)) = llm::score_plausibility(state, model, &label, &ctx, &lines_compact).await {
             tin += gin;
             tout += gout;
             if let Ok(conn) = state.db.lock() {
@@ -1339,7 +1391,7 @@ async fn attach_plausibility(
                     {
                         let v = serde_json::json!({ "s": score, "r": reason });
                         apply_plaus(&mut candidates[i], &v);
-                        let key = plaus_key(model, &candidates[i]);
+                        let key = plaus_key(model, &candidates[i], has_ctx);
                         if let Ok(conn) = state.db.lock() {
                             let _ = db::ai_put(&conn, &key, &v.to_string(), model, af::now_ts());
                         }
@@ -1353,7 +1405,7 @@ async fn attach_plausibility(
                 if candidates[i].plausibility.is_none() {
                     let v = serde_json::json!({ "s": 3, "r": "" });
                     apply_plaus(&mut candidates[i], &v);
-                    let key = plaus_key(model, &candidates[i]);
+                    let key = plaus_key(model, &candidates[i], has_ctx);
                     if let Ok(conn) = state.db.lock() {
                         let _ = db::ai_put(&conn, &key, &v.to_string(), model, af::now_ts());
                     }
@@ -1396,7 +1448,7 @@ pub async fn prewarm_plausibility(
     if cands.is_empty() {
         return Ok(0);
     }
-    let _ = attach_plausibility(&state, &mut cands, "claude-haiku-4-5", true).await;
+    let _ = attach_plausibility(&state, &mut cands, llm::QUAL_MODEL, true).await;
     Ok(cands.iter().filter(|c| c.plausibility.is_some()).count())
 }
 
@@ -1590,7 +1642,10 @@ async fn live_adjust_forecast(
         .as_deref()
         .and_then(|d| chrono::DateTime::parse_from_rfc3339(d).ok())
         .map(|ko| now >= ko.timestamp() - 300 && now <= ko.timestamp() + 3 * 3600)
-        .unwrap_or(true);
+        // No parseable kickoff → assume NOT live. `true` here fired a fresh,
+        // budget-exempt live snapshot (4 requests) per fixture for matches that
+        // possibly hadn't even started.
+        .unwrap_or(false);
     if !live_window {
         return false;
     }
@@ -1789,10 +1844,12 @@ pub async fn build_tickets(
     // Match Predictor: a deep read of ONE game — force every market so the
     // forecast and the SGP variations have the full picture.
     let predictor = selection.strategy.as_deref() == Some("predictor") && selection.fixtures.len() == 1;
-    // Scout fuses OUR full data with the ingested page data through the model, so
-    // it needs the whole engine table built (every market), same as the predictor.
+    // Scout fuses OUR data with the ingested page through the model. It RESPECTS
+    // the markets you picked (like any strategy) — only falling back to the whole
+    // table when you've selected none. (The ingest-derived corner/card/shot lines
+    // are added on top regardless.)
     let scout = selection.strategy.as_deref() == Some("scout");
-    let markets: Vec<String> = if selection.markets.is_empty() || predictor || scout {
+    let markets: Vec<String> = if selection.markets.is_empty() || predictor {
         ALL_MARKETS.iter().map(|s| s.to_string()).collect()
     } else {
         selection.markets.clone()
@@ -1808,6 +1865,23 @@ pub async fn build_tickets(
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut pred_notes: Vec<String> = Vec::new();
     let mut live_notes: Vec<String> = Vec::new();
+    // Fetch failures during the build (budget reached, API errors). A slate built
+    // on missing injuries/odds/player data must SAY so — a silently degraded
+    // build is indistinguishable from a quiet one and poisons picks + the ledger.
+    let mut degraded_notes: Vec<String> = Vec::new();
+    // Extra transparency notes (e.g. shortlist coverage) merged into det_notes.
+    let mut det_extra: Vec<String> = Vec::new();
+    // LEAN CONTEXT for big slates: past ~6 fixtures the per-match soft context
+    // (weather, H2H, tactics) grows linearly, drowns the model, and burns
+    // requests for signals that matter least on a cross-game acca. Keep the
+    // load-bearing context (predictions, standings, lineups, injuries, live).
+    let lean_context = selection.fixtures.len() > 6;
+    if lean_context {
+        det_extra.push(format!(
+            "Lean context: {} fixtures selected — weather/H2H/tactics skipped to keep the model focused (predictions, standings, lineups and injuries still on).",
+            selection.fixtures.len()
+        ));
+    }
     let mut any_live = false;
     let mut tactics_tags: HashMap<String, String> = HashMap::new();
 
@@ -1820,15 +1894,17 @@ pub async fn build_tickets(
         .strategy
         .clone()
         .unwrap_or_else(|| if selection.most_likely { "likely".to_string() } else { "value".to_string() });
-    // Today (UTC) — used to ignore ARCHIVED ingests (past fixtures) everywhere.
-    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    // Archive cutoff = today in the USER'S configured timezone (Settings), so a
+    // page for tonight's local match stays live all evening. (The old UTC check
+    // hid same-day pages after ~19:00 local west of Greenwich.)
+    let archive_cutoff = local_today(&state);
     let ingest_archived = |v: &serde_json::Value| -> bool {
-        // Archived if the page's fixture date is strictly before today.
-        v.get("date").and_then(|d| d.as_str()).map(|d| !d.is_empty() && d < today.as_str()).unwrap_or(false)
+        // Archived if the page's fixture date is before the user's local today.
+        v.get("date").and_then(|d| d.as_str()).map(|d| !d.is_empty() && d < archive_cutoff.as_str()).unwrap_or(false)
     };
     // Scout strategy: picks built purely from ingested 3rd-party stats, kept
     // independent of the engine. Pre-parse the matched pages' extracted JSON once.
-    let scout_parsed: Vec<(String, serde_json::Value)> = if strategy == "scout" {
+    let scout_parsed: Vec<(String, String, Option<i64>, serde_json::Value)> = if strategy == "scout" {
         let conn = state.db.lock().map_err(|_| "db lock")?;
         db::ingest_for_fixture(&conn)
             .unwrap_or_default()
@@ -1840,7 +1916,7 @@ pub async fn build_tickets(
                 if ingest_archived(&v) {
                     return None; // past fixture — archived, not for future builds
                 }
-                Some((crate::odds::fold(&fl), v))
+                Some((crate::odds::fold(&fl), fl, i.fixture_id, v))
             })
             .collect()
     } else {
@@ -1877,19 +1953,33 @@ pub async fn build_tickets(
             }
         }
 
-        let injuries = fetch_injury_map(&state, fx.fixture_id).await.unwrap_or_default();
+        let injuries = match fetch_injury_map(&state, fx.fixture_id).await {
+            Ok(m) => m,
+            Err(e) => {
+                degraded_notes.push(format!(
+                    "DEGRADED — {fixture_label}: injury data unavailable ({e}); availability defaults to unknown."
+                ));
+                Default::default()
+            }
+        };
 
-        // Odds (Pinnacle + Bet365) and predictions — best-effort.
-        let fixture_odds = af::cached_get(
+        // Odds (Pinnacle + Bet365) and predictions — best-effort, but SAY when missing.
+        let fixture_odds = match af::cached_get(
             &state,
             "/odds",
             vec![("fixture", fx.fixture_id.to_string())],
             af::TTL_ODDS,
         )
         .await
-        .ok()
-        .map(|j| crate::odds::parse_fixture_odds(&j, &books))
-        .unwrap_or_default();
+        {
+            Ok(j) => crate::odds::parse_fixture_odds(&j, &books),
+            Err(e) => {
+                degraded_notes.push(format!(
+                    "DEGRADED — {fixture_label}: odds unavailable ({e}); legs are likelihood-only, no EV."
+                ));
+                Default::default()
+            }
+        };
 
         if selection.use_predictions.unwrap_or(true) {
             if let Ok(pj) = af::cached_get(
@@ -1908,7 +1998,9 @@ pub async fn build_tickets(
 
         // Context signals fed to the model (it weighs them; the engine stays
         // numeric). Each is toggleable so the user can trade depth for speed.
-        if selection.use_weather.unwrap_or(true) {
+        // Weather default OFF: low-value token clutter for most matches (and
+        // Grok's news digest already mentions weather when it actually matters).
+        if selection.use_weather.unwrap_or(false) && !lean_context {
             if let (Some(city), Some(date)) = (&fx.venue_city, &fx.date_utc) {
                 if let Some(w) = crate::weather::match_weather(&state, city, date).await {
                     pred_notes.push(format!("{fixture_label}: weather ~kickoff — {w}."));
@@ -1922,20 +2014,20 @@ pub async fn build_tickets(
                 pred_notes.push(format!("{fixture_label}: {s}"));
             }
         }
-        if selection.use_h2h.unwrap_or(true) {
+        if selection.use_h2h.unwrap_or(true) && !lean_context {
             if let Some(h) = h2h_note(&state, fx.home_team_id, fx.away_team_id, &fx.home_team, &fx.away_team).await {
                 pred_notes.push(format!("{fixture_label}: {h}"));
             }
         }
+        // Referee: name only. The old 40-word pep talk invited the model to
+        // invent card tendencies it doesn't reliably know — pure token waste.
         if let Some(r) = &fx.referee {
-            pred_notes.push(format!(
-                "{fixture_label}: referee {r} — use your knowledge of this ref's card tendency when weighing card markets (a strict ref lifts to-be-carded / team-cards / both-teams-card; a lenient one lowers them).",
-            ));
+            pred_notes.push(format!("{fixture_label}: referee {r}."));
         }
 
         // Coach / formation / play-style profile (cheap Haiku, cached). Helps the
         // model weigh low-block sides, pace on counters, shot location, etc.
-        if selection.use_tactics.unwrap_or(false) {
+        if selection.use_tactics.unwrap_or(false) && !lean_context {
             let formations = fetch_formations(&state, fx.fixture_id).await;
             for (tid, tname) in [(fx.home_team_id, &fx.home_team), (fx.away_team_id, &fx.away_team)] {
                 let coach = fetch_coach(&state, tid).await;
@@ -1972,7 +2064,15 @@ pub async fn build_tickets(
                 (fx.away_team_id, fx.away_team.clone(), false, fx.home_team.clone()),
             ] {
                 let consistency = fetch_consistency(&state, team_id, fx.season).await;
-                let entries = fetch_team_players(&state, team_id, fx.season).await.unwrap_or_default();
+                let entries = match fetch_team_players(&state, team_id, fx.season).await {
+                    Ok(e) => e,
+                    Err(e) => {
+                        degraded_notes.push(format!(
+                            "DEGRADED — {team_name}: player season stats unavailable ({e}); no player props for this side."
+                        ));
+                        Vec::new()
+                    }
+                };
                 let baselines = features::squad_baselines(&entries, fx.league_id);
                 let team_starters = starters.get(&team_id);
                 // If lineups are out for this team, keep only confirmed starters.
@@ -2093,28 +2193,18 @@ pub async fn build_tickets(
             }
         }
 
-        // Referee-aware cards: nudge this fixture's card markets by the ref's
-        // estimated strictness (flagged as a model estimate, never as measured).
-        let card_picked = player_groups.iter().chain(team_groups.iter()).any(|m| matches!(m.as_str(), "cards" | "tcards" | "bothcards"));
-        if card_picked {
-            if let Some(r) = &fx.referee {
-                if let Some(strict) = fetch_ref_strictness(&state, r).await {
-                    let mult = (strict / 4.2).clamp(0.78, 1.3);
-                    for c in candidates[fx_start..].iter_mut() {
-                        if matches!(c.market_group.as_str(), "cards" | "tcards" | "bothcards") {
-                            let m = if c.line.to_lowercase().contains("under") { 1.0 / mult } else { mult };
-                            c.est_prob = round4((c.est_prob * m).clamp(0.02, 0.98));
-                            c.support.push(format!("referee ~{strict:.1} cards/game (model estimate)"));
-                        }
-                    }
-                }
-            }
-        }
+        // Referee context stays SOFT (a pred_notes line the model weighs). The old
+        // multiplier here let an LLM-invented cards/game scalar mutate est_prob —
+        // a hard-rule-4 violation, it double-counted the referee (already in the
+        // notes), and its digit-scrape parser turned a "4 or 5" reply into 45.
 
         // Apply the calibration shrink to this fixture's fresh legs BEFORE odds
         // attach, so the model-fallback EV reflects the adjusted probability.
+        // Keep the RAW value: calibration is measured against raw_prob, never the
+        // shrunk value (else the loop keeps re-correcting its own correction).
         if calib_on {
             for c in candidates[fx_start..].iter_mut() {
+                c.raw_prob = Some(c.est_prob);
                 c.est_prob = round4((0.5 + calib_lambda * (c.est_prob - 0.5)).clamp(0.01, 0.99));
             }
         }
@@ -2125,11 +2215,18 @@ pub async fn build_tickets(
         // Scout: build this fixture's picks straight from its ingested stats and
         // price them off the same odds — kept in a SEPARATE pool from the engine.
         if strategy == "scout" {
-            let (hf, af) = (crate::odds::fold(&fx.home_team), crate::odds::fold(&fx.away_team));
+            // BOTH teams must match (one-team matching fed an "Arsenal vs
+            // Chelsea" page's stats into "Chelsea vs Liverpool" candidates),
+            // with token-aware name matching so page spellings still pair up.
             let matched: Vec<&serde_json::Value> = scout_parsed
                 .iter()
-                .filter(|(fl, _)| fl.contains(&hf) || fl.contains(&af))
-                .map(|(_, v)| v)
+                .filter(|(fl, _, fid, _)| {
+                    // A previously RESOLVED page matches exactly by id; otherwise
+                    // token-aware matching on BOTH team names.
+                    *fid == Some(fx.fixture_id)
+                        || (crate::odds::team_match(fl, &fx.home_team) && crate::odds::team_match(fl, &fx.away_team))
+                })
+                .map(|(_, _, _, v)| v)
                 .collect();
             if !matched.is_empty() {
                 scout_any_match = true;
@@ -2146,7 +2243,15 @@ pub async fn build_tickets(
     // rich context below. Requires at least one matching ingested page.
     if strategy == "scout" {
         if !scout_any_match {
-            return Err("Scout needs ingested data for these fixtures. Ingest a preview/stats page that matches one of your matches, process it (🧲 Ingest), then build Scout.".to_string());
+            let labels: Vec<&str> = scout_parsed.iter().map(|(_, l, _, _)| l.as_str()).take(5).collect();
+            return Err(if labels.is_empty() {
+                "Scout needs ingested data for these fixtures. Ingest a preview/stats page, process it (🧲 Ingest), then build Scout.".to_string()
+            } else {
+                format!(
+                    "Scout found no processed page matching your selected fixtures. Available pages: {}. Both team names must match the fixture — if the page uses short names (e.g. 'Man Utd'), re-process it so the label carries the full names.",
+                    labels.join(" · ")
+                )
+            });
         }
         candidates.extend(scout_candidates);
     }
@@ -2188,7 +2293,7 @@ pub async fn build_tickets(
             .iter()
             .map(|f| format!("{} vs {}", f.home_team, f.away_team))
             .collect();
-        match crate::grok::fetch_digest(&state, &labels, &af::today(), any_live, &selection.grok_categories).await {
+        match crate::grok::fetch_digest(&state, &labels, &local_today(&state), any_live, &selection.grok_categories).await {
             Ok(r) => {
                 {
                     let conn = state.db.lock().map_err(|_| "db lock")?;
@@ -2240,7 +2345,7 @@ pub async fn build_tickets(
         "bankers" => (80, 16), // wide net of reliable recurring events
         "jackpot" => (90, 14), // lottery — wide pool of plausible longshots to stack big
         "predictor" => (110, 20), // deep single-match read — the whole market for one game
-        "scout" => (80, 18),  // ingest-derived corner/card/shot lines across the slate
+        "scout" => (220, 44), // send the WHOLE picture (Haiku's context is huge): anchors + all solid moderate (≥30%) picks
         _ => (50, 8),         // value
     };
     // Make sure the pool is big enough to actually BUILD the requested slate: with
@@ -2254,6 +2359,17 @@ pub async fn build_tickets(
     if min_legs_eff >= 3 {
         market_cap = market_cap.max(16); // more legs per market → more distinct combos
     }
+    // MULTI-FIXTURE SCALING: a fixed pool starves 10 fixtures fighting for the
+    // same rows (each match surfaces ~5 legs — useless for cross-game accas).
+    // Grow the pool modestly per extra fixture, widen the per-market cap (so
+    // "the 10 best shooters" can all be SOT legs), and cap any single fixture
+    // at ~2.5× its fair share so data-rich games can't crowd the rest out.
+    let n_fx = selection.fixtures.len().max(1);
+    if n_fx > 4 {
+        pool_n = (pool_n + (n_fx - 4) * 10).min(220);
+        market_cap = market_cap.max((n_fx * 3) / 2);
+    }
+    let per_fixture_cap = if n_fx >= 3 { ((pool_n * 5) / (n_fx * 2)).max(6) } else { 0 };
     // Tag candidates with their team's tactical style (visible at pick time).
     if !tactics_tags.is_empty() {
         for c in candidates.iter_mut() {
@@ -2265,13 +2381,23 @@ pub async fn build_tickets(
     // Per-fixture Haiku plausibility pre-score (cached) — a real-world context
     // weight blended into ranking. One cheap call per fixture, never per player.
     if selection.use_plausibility.unwrap_or(true) {
-        let (pin, pout) = attach_plausibility(&state, &mut candidates, "claude-haiku-4-5", true).await;
+        let (pin, pout) = attach_plausibility(&state, &mut candidates, llm::QUAL_MODEL, true).await;
         let scored = candidates.iter().filter(|c| c.plausibility.is_some()).count();
         if scored > 0 {
             live_notes.push(format!(
                 "Haiku plausibility pre-score blended into ranking ({scored} lines{}).",
                 if pin + pout == 0 { ", cached" } else { "" }
             ));
+        }
+        // Plausibility slider: drop lines the AI rates below the chosen 1-5 floor
+        // (a scored line only; unscored lines are kept so nothing vanishes silently).
+        if let Some(min_p) = selection.min_plausibility.filter(|&p| p > 1) {
+            let before = candidates.len();
+            candidates.retain(|c| c.plausibility.map_or(true, |p| p >= min_p));
+            let dropped = before - candidates.len();
+            if dropped > 0 {
+                live_notes.push(format!("Plausibility filter ≥{min_p}/5 removed {dropped} implausible line(s)."));
+            }
         }
     }
     // Match Predictor: deterministic forecast from the FULL candidate set (before
@@ -2301,7 +2427,78 @@ pub async fn build_tickets(
     } else {
         vec![]
     };
-    let shortlist = features::shortlist(candidates, pool_n, &strategy, market_cap);
+    // Forecast-only: the Live screen's match-predict shows ONLY the deterministic
+    // forecast — it used to run the full (often premium) model build and throw
+    // the tickets away. Return here: 0 tokens, no cache row, no LLM.
+    if selection.forecast_only {
+        let meter = {
+            let conn = state.db.lock().map_err(|_| "db lock")?;
+            let limit = {
+                let keys = state.keys.lock().map_err(|_| "keys lock")?;
+                keys.daily_limit.unwrap_or(db::DEFAULT_DAILY_LIMIT)
+            };
+            db::meter(&conn, &af::today(), limit)?
+        };
+        return Ok(BuildResponse {
+            result: BuildResult {
+                tickets: vec![],
+                forecast,
+                forecasts: simple_forecasts,
+                data_quality_notes: vec!["Forecast only — no model call (0 tokens).".to_string()],
+                ..Default::default()
+            },
+            meter,
+            usage: BuildUsage {
+                model: String::new(),
+                input_tokens: 0,
+                output_tokens: 0,
+                cost_usd: 0.0,
+                from_cache: false,
+            },
+        });
+    }
+    // Drop subjects the user voided on the results screen (e.g. "not in the
+    // lineup") — they used to reappear in every regular rebuild.
+    if !selection.exclude_subjects.is_empty() {
+        let excl: HashSet<String> =
+            selection.exclude_subjects.iter().map(|s| crate::odds::fold(s)).collect();
+        let before = candidates.len();
+        candidates.retain(|c| !excl.contains(&crate::odds::fold(&c.subject)));
+        if candidates.len() < before {
+            det_extra.push(format!(
+                "Voided subjects: {} leg(s) removed from the pool at your request.",
+                before - candidates.len()
+            ));
+        }
+    }
+    // APEX: hunt correlated combos over the FULL candidate pool (before the
+    // shortlist trims it) — the copula edge often lives in mid-probability legs.
+    let apex_combos = if strategy == "apex" {
+        let block = apex_combo_block(&candidates);
+        if block.is_empty() {
+            det_extra.push("Apex: no correlated combos cleared the bar (lift ≥1.08, corr-EV ≥2%) — singles only.".to_string());
+        } else {
+            det_extra.push(format!(
+                "Apex: {} correlated combo(s) cleared the copula bar; each is its own SGP ticket.",
+                block.lines().count()
+            ));
+        }
+        block
+    } else {
+        String::new()
+    };
+    let total_cands = candidates.len();
+    let shortlist = features::shortlist(candidates, pool_n, &strategy, market_cap, per_fixture_cap);
+    // No silent caps: say how much of the pool the model actually saw.
+    if total_cands > shortlist.len() {
+        det_extra.push(format!(
+            "Shortlist: model saw {} of {} candidate legs (band-stratified; {} per market{}).",
+            shortlist.len(),
+            total_cands,
+            market_cap,
+            if per_fixture_cap > 0 { format!(", {per_fixture_cap} per fixture") } else { String::new() }
+        ));
+    }
     let table = features::compact_table_json(&shortlist);
     let opts = llm::PromptOpts {
         count: selection.ticket_count.unwrap_or(10),
@@ -2316,6 +2513,7 @@ pub async fn build_tickets(
         lucky_risky: selection.lucky_risky,
         min_legs: selection.min_legs.unwrap_or(1).clamp(1, 12),
         max_per_subject: selection.max_per_subject.unwrap_or(0).min(20),
+        apex_combos,
     };
     // Pull in any browser-ingested pages matched to these fixtures — labeled
     // 3rd-party context for the model, and mark each item "used".
@@ -2330,9 +2528,15 @@ pub async fn build_tickets(
                     continue;
                 }
                 let m = selection.fixtures.iter().find(|f| {
-                    fl.contains(&crate::odds::fold(&f.home_team)) || fl.contains(&crate::odds::fold(&f.away_team))
+                    it.fixture_id == Some(f.fixture_id)
+                        || (crate::odds::team_match(&fl, &f.home_team) && crate::odds::team_match(&fl, &f.away_team))
                 });
                 if let Some(f) = m {
+                    // Self-heal: store the resolved fixture id so every later
+                    // consumer (scout, live, boards) matches this page exactly.
+                    if it.fixture_id != Some(f.fixture_id) {
+                        let _ = db::ingest_resolve_fixture(&conn, it.id, f.fixture_id);
+                    }
                     let parsed = it.extracted_json.as_deref().and_then(|j| serde_json::from_str::<Value>(j).ok());
                     // Skip ARCHIVED pages (their fixture day has passed) — never feed
                     // a stale past-match page into a new build.
@@ -2340,8 +2544,11 @@ pub async fn build_tickets(
                         continue;
                     }
                     let detail = parsed
-                        // Scout gets EVERYTHING the page yielded; others a tight digest.
-                        .map(|v| if scout { compact_ingest_full(&v) } else { compact_ingest(&v) })
+                        // Scout gets EVERYTHING the page yielded — but only on a
+                        // focused slate. Past 4 fixtures the full pages stack into
+                        // the token load that drowns the model, so big slates get
+                        // the tight digest per page instead (still fused, cheaper).
+                        .map(|v| if scout && selection.fixtures.len() <= 4 { compact_ingest_full(&v) } else { compact_ingest(&v) })
                         .unwrap_or_default();
                     if !detail.is_empty() {
                         let note = if scout {
@@ -2363,11 +2570,17 @@ pub async fn build_tickets(
         }
     }
 
+    // Two-stage (cheap DeepSeek draft → premium finalise) only pays off when the
+    // user picked a PREMIUM final model. Default Haiku builds directly (one call).
+    let two_stage = (scout || selection.simple.unwrap_or(false)) && llm::is_premium_model(&model);
+    let draft_model = llm::DETERMINISTIC_MODEL;
+    // Cache key must distinguish two-stage from a single-model build.
+    let hash_model = if two_stage { format!("{draft_model}+{model}") } else { model.clone() };
     let hash = llm::input_hash(
         &table,
         &markets,
         selection.reasoning,
-        &model,
+        &hash_model,
         &selection.notes,
         &pred_notes,
         grok_digest.as_deref(),
@@ -2391,6 +2604,17 @@ pub async fn build_tickets(
     for ln in &live_notes {
         det_notes.push(ln.clone());
     }
+    det_notes.extend(det_extra.iter().cloned());
+    // Surface fetch failures prominently (deduped — a tripped budget repeats
+    // the same message for every fixture/team).
+    degraded_notes.dedup();
+    if !degraded_notes.is_empty() {
+        det_notes.push(format!(
+            "⚠ This build ran with MISSING data ({} issue(s)) — treat picks with extra caution:",
+            degraded_notes.len()
+        ));
+        det_notes.extend(degraded_notes.iter().cloned());
+    }
     if let Some(e) = &grok_error {
         det_notes.push(format!("Grok unavailable — {e}"));
     }
@@ -2406,33 +2630,45 @@ pub async fn build_tickets(
             r.from_cache = true;
             (r, 0, 0, true)
         } else {
-            let call = llm::call_model(
-                &state,
-                &model,
-                &table,
-                &markets,
-                selection.reasoning,
-                &selection.notes,
-                &pred_notes,
-                grok_digest.as_deref(),
-                &opts,
-            )
-            .await?;
+            // Two-stage (Scout/Simple) or a single call.
+            let (call, draft_in, draft_out) = if two_stage {
+                llm::call_model_two_stage(
+                    &state, draft_model, &model, &table, &markets, selection.reasoning,
+                    &selection.notes, &pred_notes, grok_digest.as_deref(), &opts,
+                )
+                .await?
+            } else {
+                let c = llm::call_model(
+                    &state, &model, &table, &markets, selection.reasoning,
+                    &selection.notes, &pred_notes, grok_digest.as_deref(), &opts,
+                )
+                .await?;
+                (c, 0, 0)
+            };
             let mut r = call.result;
             r.from_cache = false;
             r.grok_used = grok_used;
             r.grok_digest = grok_digest.clone();
+            if two_stage {
+                r.data_quality_notes.push(format!("Two-stage build: {draft_model} drafted, {model} finalised."));
+            }
             reground_tickets(&mut r, &shortlist, &selection.ticket_types, total_tickets as usize, selection.max_per_subject);
             let stored = serde_json::to_string(&r).map_err(|e| e.to_string())?;
             {
                 let conn = state.db.lock().map_err(|_| "db lock")?;
                 db::ai_put(&conn, &hash, &stored, &model, af::now_ts())?;
-                db::usage_add(&conn, af::now_ts(), &model, call.input_tokens, call.output_tokens, "build")?;
+                // Bill each stage to its own model for an honest ledger.
+                if call.input_tokens + call.output_tokens > 0 {
+                    db::usage_add(&conn, af::now_ts(), &model, call.input_tokens, call.output_tokens, "build")?;
+                }
+                if draft_in + draft_out > 0 {
+                    db::usage_add(&conn, af::now_ts(), draft_model, draft_in, draft_out, "build")?;
+                }
                 // Auto-save every fresh run so it's viewable later.
                 let sel_json = serde_json::to_string(&markets).unwrap_or_default();
                 let _ = db::save_ticket(&conn, af::now_ts(), &sel_json, &stored, &selection.notes);
             }
-            (r, call.input_tokens, call.output_tokens, false)
+            (r, call.input_tokens + draft_in, call.output_tokens + draft_out, false)
         };
 
     det_notes.extend(result.data_quality_notes.drain(..));
@@ -2445,7 +2681,7 @@ pub async fn build_tickets(
     // grok flag, so we can later settle them all and see which approach wins.
     {
         let conn = state.db.lock().map_err(|_| "db lock")?;
-        let day = af::today();
+        let day = local_today(&state);
         for t in &result.tickets {
             if t.legs.is_empty() {
                 continue;
@@ -2559,15 +2795,24 @@ async fn gather_candidates(
 ) -> Vec<Candidate> {
     let player_groups: Vec<String> = markets.iter().filter(|m| is_player_market(m)).cloned().collect();
     let team_groups: Vec<String> = markets.iter().filter(|m| !is_player_market(m)).cloned().collect();
+    // Same calibration shrink as builds — the Picks/Bankers boards used to show
+    // UNCALIBRATED probabilities, so the same leg had a different est_prob on
+    // the board than in a Build (and the ladder ledger recorded raw probs).
+    let (calib_lambda, _calib_n) = calibration_shrink(state);
+    let calib_on = (calib_lambda - 1.0).abs() > 1e-6;
     let mut candidates: Vec<Candidate> = Vec::new();
     for fx in fixtures {
         let fixture_label = format!("{} vs {}", fx.home_team, fx.away_team);
+        let fx_start = candidates.len();
         let injuries = fetch_injury_map(state, fx.fixture_id).await.unwrap_or_default();
         let fixture_odds = af::cached_get(state, "/odds", vec![("fixture", fx.fixture_id.to_string())], af::TTL_ODDS)
             .await
             .ok()
             .map(|j| crate::odds::parse_fixture_odds(&j, books))
             .unwrap_or_default();
+        // Confirmed lineups, same as builds: once posted, only the starting XI
+        // gets player props (a board pick for a benched player is a trap).
+        let starters = fetch_starters(state, fx.fixture_id).await;
 
         if !player_groups.is_empty() {
             let in_form = fetch_inform(state, fx.league_id, fx.season).await;
@@ -2578,13 +2823,27 @@ async fn gather_candidates(
                 let consistency = fetch_consistency(state, team_id, fx.season).await;
                 let entries = fetch_team_players(state, team_id, fx.season).await.unwrap_or_default();
                 let baselines = features::squad_baselines(&entries, fx.league_id);
+                let team_starters = starters.get(&team_id);
+                let entries: Vec<Value> = match team_starters {
+                    Some(set) => entries
+                        .into_iter()
+                        .filter(|e| {
+                            e.get("player")
+                                .and_then(|p| p.get("id"))
+                                .and_then(|v| v.as_i64())
+                                .map(|pid| set.contains(&pid))
+                                .unwrap_or(false)
+                        })
+                        .collect(),
+                    None => entries,
+                };
                 for entry in top_players(entries, 24) {
-                    let availability = entry
-                        .get("player")
-                        .and_then(|p| p.get("id"))
-                        .and_then(|v| v.as_i64())
-                        .and_then(|pid| injuries.get(&pid).cloned())
-                        .unwrap_or_else(|| "unknown".to_string());
+                    let pid = entry.get("player").and_then(|p| p.get("id")).and_then(|v| v.as_i64());
+                    let availability = if team_starters.map(|s| pid.map(|id| s.contains(&id)).unwrap_or(false)).unwrap_or(false) {
+                        "starting".to_string()
+                    } else {
+                        pid.and_then(|id| injuries.get(&id).cloned()).unwrap_or_else(|| "unknown".to_string())
+                    };
                     let ctx = FixtureCtx {
                         fixture_label: fixture_label.clone(),
                         fixture_id: fx.fixture_id,
@@ -2601,7 +2860,12 @@ async fn gather_candidates(
             let mut home = fetch_team_stats(state, fx.home_team_id, &fx.home_team, fx.league_id, fx.season).await.ok().flatten();
             let mut away = fetch_team_stats(state, fx.away_team_id, &fx.away_team, fx.league_id, fx.season).await.ok().flatten();
             if team_groups.iter().any(|m| matches!(m.as_str(), "tcorners" | "tshots" | "toutbox" | "tinbox" | "toffsides")) {
+                // Same as builds: once recent form is fetched, apply the xG too so
+                // goal-derived lines match what a Build would show (the board's
+                // apply used to omit xg_for/xg_against — same leg, different prob).
                 let apply = |t: &mut crate::features::TeamStats, f: &TeamForm| {
+                    t.xg_for = f.xg_for;
+                    t.xg_against = f.xg_against;
                     t.corners_for = f.corners_for;
                     t.corners_against = f.corners_against;
                     t.shots_for = f.shots_for;
@@ -2641,6 +2905,14 @@ async fn gather_candidates(
                 candidates.extend(features::build_team_candidates(&h, &a, &fixture_label, fx.fixture_id, &team_groups));
             }
         }
+        // Same calibration shrink as builds, BEFORE odds attach (so model-EV
+        // reflects the adjusted prob); raw kept for the calibration loop.
+        if calib_on {
+            for c in candidates[fx_start..].iter_mut() {
+                c.raw_prob = Some(c.est_prob);
+                c.est_prob = round4((0.5 + calib_lambda * (c.est_prob - 0.5)).clamp(0.01, 0.99));
+            }
+        }
         features::attach_odds(&mut candidates, &fixture_odds, &fixture_label, &fx.home_team);
     }
     // Attach cached tactical style tags (no model call — only shows if a prior
@@ -2676,6 +2948,7 @@ fn make_ladder_ticket(cands: &[Candidate], title: &str) -> Ticket {
             team: team_badge_of(c),
             line: Some(c.line.clone()),
             est_prob: Some(c.est_prob),
+            raw_prob: Some(c.raw_prob.unwrap_or(c.est_prob)),
             pinnacle_prob: c.pinnacle_prob,
             book_odds: c.book_odds,
             book: c.book.clone(),
@@ -2825,12 +3098,21 @@ pub async fn build_ladder(
     variation: Option<u32>,
     min_odds: Option<f64>,
     max_odds: Option<f64>,
+    one_per_fixture: Option<bool>,
 ) -> Result<BuildResult, String> {
     if fixtures.is_empty() {
         return Err("Select at least one match first.".to_string());
     }
+    // Diversified cross-game mode: at most ONE leg per match — legs are then
+    // truly independent (no shared game state), which is exactly the low-
+    // correlation acca ("the 10 best shooters from 10 games") that a same-game
+    // stack can't give you.
+    let one_per_fixture = one_per_fixture.unwrap_or(false);
     let ou_side = ou_side.unwrap_or_else(|| "auto".to_string());
-    let scope = scope.unwrap_or_else(|| "team".to_string()); // team | props | mixed
+    // Default MIXED: the selected MARKETS already say what the user wants — the
+    // scope is only an optional narrowing on top (and defaulting to "team" made
+    // props-only selections error out confusingly).
+    let scope = scope.unwrap_or_else(|| "mixed".to_string()); // team | props | mixed
     let count = count.unwrap_or(5).clamp(1, 20) as usize;
     let min_prob = min_prob.unwrap_or(0.55).clamp(0.05, 0.97);
     let max_legs = max_legs.unwrap_or(8).clamp(2, 20) as usize;
@@ -2850,32 +3132,25 @@ pub async fn build_ladder(
     } else {
         markets
     };
-    let had_player = markets.iter().any(|m| is_player_market(m));
-    let had_team = markets.iter().any(|m| !is_player_market(m));
+    // Scope is an optional NARROWING on top of the selected markets — the
+    // selection always wins. If narrowing would empty the list (e.g. scope
+    // 'team' but only player props picked), fall back to the full selection
+    // instead of erroring (the old behaviour confused everyone).
+    let full_markets = markets.clone();
     match scope.as_str() {
         "team" => markets.retain(|m| !is_player_market(m)),
         "props" => markets.retain(|m| is_player_market(m)),
         _ => {} // mixed → keep both
     }
+    let mut scope_note: Option<String> = None;
     if markets.is_empty() {
-        let reason = match scope.as_str() {
-            "team" => {
-                if had_player {
-                    "The ladder scope is 'Teams/Match', but you only selected PLAYER-prop markets. Switch the ladder scope to 'Props' or 'Mixed', or add a team market (Match Result, Goals O/U, Team Corners…)."
-                } else {
-                    "No team/match markets selected. Pick at least one (Match Result, Goals O/U, BTTS, Team Corners…)."
-                }
-            }
-            "props" => {
-                if had_team {
-                    "The ladder scope is 'Props', but you only selected TEAM/match markets. Switch the ladder scope to 'Teams/Match' or 'Mixed', or add a player prop (Anytime Scorer, Shots on Target…)."
-                } else {
-                    "No player-prop markets selected. Pick at least one (Anytime Scorer, Shots on Target, Tackles…)."
-                }
-            }
-            _ => "No markets selected — pick some markets above first.",
-        };
-        return Err(reason.to_string());
+        if full_markets.is_empty() {
+            return Err("No markets selected — pick some markets above first.".to_string());
+        }
+        scope_note = Some(format!(
+            "Ladder scope '{scope}' didn't match any of your selected markets — used all of them instead."
+        ));
+        markets = full_markets;
     }
     let books = {
         let keys = state.keys.lock().map_err(|_| "keys lock")?;
@@ -2885,7 +3160,7 @@ pub async fn build_ladder(
     // Cache-only plausibility (no model call — the ladder stays deterministic).
     // If the user pre-scored in the background, every line gets a 1-5 weight that
     // tilts which lines lead each ticket.
-    let _ = attach_plausibility(&state, &mut candidates, "claude-haiku-4-5", false).await;
+    let _ = attach_plausibility(&state, &mut candidates, llm::QUAL_MODEL, false).await;
 
     // Isolate Over or Under on the O/U families (goals, corners, shots, team
     // goals) when the user asks — otherwise both sides compete on probability.
@@ -2926,7 +3201,13 @@ pub async fn build_ladder(
     }
     // Rank legs by probability, nudged by the cached plausibility weight (+0.08 at
     // 5, −0.08 at 1) so more realistic lines lead each ticket.
-    let lscore = |c: &Candidate| c.est_prob + c.plausibility.map(|p| (p as f64 - 3.0) * 0.04).unwrap_or(0.0);
+    // Rank by the SHARP-blended probability where Pinnacle priced the leg (our
+    // est averaged with the de-vigged sharp read beats either alone), nudged by
+    // cached plausibility.
+    let lscore = |c: &Candidate| {
+        let p = c.pinnacle_prob.map(|ps| 0.5 * ps + 0.5 * c.est_prob).unwrap_or(c.est_prob);
+        p + c.plausibility.map(|pl| (pl as f64 - 3.0) * 0.04).unwrap_or(0.0)
+    };
     let cmp_desc = |a: &Candidate, b: &Candidate| lscore(b).partial_cmp(&lscore(a)).unwrap_or(std::cmp::Ordering::Equal);
     let mut player_legs: Vec<Candidate> = player_best.into_values().collect();
     let mut team_legs: Vec<Candidate> = team_best.into_values().collect();
@@ -3032,9 +3313,11 @@ pub async fn build_ladder(
             }
             let c = &legs[(start + j) % pool_len];
             let fkey = format!("{}|{}", c.fixture, c.market_group);
+            let fxkey = format!("fx:{}", c.fixture);
             let k = dkey(c);
             if in_ticket.contains(&fkey)
                 || in_ticket.contains(&k)
+                || (one_per_fixture && in_ticket.contains(&fxkey))
                 || *subj_used.get(&k).unwrap_or(&0) >= cap
             {
                 continue;
@@ -3058,6 +3341,7 @@ pub async fn build_ladder(
             prod *= c.est_prob;
             chosen.push(c.clone());
             in_ticket.insert(fkey);
+            in_ticket.insert(fxkey);
             in_ticket.insert(k);
         }
         attempt += 1;
@@ -3085,7 +3369,7 @@ pub async fn build_ladder(
     // Record in the ledger under the "ladder" strategy.
     {
         let conn = state.db.lock().map_err(|_| "db lock")?;
-        let day = af::today();
+        let day = local_today(&state);
         for t in &tickets {
             let mut sig: Vec<String> = t
                 .legs
@@ -3108,6 +3392,9 @@ pub async fn build_ladder(
         max_legs,
         (min_hit * 100.0).round() as i64
     )];
+    if let Some(n) = scope_note {
+        notes.push(n);
+    }
     if tickets.len() < count {
         notes.push(format!(
             "Only {} of {} tickets — the pool ({} lines) can't form more distinct {}-leg combos. Add fixtures/markets, lower the min legs, widen the odds band, or switch the markets scope to 'mixed'/'props'.",
@@ -3139,7 +3426,7 @@ pub async fn evaluate_tickets(
     }
     let model = model
         .filter(|m| llm::is_allowed_analysis_model(m))
-        .unwrap_or_else(|| "claude-haiku-4-5".to_string());
+        .unwrap_or_else(|| llm::QUAL_MODEL.to_string());
     let leagues = leagues.unwrap_or_default();
 
     let mut rows = Vec::new();
@@ -3341,6 +3628,7 @@ fn row_to_bet(r: &db::PlacedRow) -> Result<PlacedBet, String> {
         settled: r.settled,
         grok_used: r.grok_used,
         strategy: r.strategy.clone(),
+        clv: r.clv,
     })
 }
 
@@ -3361,11 +3649,12 @@ pub fn place_bet(
         }
     }
     let ticket_json = serde_json::to_string(&t).map_err(|e| e.to_string())?;
+    let day = local_today(&state);
     let conn = state.db.lock().map_err(|_| "db lock")?;
     db::place_bet(
         &conn,
         af::now_ts(),
-        &af::today(),
+        &day,
         &ticket_json,
         stake,
         grok_used.unwrap_or(false),
@@ -3393,7 +3682,12 @@ fn pairs_from_bets(bets: &[PlacedBet]) -> Vec<(f64, f64)> {
             continue;
         }
         for (leg, res) in b.ticket.legs.iter().zip(b.leg_results.iter()) {
-            if let (Some(p), Some(won)) = (leg.est_prob, res.won) {
+            if res.void {
+                continue; // refunded legs carry no outcome signal
+            }
+            // Calibrate on the RAW engine prob — measuring the already-shrunk
+            // value would make the loop re-correct its own correction.
+            if let (Some(p), Some(won)) = (leg.raw_prob.or(leg.est_prob), res.won) {
                 if p > 0.0 && p < 1.0 {
                     pairs.push((p, if won { 1.0 } else { 0.0 }));
                 }
@@ -3411,7 +3705,10 @@ fn pairs_from_generated(conn: &rusqlite::Connection) -> Vec<(f64, f64)> {
         let legs = serde_json::from_str::<Ticket>(&tj).map(|t| t.legs).unwrap_or_default();
         let results: Vec<crate::models::LegResult> = serde_json::from_str(&lrj).unwrap_or_default();
         for (leg, res) in legs.iter().zip(results.iter()) {
-            if let (Some(p), Some(won)) = (leg.est_prob, res.won) {
+            if res.void {
+                continue; // refunded legs carry no outcome signal
+            }
+            if let (Some(p), Some(won)) = (leg.raw_prob.or(leg.est_prob), res.won) {
                 if p > 0.0 && p < 1.0 {
                     pairs.push((p, if won { 1.0 } else { 0.0 }));
                 }
@@ -3535,16 +3832,24 @@ pub async fn settle_generated(state: State<'_, AppState>) -> Result<Vec<GenRepor
         let conn = state.db.lock().map_err(|_| "db lock")?;
         db::gen_unsettled(&conn)?
     };
+    // One shared fixture-result cache for the whole run: N tickets on the same
+    // fixture cost ONE fetch, not N (this used to be the settle "fetch storm").
+    let mut cache = settle::ResultCache::default();
     for row in rows {
         let t: Ticket = match serde_json::from_str(&row.ticket_json) {
             Ok(t) => t,
             Err(_) => continue,
         };
-        let results = settle::grade_legs(&state, &t.legs).await;
-        if results.is_empty() || results.iter().any(|r| r.won.is_none()) {
+        let results = settle::grade_legs_cached(&state, &t.legs, &mut cache).await;
+        // Void legs are settled (book refund) — only a non-void ungraded leg blocks.
+        if results.is_empty() || results.iter().any(|r| r.won.is_none() && !r.void) {
             continue; // not all legs gradeable yet
         }
-        let won = results.iter().all(|r| r.won == Some(true));
+        let live: Vec<_> = results.iter().filter(|r| !r.void).collect();
+        // Paper-ledger honesty: an all-void ticket is a push, not a loss — settle
+        // it as won=false but its leg_results carry `void`, so report/calibration
+        // readers can exclude it.
+        let won = !live.is_empty() && live.iter().all(|r| r.won == Some(true));
         let lr = serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string());
         let conn = state.db.lock().map_err(|_| "db lock")?;
         let _ = db::gen_mark_settled(&conn, row.id, won, &lr);
@@ -3589,13 +3894,18 @@ pub fn generated_report_by_market(state: State<AppState>) -> Result<Vec<MarketRe
         let legs = serde_json::from_str::<Ticket>(&tj).map(|t| t.legs).unwrap_or_default();
         let results: Vec<crate::models::LegResult> = serde_json::from_str(&lrj).unwrap_or_default();
         for (leg, res) in legs.iter().zip(results.iter()) {
+            if res.void {
+                continue; // refunded legs carry no outcome signal
+            }
             if let Some(won) = res.won {
                 let e = agg.entry(leg.market.clone()).or_insert((0, 0, 0.0, 0.0, 0, 0));
                 e.0 += 1;
                 if won {
                     e.1 += 1;
                 }
-                e.2 += leg.est_prob.unwrap_or(0.0);
+                // Compare against the RAW engine prob (pre-shrink) so this report
+                // measures the ENGINE per market, not the calibration on top.
+                e.2 += leg.raw_prob.or(leg.est_prob).unwrap_or(0.0);
                 if let Some(m) = res.margin {
                     e.3 += m;
                     e.4 += 1;
@@ -3768,9 +4078,10 @@ pub async fn live_snapshot(state: State<'_, AppState>, fixture: LiveFixture) -> 
 
 async fn live_snapshot_inner(state: &AppState, fixture: LiveFixture) -> Result<LiveSnapshot, String> {
     let fid = fixture.fixture_id;
-    // Refresh the live score/minute.
+    // Refresh the live score/minute — ALWAYS fresh + budget-exempt so a stale
+    // pre-kickoff cache row can't make an in-play game read as "not started".
     let (mut status, mut elapsed, mut hg, mut ag) = (fixture.status.clone(), fixture.elapsed, fixture.home_goals, fixture.away_goals);
-    if let Ok(fj) = af::cached_get(&state, "/fixtures", vec![("id", fid.to_string())], TTL_LIVE_SHORT).await {
+    if let Ok(fj) = af::fetch_live(&state, "/fixtures", vec![("id", fid.to_string())], TTL_LIVE_SHORT).await {
         if let Some(f) = response_array(&fj).into_iter().next() {
             let stt = f.get("fixture").and_then(|x| x.get("status"));
             status = stt.and_then(|s| s.get("short")).and_then(|v| v.as_str()).unwrap_or(&status).to_string();
@@ -3849,7 +4160,13 @@ async fn live_snapshot_inner(state: &AppState, fixture: LiveFixture) -> Result<L
                             };
                             let odd = v.get("odd").and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok()).or_else(|| v.get("odd").and_then(|x| x.as_f64())).unwrap_or(0.0);
                             if odd > 1.0 {
-                                odds.push(LiveOdd { market: name.to_string(), selection: sel, odds: odd, implied: round4(1.0 / odd) });
+                                // In-play margins are the book's fattest (~10%+).
+                                // Raw 1/odds systematically overstated every live
+                                // "implied" probability — haircut by a documented
+                                // flat live-margin estimate (single-sided values;
+                                // a paired de-vig isn't reliably possible here).
+                                const LIVE_MARGIN: f64 = 0.10;
+                                odds.push(LiveOdd { market: name.to_string(), selection: sel, odds: odd, implied: round4(1.0 / odd / (1.0 + LIVE_MARGIN)) });
                             }
                         }
                     }
@@ -3967,9 +4284,11 @@ pub async fn live_ticket(state: State<'_, AppState>, fixture: LiveFixture, model
 
     // Live PLAYER props — it's a numbers game: who's actually shooting/attempting
     // right now is most likely to do more. Pace-extrapolate each player's live
-    // shots over the time remaining.
+    // output over the time remaining. `pace` = remaining ÷ elapsed, capped so an
+    // early minute can't project an absurd burst.
     let elapsed = snap.fixture.elapsed.max(1);
-    let frac = ((90 - snap.fixture.elapsed).clamp(0, 90) as f64) / elapsed as f64;
+    let remaining_min = (90 - snap.fixture.elapsed).clamp(0, 90);
+    let frac = (remaining_min as f64 / elapsed as f64).min(3.0);
     if let Ok(pj) = af::cached_get(&state, "/fixtures/players", vec![("fixture", fixture.fixture_id.to_string())], TTL_LIVE_SHORT).await {
         let mut players: Vec<(String, String, f64, f64, f64)> = Vec::new(); // name, team, mins, shots, sot
         for team in response_array(&pj) {
@@ -3989,20 +4308,31 @@ pub async fn live_ticket(state: State<'_, AppState>, fixture: LiveFixture, model
         }
         // Prioritise the live shooters, then high-minute regulars.
         players.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal).then(b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal)));
-        for (name, _team, _mins, shots, sot) in players.into_iter().take(8) {
-            // Shots: P(≥1 more) over remaining time, pace from shots-so-far.
-            let more_shots = shots * frac;
-            let p_shot = 1.0 - (-more_shots).exp();
-            if p_shot > 0.15 {
-                let next = (shots as i64) + 1;
-                lines.push(format!("[{}] {} — {}+ shots (has {} so far) — our {}%", menu.len(), name, next, shots as i64, (p_shot * 100.0).round() as i64));
-                menu.push(LiveLeg { label: format!("{} {}+ shots", name, next), prob: round4(p_shot), odds: None, source: "model".into(), why: String::new() });
-            }
-            // To score from here, from SOT pace × ~0.3 conversion.
-            let p_score = 1.0 - (-(sot * frac * 0.30)).exp();
-            if p_score > 0.08 {
-                lines.push(format!("[{}] {} — to score from here ({} SOT so far) — our {}%", menu.len(), name, sot as i64, (p_score * 100.0).round() as i64));
-                menu.push(LiveLeg { label: format!("{} to score from here", name), prob: round4(p_score), odds: None, source: "model".into(), why: String::new() });
+        // Player pace is only meaningful once there's a real sample (≥15').
+        if elapsed >= 15 {
+            for (name, _team, _mins, shots, sot) in players.into_iter().take(12) {
+                // Shots: P(≥1 more) over remaining time, pace from shots-so-far.
+                let more_shots = shots * frac;
+                let p_shot = 1.0 - (-more_shots).exp();
+                if p_shot > 0.12 && shots >= 1.0 {
+                    let next = (shots as i64) + 1;
+                    lines.push(format!("[{}] {} — {}+ shots in the {}' left (has {} · ~{:.1} more expected) — our {}%", menu.len(), name, next, remaining_min, shots as i64, more_shots, (p_shot * 100.0).round() as i64));
+                    menu.push(LiveLeg { label: format!("{} {}+ shots", name, next), prob: round4(p_shot), odds: None, source: "model".into(), why: String::new() });
+                }
+                // Shots on target: P(≥1 more SOT).
+                let more_sot = sot * frac;
+                let p_sot = 1.0 - (-more_sot).exp();
+                if p_sot > 0.12 && sot >= 1.0 {
+                    let next = (sot as i64) + 1;
+                    lines.push(format!("[{}] {} — {}+ shots on target in the {}' left (has {}) — our {}%", menu.len(), name, next, remaining_min, sot as i64, (p_sot * 100.0).round() as i64));
+                    menu.push(LiveLeg { label: format!("{} {}+ shots on target", name, next), prob: round4(p_sot), odds: None, source: "model".into(), why: String::new() });
+                }
+                // To score from here, from SOT pace × ~0.3 conversion.
+                let p_score = 1.0 - (-(sot * frac * 0.30)).exp();
+                if p_score > 0.08 && sot >= 1.0 {
+                    lines.push(format!("[{}] {} — to score in the {}' left ({} SOT so far) — our {}%", menu.len(), name, remaining_min, sot as i64, (p_score * 100.0).round() as i64));
+                    menu.push(LiveLeg { label: format!("{} to score from here", name), prob: round4(p_score), odds: None, source: "model".into(), why: String::new() });
+                }
             }
         }
     }
@@ -4016,29 +4346,54 @@ pub async fn live_ticket(state: State<'_, AppState>, fixture: LiveFixture, model
     }).collect::<Vec<_>>().join(" | ");
     let ev_str = snap.events.iter().rev().take(10).map(|e| format!("{}' {} {} ({})", e.minute, e.kind, e.player, e.team)).collect::<Vec<_>>().join("; ");
 
+    // Scout-for-live: fuse the user's INGESTED pre-match stats with the live state.
+    // Use the STRUCTURED extracted data (corners/cards/shots per game, form, xG,
+    // predictions) — the same clean stats the Scout strategy uses — not raw page
+    // text. Matched by team, processed only, past-day pages skipped.
+    let today = local_today(&state);
+    let (hf, af) = (crate::odds::fold(&f.home_team), crate::odds::fold(&f.away_team));
     let ingest_notes = {
         let conn = state.db.lock().map_err(|_| "db lock")?;
-        db::ingest_for_fixture(&conn).ok().map(|rows| {
-            rows.into_iter().filter(|r| {
-                let t = format!("{} {} {}", r.title, r.note, r.content).to_lowercase();
-                t.contains(&f.home_team.to_lowercase()) || t.contains(&f.away_team.to_lowercase())
-            }).take(4).map(|r| {
-                let body = r.note.trim();
-                let body = if body.is_empty() { r.content.chars().take(400).collect::<String>() } else { body.to_string() };
-                format!("- {}: {}", r.title, body)
-            }).collect::<Vec<_>>().join("\n")
-        }).unwrap_or_default()
+        db::ingest_for_fixture(&conn)
+            .ok()
+            .map(|rows| {
+                rows.into_iter()
+                    .filter(|r| r.status == "processed")
+                    .filter_map(|r| {
+                        let fl = crate::odds::fold(&r.fixture_label.clone().unwrap_or_default());
+                        // Resolved id matches exactly; else BOTH teams must match
+                        // (one-team contains() fed wrong-fixture pages in here).
+                        let id_match = r.fixture_id == Some(f.fixture_id);
+                        if !id_match
+                            && !(crate::odds::team_match(&fl, &f.home_team) && crate::odds::team_match(&fl, &f.away_team))
+                        {
+                            return None;
+                        }
+                        let v = serde_json::from_str::<Value>(r.extracted_json.as_deref()?).ok()?;
+                        // Skip archived (before UTC yesterday — see the build-path
+                        // comment: UTC *today* hid same-day pages every evening).
+                        if v.get("date").and_then(|d| d.as_str()).map(|d| !d.is_empty() && d < today.as_str()).unwrap_or(false) {
+                            return None;
+                        }
+                        let d = compact_ingest_full(&v);
+                        if d.is_empty() { None } else { Some(format!("- {d}")) }
+                    })
+                    .take(4)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default()
     };
 
     let menu_block = lines.join("\n");
     let ingest_block = if ingest_notes.is_empty() { "(none)".to_string() } else { ingest_notes };
-    let system = "You are a sharp in-play football trader. From the supplied MENU you surface the BEST INDIVIDUAL bets (SINGLES) for the current game state — a POOL the user cherry-picks from, NOT one combined ticket. RULES: pick only indices that exist; never invent or alter a probability (the menu % is fixed and authoritative); the picks may point different ways or even mildly conflict — that's fine, they are separate singles, not a parlay; avoid near-duplicates (don't pick both '2+ shots' and 'to score' for the same player unless both are strong). Lean on who is ACTUALLY attempting/shooting (it's a numbers game) and the live momentum. Output strict JSON only, no prose.";
+    let system = "You are a sharp in-play football trader. From the supplied MENU you surface the BEST INDIVIDUAL bets (SINGLES) for the current game state — a POOL the user cherry-picks from, NOT one combined ticket. THE LIVE DATA IS YOUR PRIMARY, DECISIVE SIGNAL: the current score, shots, corners, momentum and time remaining OVERRIDE any pre-match number. Use the user's INGESTED / SCOUT pre-match stats (corners/cards/shots per game, form, xG) only as the BASELINE EXPECTATION, then judge the TRAJECTORY — is the game running ABOVE or BELOW that baseline? A side that averages 7 corners but is being pinned back → fade its corners; a modest side now camped in the opponent's half → its corners/shots/cards are live even if its season rate is low. When live and pre-match disagree, LIVE WINS. ASSESS FEASIBILITY IN THE MINUTES LEFT: only back an 'over' or 'to happen' pick the remaining time can realistically deliver — late in a game with little time, favour tight lines and things already trending, not a big burst that needs the whole match. PLAYER PROPS ARE THE EDGE: when the menu contains live player props (a player's 'N+ shots', 'N+ shots on target' or 'to score from here'), your pool MUST prominently feature them — the live shooters attempting right now are the highest-value in-play picks; do NOT return an all-team-markets pool when player props exist. RULES: pick only indices that exist; never invent or alter a probability (the menu % is fixed and authoritative); in each pick's why cite only the menu numbers and the live stats/events supplied — never an invented stat; picks may point different ways — they're separate singles, not a parlay; avoid near-duplicates (don't pick both '2+ shots' and 'to score' for the same player unless both are strong). Lean on who is ACTUALLY attempting/shooting right now (it's a numbers game). Output strict JSON only, no prose.";
     let user = format!(
-        "LIVE MATCH: {} {}-{} {} ({}', {} | {})\n\nLIVE STATS: {}\nEVENTS: {}\n\nINGESTED PAGE NOTES (your own clipped pages — soft context, don't trust blindly):\n{}\n\nMENU (pick by index — the ONLY picks you may use; the % is fixed, never change it):\n{}\n\nSurface the 5-8 BEST SINGLES for THIS game state right now — a pool to build from. Favour live shooters likely to do more, value vs the live odds, and any quiet threat the numbers say is due. Each is a STANDALONE single; do NOT try to make them combine. Output STRICT JSON only: {{\"legs\":[{{\"i\":<index>,\"why\":\"<6-12 words>\"}}],\"rationale\":\"<1 sentence on how the game is unfolding>\",\"confidence\":\"low|medium|high\"}}",
-        f.home_team, f.home_goals, f.away_goals, f.away_team, f.elapsed, f.status, f.league_name,
+        "LIVE MATCH: {} {}-{} {} ({}' played, ~{}' LEFT, {} | {})\n\n=== LIVE (primary — this is what's ACTUALLY happening) ===\nLIVE STATS: {}\nEVENTS: {}\n\n=== INGESTED / SCOUT pre-match stats (baseline expectation only — judge the trajectory against these) ===\n{}\n\nMENU (pick by index — the ONLY picks you may use; the % is fixed, never change it):\n{}\n\nSurface the 5-8 BEST SINGLES for THIS game state right now — a pool to build from. There are only ~{}' left: only back what that time can realistically deliver. Weigh the LIVE trajectory first, using the Scout baseline to spot where the game is over/under-performing expectation. PROMINENTLY include the live PLAYER PROPS (shooters) when present — that's the edge. Each is a STANDALONE single; do NOT try to make them combine. Output STRICT JSON only: {{\"legs\":[{{\"i\":<index>,\"why\":\"<6-12 words, cite live vs baseline>\"}}],\"rationale\":\"<1 sentence on the game's trajectory vs its pre-match expectation>\",\"confidence\":\"low|medium|high\"}}",
+        f.home_team, f.home_goals, f.away_goals, f.away_team, f.elapsed, remaining_min, f.status, f.league_name,
         if stat_str.is_empty() { "(none)" } else { &stat_str },
         if ev_str.is_empty() { "(none)" } else { &ev_str },
-        ingest_block, menu_block
+        ingest_block, menu_block, remaining_min
     );
 
     // Cache by live state + menu + model (token-budget rule: one call, cached).
@@ -4059,7 +4414,7 @@ pub async fn live_ticket(state: State<'_, AppState>, fixture: LiveFixture, model
             Some(v) => v,
             None => {
                 cached = false;
-                let (txt, gin, gout) = llm::chat_call(&state, &model, system, &user, 600).await?;
+                let (txt, gin, gout) = llm::chat_call(&state, &model, system, &user, 900).await?;
                 let conn = state.db.lock().map_err(|_| "db lock")?;
                 let _ = db::usage_add(&conn, af::now_ts(), &model, gin, gout, "live");
                 let _ = db::ai_put(&conn, &key, &txt, &model, af::now_ts());
@@ -4117,6 +4472,12 @@ pub async fn live_ticket(state: State<'_, AppState>, fixture: LiveFixture, model
 /// the sim only models co-occurrence, it never changes a leg's probability.
 #[tauri::command]
 pub fn price_sgp(legs: Vec<TicketLeg>) -> Result<crate::montecarlo::SgpPrice, String> {
+    // A leg with NO probability cannot be priced — the old silent 0.5 coin-flip
+    // FABRICATED a number and quietly poisoned the combined price (honest-data
+    // rule). Refuse instead; the UI treats the error as "no SGP price".
+    if legs.iter().any(|l| l.est_prob.or(l.pinnacle_prob).is_none()) {
+        return Err("a leg has no probability — correlated SGP price unavailable".to_string());
+    }
     let sim_legs: Vec<crate::montecarlo::SimLeg> = legs
         .iter()
         .map(|l| {
@@ -4271,6 +4632,13 @@ pub fn update_ingest_note(state: State<AppState>, id: i64, note: String) -> Resu
     db::ingest_set_note(&conn, id, &note)
 }
 
+/// Manually assign an ingested page to a fixture ("Home vs Away" + optional date).
+#[tauri::command]
+pub fn assign_ingest_fixture(state: State<AppState>, id: i64, label: String, date: Option<String>) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|_| "db lock")?;
+    db::ingest_set_fixture(&conn, id, label.trim(), date.as_deref().unwrap_or("").trim())
+}
+
 /// Run Haiku over an ingested page: structure it + tag the fixture it's about.
 #[tauri::command]
 pub async fn process_ingested(
@@ -4284,7 +4652,7 @@ pub async fn process_ingested(
     };
     let model = model
         .filter(|m| llm::is_allowed_analysis_model(m))
-        .unwrap_or_else(|| "claude-haiku-4-5".to_string());
+        .unwrap_or_else(|| llm::DETERMINISTIC_MODEL.to_string()); // ingest scraping = DeepSeek
     let model = model.as_str();
     let (json, gin, gout) = llm::extract_ingest(&state, model, &row.content, &row.note).await?;
     let v: Value = serde_json::from_str(&json).unwrap_or_else(|_| serde_json::json!({}));
@@ -4307,47 +4675,614 @@ pub fn delete_bet(state: State<AppState>, id: i64) -> Result<(), String> {
     db::delete_placed(&conn, id)
 }
 
-/// Grade an open bet against results. Status: won / lost / partial / open.
+/// Set the combined odds on an OPEN bet, then settle it. This is the Tracker's
+/// "add odds" flow: a winning ticket placed without a price now stays open
+/// (instead of settling break-even) until the user supplies the real odds.
+#[tauri::command]
+pub async fn set_bet_odds(state: State<'_, AppState>, id: i64, odds: f64) -> Result<PlacedBet, String> {
+    if !(1.0..=10_000.0).contains(&odds) {
+        return Err("odds must be a decimal price above 1.0".to_string());
+    }
+    {
+        let conn = state.db.lock().map_err(|_| "db lock")?;
+        let row = db::get_placed(&conn, id)?.ok_or_else(|| "bet not found".to_string())?;
+        if row.settled {
+            return Err("bet already settled".to_string());
+        }
+        let mut ticket: Ticket = serde_json::from_str(&row.ticket_json).map_err(|e| e.to_string())?;
+        ticket.combined_odds = Some((odds * 100.0).round() / 100.0);
+        let tj = serde_json::to_string(&ticket).map_err(|e| e.to_string())?;
+        db::set_bet_odds(&conn, id, &tj)?;
+    }
+    let mut cache = settle::ResultCache::default();
+    settle_bet_inner(&state, id, &mut cache).await
+}
+
+/// Grade an open bet against results. Status: won / lost / partial / void / open.
 #[tauri::command]
 pub async fn settle_bet(state: State<'_, AppState>, id: i64) -> Result<PlacedBet, String> {
+    let mut cache = settle::ResultCache::default();
+    settle_bet_inner(&state, id, &mut cache).await
+}
+
+/// Settlement core, sharing a fixture-result cache across calls. Book rules:
+/// void legs drop out of the parlay (their odds become 1.0); an all-void ticket
+/// pushes (stake back). A winning ticket with UNKNOWN odds stays OPEN — a
+/// break-even placeholder would silently erase real profit from the bankroll.
+async fn settle_bet_inner(
+    state: &AppState,
+    id: i64,
+    cache: &mut settle::ResultCache,
+) -> Result<PlacedBet, String> {
     let row = {
         let conn = state.db.lock().map_err(|_| "db lock")?;
         db::get_placed(&conn, id)?.ok_or_else(|| "bet not found".to_string())?
     };
     let ticket: Ticket = serde_json::from_str(&row.ticket_json).map_err(|e| e.to_string())?;
 
-    let leg_results = settle::grade_legs(&state, &ticket.legs).await;
-    let graded = leg_results.iter().filter(|r| r.won.is_some()).count();
+    let leg_results = settle::grade_legs_cached(state, &ticket.legs, cache).await;
     let total = leg_results.len();
+    let voids = leg_results.iter().filter(|r| r.void).count();
+    let pending = leg_results.iter().filter(|r| r.won.is_none() && !r.void).count();
     let any_lost = leg_results.iter().any(|r| r.won == Some(false));
     let any_won = leg_results.iter().any(|r| r.won == Some(true));
 
-    let (status, settled, returns) = if total == 0 {
-        ("open".to_string(), false, 0.0)
-    } else if graded < total {
+    let (status, settled, returns) = if total == 0 || pending > 0 {
         ("open".to_string(), false, 0.0) // not all matches finished yet
     } else if any_lost {
         let s = if any_won { "partial" } else { "lost" };
         (s.to_string(), true, 0.0)
+    } else if voids == total {
+        // Every leg void (postponements/non-features) → push, stake refunded.
+        ("void".to_string(), true, (row.stake * 100.0).round() / 100.0)
     } else {
-        // all legs won
-        let payout = match ticket.combined_odds {
-            Some(o) if o > 0.0 => row.stake * o,
-            _ => row.stake, // unknown odds → break-even placeholder
+        // All non-void legs won. Void legs settle at odds 1.0, so recompute the
+        // payout from the surviving legs' book odds where we have them all.
+        let live_odds: Vec<Option<f64>> = ticket
+            .legs
+            .iter()
+            .zip(leg_results.iter())
+            .filter(|(_, r)| !r.void)
+            .map(|(l, _)| l.book_odds)
+            .collect();
+        let payout_odds = if voids == 0 {
+            ticket.combined_odds
+        } else if live_odds.iter().all(|o| o.is_some()) {
+            Some(live_odds.iter().map(|o| o.unwrap()).product::<f64>())
+        } else {
+            None
         };
-        ("won".to_string(), true, (payout * 100.0).round() / 100.0)
+        match payout_odds {
+            Some(o) if o > 0.0 => ("won".to_string(), true, (row.stake * o * 100.0).round() / 100.0),
+            // Unknown odds: stay open rather than fabricate a break-even payout.
+            // The legs are graded (all green) so the UI can prompt for the odds.
+            _ => ("open".to_string(), false, 0.0),
+        }
     };
 
     let lr_json = serde_json::to_string(&leg_results).map_err(|e| e.to_string())?;
     {
         let conn = state.db.lock().map_err(|_| "db lock")?;
         db::update_settlement(&conn, id, &status, returns, &lr_json, settled)?;
+    }
+    // Closing-line value, captured once at settlement. Win/loss needs hundreds
+    // of bets to separate skill from variance; consistently beating the close
+    // proves edge in dozens. Best-effort — missing closing odds → no CLV.
+    if settled && row.clv.is_none() {
+        let _ = capture_clv(state, id, &ticket, cache).await;
+    }
+    {
+        let conn = state.db.lock().map_err(|_| "db lock")?;
         let r = db::get_placed(&conn, id)?.ok_or_else(|| "bet not found".to_string())?;
         row_to_bet(&r)
     }
 }
 
-/// Settle every open bet; returns the full updated list.
+/// Today's date in the USER'S configured timezone (Settings → timezone), for
+/// every user-facing day boundary: bet/ledger days, Grok digest date, ingest
+/// archiving. The REQUEST METER intentionally stays UTC — API-Football's quota
+/// resets at 00:00 UTC, so metering any other way would drift from the provider.
+fn local_today(state: &AppState) -> String {
+    let tz = state
+        .keys
+        .lock()
+        .ok()
+        .and_then(|k| k.timezone.clone())
+        .unwrap_or_default();
+    match tz.parse::<chrono_tz::Tz>() {
+        Ok(z) => chrono::Utc::now().with_timezone(&z).format("%Y-%m-%d").to_string(),
+        Err(_) => af::today(),
+    }
+}
+
+/// One correlated combo the copula priced as +EV at the naive product price.
+pub struct ApexCombo {
+    pub idx: Vec<usize>,
+    pub price: crate::montecarlo::SgpPrice,
+    pub product_odds: f64,
+    pub corr_ev: f64,
+}
+
+/// APEX correlation hunter: search each fixture's PRICED legs for combos where
+/// the naive product price OVERPAYS the true joint probability — i.e. the legs
+/// are positively correlated (copula lift > 1) but the book prices them near-
+/// independently. This is the structural SGP edge: `corr_ev = product_odds ×
+/// correlated_prob − 1`. All deterministic (Monte-Carlo, seeded); the model
+/// only copies the winning combos into tickets. Returns the global top 8
+/// (max 3 per fixture) sorted by corr-EV.
+fn apex_top_combos(cands: &[Candidate]) -> Vec<ApexCombo> {
+    use crate::montecarlo::{is_scoreline_market, sgp_probability, theme_of, SimLeg};
+    const SEARCH_SIMS: usize = 8_000;
+    const MIN_LIFT: f64 = 1.08;
+    const MIN_CORR_EV: f64 = 0.02;
+
+    let mut by_fix: HashMap<i64, Vec<usize>> = HashMap::new();
+    for (i, c) in cands.iter().enumerate() {
+        // Eligible: priced in a sane band (longshot-bias guard), a real fair
+        // marginal, no availability risk, and model↔sharp agreement when both
+        // exist (a big gap means one estimate is wrong — don't build on it).
+        let priced = matches!(c.book_odds, Some(o) if (1.30..=3.60).contains(&o));
+        let fair = c.pinnacle_prob.unwrap_or(c.est_prob);
+        let agree = c.pinnacle_prob.map(|p| (p - c.est_prob).abs() < 0.10).unwrap_or(true);
+        let risky = c.flags.iter().any(|f| f.contains("unlikely to feature") || f.contains("minutes at risk"));
+        if priced && agree && !risky && (0.25..=0.90).contains(&fair) {
+            by_fix.entry(c.fixture_id).or_default().push(i);
+        }
+    }
+
+    let mut all: Vec<ApexCombo> = Vec::new();
+    for (fid, mut idx) in by_fix {
+        // Rank by fair probability and keep the top 10 → ≤165 combos to price.
+        idx.sort_by(|a, b| {
+            let fa = cands[*a].pinnacle_prob.unwrap_or(cands[*a].est_prob);
+            let fb = cands[*b].pinnacle_prob.unwrap_or(cands[*b].est_prob);
+            fb.partial_cmp(&fa).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        idx.truncate(10);
+        let sim_of = |i: usize| -> SimLeg {
+            let c = &cands[i];
+            SimLeg {
+                fixture_id: fid,
+                subject: crate::odds::fold(&c.subject),
+                theme: theme_of(&c.market, &c.line, &c.subject),
+                prob: c.pinnacle_prob.unwrap_or(c.est_prob),
+                scoreline: is_scoreline_market(&c.market),
+            }
+        };
+        // Never stack the same subject (nested legs) or the same market+team.
+        let compatible = |a: usize, b: usize| -> bool {
+            let (x, y) = (&cands[a], &cands[b]);
+            crate::odds::fold(&x.subject) != crate::odds::fold(&y.subject)
+                && !(x.market == y.market && x.team == y.team)
+        };
+        let mut combos: Vec<Vec<usize>> = Vec::new();
+        for a in 0..idx.len() {
+            for b in (a + 1)..idx.len() {
+                if !compatible(idx[a], idx[b]) {
+                    continue;
+                }
+                combos.push(vec![idx[a], idx[b]]);
+                for c3 in (b + 1)..idx.len() {
+                    if compatible(idx[a], idx[c3]) && compatible(idx[b], idx[c3]) {
+                        combos.push(vec![idx[a], idx[b], idx[c3]]);
+                    }
+                }
+            }
+        }
+        let mut fixture_best: Vec<ApexCombo> = Vec::new();
+        for combo in combos {
+            let legs: Vec<SimLeg> = combo.iter().map(|&i| sim_of(i)).collect();
+            let price = sgp_probability(&legs, SEARCH_SIMS);
+            let product_odds: f64 = combo.iter().map(|&i| cands[i].book_odds.unwrap_or(1.0)).product();
+            let corr_ev = product_odds * price.correlated - 1.0;
+            if price.lift >= MIN_LIFT && corr_ev >= MIN_CORR_EV {
+                fixture_best.push(ApexCombo { idx: combo, price, product_odds, corr_ev });
+            }
+        }
+        // Top 3 per fixture so one match can't flood the slate.
+        fixture_best.sort_by(|a, b| b.corr_ev.partial_cmp(&a.corr_ev).unwrap_or(std::cmp::Ordering::Equal));
+        all.extend(fixture_best.into_iter().take(3));
+    }
+    all.sort_by(|a, b| b.corr_ev.partial_cmp(&a.corr_ev).unwrap_or(std::cmp::Ordering::Equal));
+    all.truncate(8);
+    all
+}
+
+/// Render the top combos as prompt lines for the Apex strategy block.
+fn apex_combo_block(cands: &[Candidate]) -> String {
+    apex_top_combos(cands)
+        .into_iter()
+        .map(|cb| {
+            let legs_txt = cb
+                .idx
+                .iter()
+                .map(|&i| {
+                    let c = &cands[i];
+                    format!("[{} | {} | {} @ {:.2}]", c.subject, c.market, c.line, c.book_odds.unwrap_or(0.0))
+                })
+                .collect::<Vec<_>>()
+                .join(" + ");
+            format!(
+                "- {}: {} → correlated {:.0}% vs naive {:.0}% (lift x{:.2}), combined @{:.2}, corr-EV {:+.1}%",
+                cands[cb.idx[0]].fixture,
+                legs_txt,
+                cb.price.correlated * 100.0,
+                cb.price.independent * 100.0,
+                cb.price.lift,
+                cb.product_odds,
+                cb.corr_ev * 100.0
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 🧬 DARWIN sweep: a POPULATION of deterministic micro-strategies paper-trades
+/// this slate at ZERO token cost. Each variant selects legs by one narrow,
+/// testable hypothesis and writes its tickets to the generated ledger under
+/// "dw:<name>"; auto-settlement + the Ledger report become the fitness
+/// function. Instead of arguing about which strategy is best, the tool BREEDS
+/// the answer: variants that keep winning earn real stakes, variants that
+/// don't die in paper. Costs nothing but the candidates it already gathered.
+#[tauri::command]
+pub async fn darwin_sweep(
+    state: State<'_, AppState>,
+    fixtures: Vec<FixtureInput>,
+    markets: Vec<String>,
+) -> Result<Vec<String>, String> {
+    if fixtures.is_empty() {
+        return Err("Select at least one match first.".to_string());
+    }
+    let books = {
+        let keys = state.keys.lock().map_err(|_| "keys lock")?;
+        keys.books.clone()
+    };
+    let markets: Vec<String> = if markets.is_empty() {
+        ALL_MARKETS.iter().map(|s| s.to_string()).collect()
+    } else {
+        markets
+    };
+    let cands = gather_candidates(&state, &fixtures, &markets, &books).await;
+    if cands.is_empty() {
+        return Err("No candidate legs for these fixtures/markets.".to_string());
+    }
+
+    // Line-room mining input: markets whose settled ledger shows overs clearing
+    // the line with ROOM (avg margin ≥ +0.75) — the book's line is set low.
+    let lineroom: HashMap<String, f64> = {
+        let conn = state.db.lock().map_err(|_| "db lock")?;
+        let mut agg: HashMap<String, (f64, i64)> = HashMap::new();
+        for (tj, lrj) in db::gen_settled(&conn).unwrap_or_default() {
+            let legs = serde_json::from_str::<Ticket>(&tj).map(|t| t.legs).unwrap_or_default();
+            let results: Vec<LegResult> = serde_json::from_str(&lrj).unwrap_or_default();
+            for (leg, res) in legs.iter().zip(results.iter()) {
+                if res.void {
+                    continue;
+                }
+                if let Some(m) = res.margin {
+                    if leg.line.as_deref().unwrap_or("").to_lowercase().starts_with("over") {
+                        let e = agg.entry(leg.market.clone()).or_insert((0.0, 0));
+                        e.0 += m;
+                        e.1 += 1;
+                    }
+                }
+            }
+        }
+        agg.into_iter()
+            .filter(|(_, (_, n))| *n >= 8)
+            .map(|(k, (sum, n))| (k, sum / n as f64))
+            .collect()
+    };
+
+    let score_desc = |a: &Candidate, b: &Candidate| b.est_prob.partial_cmp(&a.est_prob).unwrap_or(std::cmp::Ordering::Equal);
+    let mut tickets: Vec<(&'static str, Ticket)> = Vec::new();
+
+    // Singles from a filtered, ranked view — one hypothesis per variant.
+    let mut singles = |name: &'static str, mut pool: Vec<&Candidate>, n: usize, tickets: &mut Vec<(&'static str, Ticket)>| {
+        pool.sort_by(|a, b| score_desc(a, b));
+        for c in pool.into_iter().take(n) {
+            let t = make_ladder_ticket(std::slice::from_ref(c), &format!("🧬 {name} · {}", c.subject));
+            tickets.push((name, t));
+        }
+    };
+
+    // dw:sharp2 / dw:sharp5 — the top-down edge at two thresholds (which EV bar
+    // actually survives the vig? let the ledger answer).
+    let sharp = |min_ev: f64| -> Vec<&Candidate> {
+        cands.iter()
+            .filter(|c| c.ev_source.as_deref() == Some("sharp") && c.ev.unwrap_or(-1.0) >= min_ev)
+            .collect()
+    };
+    singles("dw:sharp2", sharp(0.02), 4, &mut tickets);
+    singles("dw:sharp5", sharp(0.05), 3, &mut tickets);
+
+    // dw:formgap — recent rate far above season (role change the book hasn't
+    // repriced). The tool computes BOTH rates; the gap is the hypothesis.
+    let gapped: Vec<&Candidate> = cands.iter()
+        .filter(|c| c.est_prob >= 0.50 && c.flags.iter().any(|f| f.starts_with("form-gap")))
+        .collect();
+    singles("dw:formgap", gapped, 4, &mut tickets);
+
+    // dw:lineroom — overs on count markets whose OWN settled history clears the
+    // line with room to spare (margin mining: hit-rate says "win", margin says
+    // "the line is set too low").
+    let room: Vec<&Candidate> = cands.iter()
+        .filter(|c| {
+            c.line.to_lowercase().starts_with("over")
+                && c.est_prob >= 0.55
+                && lineroom.get(&c.market).map(|m| *m >= 0.75).unwrap_or(false)
+        })
+        .collect();
+    singles("dw:lineroom", room, 4, &mut tickets);
+
+    // dw:corrlift — the copula's best correlated combos as real tickets.
+    for cb in apex_top_combos(&cands).into_iter().take(2) {
+        let legs: Vec<Candidate> = cb.idx.iter().map(|&i| cands[i].clone()).collect();
+        let t = make_ladder_ticket(&legs, &format!("🧬 dw:corrlift · lift x{:.2}", cb.price.lift));
+        tickets.push(("dw:corrlift", t));
+    }
+
+    // dw:shooters — the user's cross-game shape: one SOT/shots leg per match,
+    // truly independent legs, product price.
+    let mut shooters: Vec<&Candidate> = cands.iter()
+        .filter(|c| matches!(c.market_group.as_str(), "sot" | "pshots") && c.est_prob >= 0.55)
+        .collect();
+    shooters.sort_by(|a, b| score_desc(a, b));
+    let mut per_fix: HashSet<i64> = HashSet::new();
+    let mut acca: Vec<Candidate> = Vec::new();
+    for c in shooters {
+        if acca.len() >= 5 {
+            break;
+        }
+        if per_fix.insert(c.fixture_id) {
+            acca.push(c.clone());
+        }
+    }
+    if acca.len() >= 3 {
+        let t = make_ladder_ticket(&acca, &format!("🧬 dw:shooters · {} legs, 1/match", acca.len()));
+        tickets.push(("dw:shooters", t));
+    }
+
+    // dw:chalk3 — the favourite-longshot bias played from the OTHER side: short
+    // prices are the least-overpriced part of the book; does a 3-leg chalk acca
+    // out-earn its ~1.3x-per-leg drag?
+    let mut chalk: Vec<&Candidate> = cands.iter()
+        .filter(|c| matches!(c.book_odds, Some(o) if (1.25..=1.60).contains(&o)))
+        .collect();
+    chalk.sort_by(|a, b| score_desc(a, b));
+    let mut per_fix: HashSet<i64> = HashSet::new();
+    let mut legs3: Vec<Candidate> = Vec::new();
+    for c in chalk {
+        if legs3.len() >= 3 {
+            break;
+        }
+        if per_fix.insert(c.fixture_id) {
+            legs3.push(c.clone());
+        }
+    }
+    if legs3.len() == 3 {
+        let t = make_ladder_ticket(&legs3, "🧬 dw:chalk3 · cross-game chalk treble");
+        tickets.push(("dw:chalk3", t));
+    }
+
+    // dw:contra-under — our model sees LESS scoring than the sharp line. Unders
+    // are where public over-bias leaves value; test whether OUR under read wins.
+    let unders: Vec<&Candidate> = cands.iter()
+        .filter(|c| {
+            c.line.to_lowercase().starts_with("under")
+                && matches!(c.pinnacle_prob, Some(p) if c.est_prob >= p + 0.03)
+        })
+        .collect();
+    singles("dw:contra-under", unders, 3, &mut tickets);
+
+    // Record everything to the paper ledger (dedup per day+strategy+sig is
+    // built into gen_add, so re-sweeping the same slate is idempotent).
+    let day = local_today(&state);
+    let mut counts: HashMap<&'static str, usize> = HashMap::new();
+    {
+        let conn = state.db.lock().map_err(|_| "db lock")?;
+        for (name, t) in &tickets {
+            let mut sig: Vec<String> = t
+                .legs
+                .iter()
+                .map(|l| format!("{}|{}|{}", l.market, l.selection, l.line.clone().unwrap_or_default()))
+                .collect();
+            sig.sort();
+            if let Ok(tj) = serde_json::to_string(t) {
+                let _ = db::gen_add(&conn, af::now_ts(), &day, name, false, &t.kind, &sig.join("##"), &tj, t.combined_odds);
+                *counts.entry(name).or_insert(0) += 1;
+            }
+        }
+    }
+    let mut summary: Vec<String> = counts
+        .into_iter()
+        .map(|(k, v)| format!("{k}: {v} paper ticket(s)"))
+        .collect();
+    summary.sort();
+    if summary.is_empty() {
+        summary.push("No variant found qualifying legs on this slate (thin data or unpriced markets).".to_string());
+    }
+    Ok(summary)
+}
+
+/// Snapshot the CLOSING odds for open bets' fixtures near kickoff (called by
+/// the background loop in lib.rs). Writes the /odds response into the normal
+/// cache with a long TTL, so `capture_clv`'s cache-first read later finds the
+/// true closing line. One snapshot per fixture (marker in ai_results).
+pub async fn closing_snapshot_tick(state: &AppState) -> Result<(), String> {
+    // Fixture ids on OPEN bets only — nothing else needs a closing line.
+    let fids: Vec<i64> = {
+        let conn = state.db.lock().map_err(|_| "db lock")?;
+        let mut set: HashSet<i64> = HashSet::new();
+        for row in db::list_placed(&conn)?.into_iter().filter(|r| !r.settled) {
+            if let Ok(t) = serde_json::from_str::<Ticket>(&row.ticket_json) {
+                set.extend(t.legs.iter().map(|l| l.fixture_id).filter(|f| *f != 0));
+            }
+        }
+        set.into_iter().collect()
+    };
+    let now = af::now_ts();
+    for fid in fids {
+        let marker = format!("closing-snap:{fid}");
+        let already = {
+            let conn = state.db.lock().map_err(|_| "db lock")?;
+            db::ai_get(&conn, &marker)?.is_some()
+        };
+        if already {
+            continue;
+        }
+        // Kickoff time from the (cheap, cached) fixture row.
+        let ko = af::cached_get(state, "/fixtures", vec![("id", fid.to_string())], af::TTL_FIXTURES)
+            .await
+            .ok()
+            .and_then(|j| {
+                response_array(&j)
+                    .first()
+                    .and_then(|e| e.get("fixture"))
+                    .and_then(|f| f.get("date"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|d| chrono::DateTime::parse_from_rfc3339(d).ok())
+                    .map(|dt| dt.timestamp())
+            });
+        let Some(ko) = ko else { continue };
+        // Window: 20 min before kickoff to 10 min after — the closing line.
+        if now >= ko - 1200 && now <= ko + 600 {
+            if af::fetch_live(state, "/odds", vec![("fixture", fid.to_string())], settle::TTL_RESULT)
+                .await
+                .is_ok()
+            {
+                let conn = state.db.lock().map_err(|_| "db lock")?;
+                let _ = db::ai_put(&conn, &marker, "1", "closing-snapshot", af::now_ts());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Map a leg's market display name back to its odds-attach group key.
+fn market_group_of(market: &str) -> Option<&'static str> {
+    Some(match market {
+        "Anytime Scorer" => "scorer",
+        "Anytime Assist" => "assists",
+        "To Be Carded" => "cards",
+        "Shots on Target" => "sot",
+        "Player Shots" => "pshots",
+        "Fouls Committed" | "Fouls Drawn" => "fouls",
+        "Tackles" => "tackles",
+        "Passes Completed" => "passes",
+        "Goalkeeper Saves" => "saves",
+        "BTTS" => "btts",
+        "Team Total Goals" => "tgoals",
+        "Team Corners" => "tcorners",
+        "Team Total Cards" => "tcards",
+        "Team Offsides" => "toffsides",
+        "Both Teams Carded" => "bothcards",
+        "Most Cards" => "mostcards",
+        "Match Result" => "win",
+        "Double Chance" => "dc",
+        "Correct Score" => "exactscore",
+        "Asian Handicap" => "ahandicap",
+        m if (m.starts_with("Over ") || m.starts_with("Under ")) && m.ends_with("Goals") => "ou25",
+        m if m.contains("1st Half") && m.ends_with("Goals") => "h1goals",
+        m if m.contains("2nd Half") && m.ends_with("Goals") => "h2goals",
+        _ => return None,
+    })
+}
+
+/// Compute + store CLV for a just-settled bet: re-fetch each fixture's odds
+/// (post-match the API returns its LAST pre-kickoff update ≈ the closing line;
+/// cache-first so repeat settles are free) and compare each leg's placed price.
+async fn capture_clv(
+    state: &AppState,
+    id: i64,
+    ticket: &Ticket,
+    cache: &settle::ResultCache,
+) -> Result<(), String> {
+    let books = {
+        let keys = state.keys.lock().map_err(|_| "keys lock")?;
+        keys.books.clone()
+    };
+    // Legs that recorded a price at placement, grouped by fixture.
+    let mut by_fixture: HashMap<i64, Vec<&TicketLeg>> = HashMap::new();
+    for l in ticket.legs.iter().filter(|l| l.book_odds.is_some() && l.fixture_id != 0) {
+        by_fixture.entry(l.fixture_id).or_default().push(l);
+    }
+    if by_fixture.is_empty() {
+        return Ok(());
+    }
+    let mut details: Vec<serde_json::Value> = Vec::new();
+    let mut clvs: Vec<f64> = Vec::new();
+    for (fid, legs) in by_fixture {
+        // NOTE: if a pre-match /odds cache row is still fresh (settling within
+        // an hour of the last build) this compares against that snapshot rather
+        // than the true close — acceptable drift for a desktop tracker.
+        let oj = match af::fetch_priority(state, "/odds", vec![("fixture", fid.to_string())], settle::TTL_RESULT).await {
+            Ok(j) => j,
+            Err(_) => continue,
+        };
+        let odds = crate::odds::parse_fixture_odds(&oj, &books);
+        let home = cache.home_of(fid).unwrap_or_default();
+        // Pseudo-candidates so attach_odds does the market/selection matching.
+        let mut cands: Vec<Candidate> = legs
+            .iter()
+            .filter_map(|l| {
+                let group = market_group_of(&l.market)?;
+                Some(Candidate {
+                    subject: l.selection.clone(),
+                    subject_kind: String::new(),
+                    team: l.team.clone().unwrap_or_default(),
+                    opponent: String::new(),
+                    fixture: l.r#match.clone(),
+                    fixture_id: fid,
+                    market: l.market.clone(),
+                    market_group: group.to_string(),
+                    line: l.line.clone().unwrap_or_default(),
+                    base_rate: 0.0,
+                    est_prob: l.est_prob.unwrap_or(0.5),
+                    pinnacle_prob: None,
+                    book_odds: None,
+                    book: None,
+                    ev: None,
+                    ev_source: None,
+                    form_state: None,
+                    xg_source: None,
+                    support: vec![],
+                    flags: vec![],
+                    plausibility: None,
+                    raw_prob: None,
+                })
+            })
+            .collect();
+        let label = legs.first().map(|l| l.r#match.clone()).unwrap_or_default();
+        features::attach_odds(&mut cands, &odds, &label, &home);
+        for c in &cands {
+            let placed = ticket
+                .legs
+                .iter()
+                .find(|l| l.selection == c.subject && l.market == c.market)
+                .and_then(|l| l.book_odds);
+            if let (Some(p), Some(close)) = (placed, c.book_odds) {
+                if close > 1.0 && p > 1.0 {
+                    let clv = round4(p / close - 1.0);
+                    clvs.push(clv);
+                    details.push(serde_json::json!({
+                        "selection": c.subject, "market": c.market,
+                        "placed": p, "close": close, "clv": clv
+                    }));
+                }
+            }
+        }
+    }
+    if clvs.is_empty() {
+        return Ok(());
+    }
+    let avg = round4(clvs.iter().sum::<f64>() / clvs.len() as f64);
+    let conn = state.db.lock().map_err(|_| "db lock")?;
+    db::set_bet_clv(&conn, id, avg, &serde_json::to_string(&details).unwrap_or_default())
+}
+
+/// Settle every open bet; returns the full updated list. One shared
+/// fixture-result cache for the run — N bets on one fixture = one fetch.
 #[tauri::command]
 pub async fn settle_all(state: State<'_, AppState>) -> Result<Vec<PlacedBet>, String> {
     let open_ids: Vec<i64> = {
@@ -4358,8 +5293,9 @@ pub async fn settle_all(state: State<'_, AppState>) -> Result<Vec<PlacedBet>, St
             .map(|r| r.id)
             .collect()
     };
+    let mut cache = settle::ResultCache::default();
     for id in open_ids {
-        let _ = settle_bet(state.clone(), id).await;
+        let _ = settle_bet_inner(&state, id, &mut cache).await;
     }
     list_bets(state)
 }

@@ -34,6 +34,9 @@ pub struct Keys {
     /// OpenAI key — GPT models as a second analysis angle (optional).
     #[serde(default)]
     pub openai: Option<String>,
+    /// DeepSeek key — cheap high-context model used as the default engine.
+    #[serde(default)]
+    pub deepseek: Option<String>,
     /// Parlay API key (parlay-api.com) — sharp odds, de-vig, +EV scanner.
     #[serde(default)]
     pub parlay: Option<String>,
@@ -92,6 +95,9 @@ impl Keys {
         }
         if keys.openai.is_none() {
             keys.openai = std::env::var("OPENAI_API_KEY").ok().filter(|s| !s.is_empty());
+        }
+        if keys.deepseek.is_none() {
+            keys.deepseek = std::env::var("DEEPSEEK_API_KEY").ok().filter(|s| !s.is_empty());
         }
         if keys.parlay.is_none() {
             keys.parlay = std::env::var("PARLAY_API_KEY").ok().filter(|s| !s.is_empty());
@@ -172,7 +178,10 @@ pub fn run() {
             }
 
             let http = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(180))
+                // Generous: a thinking-capable model (Sonnet 5 / Opus) on a big
+                // Scout prompt can take a while; a short timeout surfaces as the
+                // confusing "error sending request for url".
+                .timeout(std::time::Duration::from_secs(300))
                 .user_agent("powabet/0.1")
                 .build()
                 .map_err(std::io::Error::other)?;
@@ -182,10 +191,28 @@ pub fn run() {
                 http,
                 keys: Mutex::new(keys),
                 settings_path,
-                // Start in the past so the first request isn't delayed.
+                // Start in the past so the first request isn't delayed. Instant
+                // is boot-relative — a bare subtraction panics if the machine
+                // booted <60s ago.
                 throttle: tokio::sync::Mutex::new(
-                    std::time::Instant::now() - std::time::Duration::from_secs(60),
+                    std::time::Instant::now()
+                        .checked_sub(std::time::Duration::from_secs(60))
+                        .unwrap_or_else(std::time::Instant::now),
                 ),
+            });
+
+            // CLOSING-LINE snapshot loop: every 10 minutes, check open bets'
+            // fixtures — if one is within its kickoff window, snapshot the odds
+            // (once) so CLV later compares against a TRUE closing line instead
+            // of the post-match approximation. Best-effort; only runs while the
+            // app is open, which is exactly when it costs nothing to have.
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+                    let state = handle.state::<AppState>();
+                    let _ = commands::closing_snapshot_tick(&state).await;
+                }
             });
             Ok(())
         })
@@ -204,6 +231,7 @@ pub fn run() {
             commands::evaluate_tickets,
             commands::settle_generated,
             commands::generated_report,
+            commands::darwin_sweep,
             commands::generated_report_by_kind,
             commands::generated_report_by_market,
             commands::export_data,
@@ -221,6 +249,7 @@ pub fn run() {
             commands::process_ingested,
             commands::delete_ingested,
             commands::update_ingest_note,
+            commands::assign_ingest_fixture,
             commands::save_ticket,
             commands::list_tickets,
             commands::list_grok_log,
@@ -236,6 +265,7 @@ pub fn run() {
             commands::delete_bet,
             commands::settle_bet,
             commands::settle_all,
+            commands::set_bet_odds,
         ])
         .run(tauri::generate_context!())
         .expect("error while running powabet");

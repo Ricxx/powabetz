@@ -34,16 +34,6 @@ pub fn grok_cost(input: i64, output: i64, sources: i64) -> f64 {
     (c * 10000.0).round() / 10000.0
 }
 
-const SYSTEM: &str = r#"You are a football betting research assistant. Use web + X search to surface the MOST RECENT info on this ONE match (last 24-48h, plus in-play if underway). Do only a FEW focused searches — do not over-search. Be concise:
-- OUT/DOUBTFUL: confirmed injuries, suspensions, illness, rotation — name the players. MOST IMPORTANT.
-- NEWS: lineup leaks, manager comments, returning players, weather if relevant.
-- SENTIMENT: what bettors on X are backing.
-- ANGLE: one short line (motivation, must-win, form).
-If unverified, say "unconfirmed" — never invent injuries or lineups.
-
-End with one line exactly:
-UNAVAILABLE: <semicolon-separated FULL names CONFIRMED out or suspended for this match; "none" if none>"#;
-
 /// Extract confirmed-unavailable names from EVERY "UNAVAILABLE:" line in the
 /// digest (one per match in a combined digest).
 pub fn parse_unavailable(digest: &str) -> Vec<String> {
@@ -87,7 +77,7 @@ fn build_system(categories: &[String]) -> String {
         s.push_str("\n- OUT/DOUBTFUL: confirmed injuries, suspensions, illness or rotation — name the players. MOST IMPORTANT.");
     }
     if has("news") {
-        s.push_str("\n- NEWS: lineup leaks, manager comments, returning players, weather if relevant.");
+        s.push_str("\n- NEWS: lineup leaks, manager comments, returning players.");
     }
     if has("bets") {
         s.push_str("\n- RECOMMENDED BETS: specific picks sharps/public are backing for this match.");
@@ -102,14 +92,17 @@ fn build_system(categories: &[String]) -> String {
         s.push_str("\n- OPINIONS: notable pundit/expert opinion or fan sentiment.");
     }
     if has("predictions") {
-        s.push_str("\n- PREDICTIONS: scoreline/result predictions being made.");
+        s.push_str("\n- PREDICTIONS: TEXT scoreline/result predictions only — most X prediction posts are graphics/cards you cannot read; skip those entirely.");
     }
     format!(
-        "You are a football betting research assistant. Use web + X search for the MOST RECENT info on this ONE match (last 24-48h, plus in-play if underway). Do only a FEW focused searches. Cover ONLY these, concisely:{s}\nIf unverified, say \"unconfirmed\" — never invent injuries or lineups.\n\nEnd with one line exactly:\nUNAVAILABLE: <semicolon-separated FULL names CONFIRMED out or suspended for this match; \"none\" if none>"
+        "You are a football betting research assistant. Use web + X search for the MOST RECENT info on this ONE match (last 24-48h, plus in-play if underway). Do only a FEW focused searches. Cover ONLY these, concisely:{s}\nTEXT ONLY: ignore posts whose substance is an image/graphic (prediction cards, bet-slip screenshots, stat graphics) — you cannot read them and must NEVER guess their contents.\nIf unverified, say \"unconfirmed\" — never invent injuries or lineups.\n\nEnd with one line exactly:\nUNAVAILABLE: <semicolon-separated FULL names out/suspended for this match — ONLY names a specific recent report explicitly confirms. This line REMOVES players from the user's betting pool: when in ANY doubt (rumour, old news, unclear wording) leave the name out; \"none\" if none>"
     )
 }
 
-fn cache_key(label: &str, date: &str) -> String {
+/// Cache key covers everything that changes the digest's CONTENT: live vs
+/// pre-match (a pre-match digest must not be served mid-game and vice versa)
+/// and the requested categories (different sections = a different digest).
+fn cache_key(label: &str, date: &str, live: bool, categories: &[String]) -> String {
     let mut h = Sha256::new();
     h.update(b"grok|");
     h.update(MODEL.as_bytes());
@@ -117,6 +110,9 @@ fn cache_key(label: &str, date: &str) -> String {
     h.update(label.as_bytes());
     h.update(b"|");
     h.update(date.as_bytes());
+    h.update(if live { b"|live" as &[u8] } else { b"|pre" });
+    h.update(b"|");
+    h.update(categories.join(",").as_bytes());
     format!("grok:{:x}", h.finalize())
 }
 
@@ -142,6 +138,26 @@ pub async fn fetch_digest(
     if matches.is_empty() {
         return Err("no matches".to_string());
     }
+    // Daily spend cap. Grok live-search calls are the app's most expensive per
+    // unit and, unlike API-Football, had NO limiter — a heavy build day could
+    // spend without bound. Cached digests still work when the cap is hit.
+    const GROK_DAILY_CAP_USD: f64 = 2.0;
+    {
+        let conn = state.db.lock().map_err(|_| "db lock".to_string())?;
+        let day_start = af::now_ts() - af::now_ts().rem_euclid(86_400);
+        let spent: f64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(cost_usd), 0) FROM grok_usage WHERE created_at >= ?1",
+                [day_start],
+                |r| r.get(0),
+            )
+            .unwrap_or(0.0);
+        if spent >= GROK_DAILY_CAP_USD {
+            return Err(format!(
+                "Grok daily spend cap reached (${spent:.2}/${GROK_DAILY_CAP_USD:.2}). Cached digests still work; fresh searches resume tomorrow."
+            ));
+        }
+    }
     let system = build_system(categories);
 
     let mut parts: Vec<String> = Vec::new();
@@ -152,7 +168,7 @@ pub async fn fetch_digest(
     // Run the uncached matches concurrently (Grok searches are slow + unthrottled).
     let mut pending = Vec::new();
     for label in matches {
-        let key = cache_key(label, date);
+        let key = cache_key(label, date, live, categories);
         let cached = {
             let conn = state.db.lock().map_err(|_| "db lock".to_string())?;
             db::cache_get(&conn, &key, now).ok().flatten()

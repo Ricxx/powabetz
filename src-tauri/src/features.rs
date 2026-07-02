@@ -70,8 +70,8 @@ const PHI_OFFSIDES: f64 = 1.15;
 // Per-PLAYER count props are overdispersed too — a player's shots/tackles vary
 // game to game with role, opponent and game state. Same NB treatment, slightly
 // milder factors (single-player counts are lower).
-const PHI_P_SHOTS: f64 = 1.20;
-const PHI_P_SOT: f64 = 1.15;
+pub const PHI_P_SHOTS: f64 = 1.20;
+pub const PHI_P_SOT: f64 = 1.15;
 const PHI_P_TACKLES: f64 = 1.20;
 const PHI_P_FOULS: f64 = 1.15;
 const PHI_P_SAVES: f64 = 1.20;
@@ -361,10 +361,13 @@ pub struct Consistency {
 
 /// Blend a season-average Poisson probability with the observed recent hit-rate.
 /// With enough appearances we lean on what ACTUALLY happens; otherwise we keep
-/// the model estimate. Returns (blended_prob, optional "N/M recent" note).
-fn blend_consistency(poisson: f64, rate: f64, apps: u32) -> (f64, Option<String>) {
+/// the model estimate. Returns (blended_prob, optional "N/M recent" note,
+/// form_gap) — form_gap flags a RECENT rate far above the season-implied one:
+/// the classic role-change signal (new position, new set-piece duty, teammate
+/// injured) that books pricing off season averages are slow to reprice.
+fn blend_consistency(poisson: f64, rate: f64, apps: u32) -> (f64, Option<String>, bool) {
     if apps < 3 {
-        return (poisson, None);
+        return (poisson, None, false);
     }
     // Shrinkage / empirical-Bayes: treat the season-average Poisson estimate as a
     // prior worth ~K pseudo-games, and weight the observed recent hit-rate by its
@@ -374,7 +377,8 @@ fn blend_consistency(poisson: f64, rate: f64, apps: u32) -> (f64, Option<String>
     let w = apps as f64 / (apps as f64 + K);
     let blended = (1.0 - w) * poisson + w * rate;
     let hits = (rate * apps as f64).round() as u32;
-    (clampp(blended), Some(format!("hit {hits}/{apps} recent")))
+    let gap = apps >= 4 && rate - poisson >= 0.20;
+    (clampp(blended), Some(format!("hit {hits}/{apps} recent")), gap)
 }
 
 // ---------- position-group baselines (empirical-Bayes prior) ----------
@@ -522,6 +526,7 @@ pub fn build_player_candidates_entry(
             support,
             flags,
             plausibility: None,
+            raw_prob: None,
         }
     };
 
@@ -530,7 +535,12 @@ pub fn build_player_candidates_entry(
             "scorer" => {
                 // xG only enters here, as one optional input.
                 let proxy_xg_p90 = sot_p90 * 0.30 + (shots_p90 - sot_p90).max(0.0) * 0.05;
-                let lambda = goals_p90.max(0.18 * sot_p90) * min_scale;
+                // BLEND actual scoring rate with the SOT-implied rate. The old
+                // `goals_p90.max(0.18*sot)` was one-directional — it could only
+                // RAISE the estimate, systematically inflating every scorer prob
+                // (and, via the model-EV fallback, manufacturing fake +EV). A
+                // weighted blend regresses noisy finishers both ways.
+                let lambda = (0.7 * goals_p90 + 0.3 * (0.18 * sot_p90)) * min_scale;
                 let mut est = pois_ge1(lambda);
                 let form = classify(goals_p90, proxy_xg_p90, sot_p90);
                 let mut flags = vec!["xG is estimated (proxy)".to_string()];
@@ -542,8 +552,11 @@ pub fn build_player_candidates_entry(
                     "due_regression" => flags.push("due: healthy chances despite drought".to_string()),
                     _ => {}
                 }
-                let (est_b, gnote) = blend_consistency(est, con.goal_rate, con.apps);
+                let (est_b, gnote, gap) = blend_consistency(est, con.goal_rate, con.apps);
                 est = est_b;
+                if gap {
+                    flags.push("form-gap: scoring well above season rate — book may lag".to_string());
+                }
                 let mut sup = vec![
                     format!("goals/90 {:.2}", goals_p90),
                     format!("sot/90 {:.2}", sot_p90),
@@ -564,7 +577,7 @@ pub fn build_player_candidates_entry(
                     sup.push(s.position.clone());
                 }
                 if hot {
-                    flags.push("in-form: among the league's top scorers/assisters this season".to_string());
+                    flags.push("in-form (league top scorer/assister)".to_string());
                 }
                 let mut c = base("Anytime Scorer", "scorer", "1+ goal", goals_p90, est, sup, flags);
                 c.form_state = Some(form);
@@ -578,12 +591,13 @@ pub fn build_player_candidates_entry(
                 } else {
                     ("1+ shot on target", nb_ge1(lambda, PHI_P_SOT), con.sot1_rate)
                 };
-                let (est, note) = blend_consistency(base_est, rate, con.apps);
+                let (est, note, gap) = blend_consistency(base_est, rate, con.apps);
                 let mut sup = vec![format!("sot/90 {:.2}", sot_p90), format!("exp_min {:.0}", exp_min)];
                 if let Some(n) = note {
                     sup.push(n);
                 }
-                out.push(base("Shots on Target", "sot", line, sot_p90, est, sup, vec![]));
+                let fl = if gap { vec!["form-gap: recent SOT rate well above season — book may lag".to_string()] } else { vec![] };
+                out.push(base("Shots on Target", "sot", line, sot_p90, est, sup, fl));
             }
             "tackles" => {
                 let lambda = tackles_p90 * workload * min_scale;
@@ -602,7 +616,7 @@ pub fn build_player_candidates_entry(
                         format!("tackles/90 {:.2}", tackles_p90),
                         format!("workload x{:.2} ({})", workload, if ctx.is_home { "home" } else { "away" }),
                     ],
-                    vec!["workload proxied from home/away (no odds)".to_string()],
+                    vec!["workload proxy".to_string()],
                 ));
             }
             "fouls" => {
@@ -619,7 +633,7 @@ pub fn build_player_candidates_entry(
                     fouls_p90,
                     cest,
                     vec![format!("fouls/90 {:.2}", fouls_p90)],
-                    vec!["workload proxied from home/away".to_string()],
+                    vec!["workload proxy".to_string()],
                 ));
                 let ld = fdrawn_p90 * min_scale;
                 out.push(base(
@@ -634,7 +648,7 @@ pub fn build_player_candidates_entry(
             }
             "cards" => {
                 let lambda = cards_p90 * workload * min_scale;
-                let (est, note) = blend_consistency(pois_ge1(lambda), con.card_rate, con.apps);
+                let (est, note, _gap) = blend_consistency(pois_ge1(lambda), con.card_rate, con.apps);
                 let mut sup = vec![format!("cards/90 {:.2}", cards_p90)];
                 let mut flags = vec![];
                 match note {
@@ -653,9 +667,15 @@ pub fn build_player_candidates_entry(
                 if expected < 8.0 {
                     continue; // not a passing role — skip rather than offer a junk line
                 }
-                let line_val = ((expected - 0.6 * expected.sqrt()) / 5.0).floor() * 5.0;
+                // Pass counts are FAR overdispersed vs Poisson (role, game state,
+                // scoreline chasing): var ≈ φ·mean with φ well above 1. The old
+                // sd = sqrt(mean) made every self-derived line a ~72% "banker" by
+                // construction. Use an honest spread so est_prob reflects reality.
+                const PHI_P_PASSES: f64 = 6.0;
+                let sd = (expected * PHI_P_PASSES).sqrt().max(1.0);
+                let line_val = ((expected - 0.75 * sd) / 5.0).floor() * 5.0;
                 let line_val = line_val.max(10.0);
-                let z = (expected - line_val + 0.5) / expected.max(1.0).sqrt();
+                let z = (expected - line_val + 0.5) / sd;
                 out.push(base(
                     "Passes Completed",
                     "passes",
@@ -693,7 +713,7 @@ pub fn build_player_candidates_entry(
                     continue;
                 }
                 let af = if hot {
-                    vec!["in-form: among the league's top scorers/assisters this season".to_string()]
+                    vec!["in-form (league top scorer/assister)".to_string()]
                 } else {
                     vec![]
                 };
@@ -714,11 +734,12 @@ pub fn build_player_candidates_entry(
                 } else {
                     ("1+ shot", nb_ge1(lambda, PHI_P_SHOTS), con.shot1_rate)
                 };
-                let (est, note) = blend_consistency(base_est, rate, con.apps);
+                let (est, note, gap) = blend_consistency(base_est, rate, con.apps);
                 let mut sup = vec![format!("shots/90 {:.2}", shots_p90), format!("exp_min {:.0}", exp_min)];
                 if let Some(n) = note {
                     sup.push(n);
                 }
+                let fl = if gap { vec!["form-gap: recent shot volume well above season — book may lag".to_string()] } else { vec![] };
                 out.push(base(
                     "Player Shots",
                     "pshots",
@@ -726,7 +747,7 @@ pub fn build_player_candidates_entry(
                     shots_p90,
                     est,
                     sup,
-                    vec![],
+                    fl,
                 ));
             }
             _ => {}
@@ -883,9 +904,9 @@ pub fn build_team_candidates(
     let lambda_away = (maher(a_for, h_against) * AWAY_ADJ).max(0.05);
     let xg_used = home.xg_for.is_some() && away.xg_for.is_some();
     let crude = if xg_used {
-        "team line: real xG (recent form)".to_string()
+        "xG-based (recent form)".to_string()
     } else {
-        "team line: crude season-rate proxy".to_string()
+        "season-rate proxy".to_string()
     };
 
     let mk = |subject: &str, market: &str, group: &str, line: &str, rate: f64, est: f64, support: Vec<String>| Candidate {
@@ -910,6 +931,7 @@ pub fn build_team_candidates(
         support,
         flags: vec![crude.clone()],
         plausibility: None,
+        raw_prob: None,
     };
 
     // Dixon-Coles-corrected joint score matrix, shared by every scoreline-derived
@@ -1327,7 +1349,9 @@ fn oracle_score(c: &Candidate) -> f64 {
         None => (-0.15, -0.10), // unpriced → I can't trust the edge, so I pass
     };
     // Conviction from context (in-form, suited role, trend, certainty to play).
-    let has = |needle: &str| c.flags.iter().any(|f| f.contains(needle));
+    let has = |needle: &str| {
+        c.flags.iter().any(|f| f.contains(needle)) || c.support.iter().any(|f| f.contains(needle))
+    };
     let mut conviction = 0.0;
     if has("in-form") {
         conviction += 0.10;
@@ -1453,7 +1477,16 @@ pub fn banker_score(c: &Candidate) -> f64 {
 /// - "oracle": Claude's CONFLUENCE read — sharp + model + edge + context must
 ///   agree; fades chalk, longshots and model-vs-market disagreement.
 /// `per_market_cap` bounds how many of one market (e.g. scorers) reach the model.
-pub fn shortlist(mut cands: Vec<Candidate>, n: usize, mode: &str, per_market_cap: usize) -> Vec<Candidate> {
+/// `per_fixture_cap` (0 = off) bounds how many legs ONE fixture may take, so a
+/// multi-match slate can't be dominated by a couple of data-rich games — the
+/// fix for "10 fixtures starve each other in a fixed-size table".
+pub fn shortlist(
+    mut cands: Vec<Candidate>,
+    n: usize,
+    mode: &str,
+    per_market_cap: usize,
+    per_fixture_cap: usize,
+) -> Vec<Candidate> {
     // Haiku plausibility (1-5) as a small ranking weight: +0.12 at 5, −0.12 at 1,
     // 0 at the neutral 3 (or when unscored). Re-ranks only — never a probability.
     let plaus = |c: &Candidate| -> f64 { c.plausibility.map(|p| (p as f64 - 3.0) * 0.06).unwrap_or(0.0) };
@@ -1461,26 +1494,29 @@ pub fn shortlist(mut cands: Vec<Candidate>, n: usize, mode: &str, per_market_cap
         "value" => c.est_prob + c.ev.unwrap_or(0.0).max(0.0) * 1.5,
         "oracle" => oracle_score(c),
         "power" => power_score(c),
-        "bankers" => {
-            // Reliable RECURRING events: high probability, bonus for markets that
-            // repeat game-to-game, extra for a real recent hit-rate (consistency).
-            let recurring = matches!(
-                c.market_group.as_str(),
-                "cards" | "sot" | "pshots" | "fouls" | "tackles" | "passes" | "scorer" | "tcorners" | "tcards" | "tshots"
-            );
-            let has_recent = c.support.iter().any(|s| s.starts_with("hit "));
-            let mut s = c.est_prob;
-            if recurring {
-                s += 0.05;
-            }
-            if has_recent {
-                s += 0.12; // observed to happen most recent games → a trustworthy banker
-            }
-            if c.flags.iter().any(|f| f.contains("unlikely to feature")) {
-                s -= 0.5;
-            }
-            s
+        // APEX: proven-edge legs only. Heavy weight on sharp-backed +EV (the
+        // top-down route), model↔market agreement as the trap filter, and a
+        // favourite-longshot-bias guard band. Unpriced legs sink — Apex can't
+        // verify an edge it can't price.
+        "apex" => {
+            let sharp = c.pinnacle_prob.is_some() && c.ev_source.as_deref() == Some("sharp");
+            let ev = c.ev.unwrap_or(-0.15);
+            let agree = match c.pinnacle_prob {
+                Some(p) => 0.20 - ((p - c.est_prob).abs() * 2.0).min(0.40),
+                None => -0.05,
+            };
+            let band = match c.book_odds {
+                Some(o) if (1.4..=3.2).contains(&o) => 0.10,
+                Some(o) if o > 3.6 => -0.20, // longshot bias — overpriced tail
+                Some(_) => 0.0,
+                None => -0.30,
+            };
+            c.est_prob * 0.3 + ev.clamp(-0.15, 0.5) * 2.0 + if sharp { 0.15 } else { 0.0 } + agree + band
         }
+        // ONE definition of "banker": the same score that ranks the Bankers
+        // board. (This arm used to be a diverged near-duplicate with different
+        // weights, so the board and a Bankers build disagreed about the same leg.)
+        "bankers" => banker_score(c),
         "favorites" => {
             // Reward a useful odds band; penalise odds-on chalk; weigh form.
             let band = match c.book_odds {
@@ -1500,19 +1536,72 @@ pub fn shortlist(mut cands: Vec<Candidate>, n: usize, mode: &str, per_market_cap
     };
     let score = |c: &Candidate| base(c) + plaus(c);
     cands.sort_by(|a, b| score(b).partial_cmp(&score(a)).unwrap_or(std::cmp::Ordering::Equal));
+
+    // STRATIFIED selection. A single-objective top-N silently purged whole
+    // classes of opportunity before the model ever saw them (e.g. the plausible
+    // ~30% longshots Jackpot needs rank last under pure likelihood). Reserve
+    // slots across probability bands — bankers / mid / live longshots — and fill
+    // each band in strategy-score order, so every strategy sees the full
+    // spectrum while its own score still decides who represents each band.
+    // Unfilled band quotas spill back to the global order, so thin slates lose
+    // nothing vs the old behaviour.
+    let bands: [(f64, f64, usize); 3] = [
+        (0.60, 1.01, n / 2),          // bankers-grade
+        (0.40, 0.60, (n * 3) / 10),   // solid-moderate
+        (0.15, 0.40, n - n / 2 - (n * 3) / 10), // plausible longshots
+    ];
     let mut per_market: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut out = Vec::new();
-    for c in cands {
-        let count = per_market.entry(c.market.clone()).or_insert(0);
-        if *count >= per_market_cap {
-            continue;
+    let mut per_fixture: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
+    let mut slots: Vec<Option<Candidate>> = cands.into_iter().map(Some).collect();
+    let mut out: Vec<Candidate> = Vec::new();
+    let mut try_take = |slot: &mut Option<Candidate>,
+                        out: &mut Vec<Candidate>,
+                        per_market: &mut std::collections::HashMap<String, usize>,
+                        per_fixture: &mut std::collections::HashMap<i64, usize>|
+     -> bool {
+        let c = match slot.as_ref() {
+            Some(c) => c,
+            None => return false,
+        };
+        if *per_market.get(&c.market).unwrap_or(&0) >= per_market_cap {
+            return false;
         }
-        *count += 1;
-        out.push(c);
+        if per_fixture_cap > 0 && *per_fixture.get(&c.fixture_id).unwrap_or(&0) >= per_fixture_cap {
+            return false;
+        }
+        *per_market.entry(c.market.clone()).or_insert(0) += 1;
+        *per_fixture.entry(c.fixture_id).or_insert(0) += 1;
+        out.push(slot.take().unwrap());
+        true
+    };
+    for (lo, hi, quota) in bands {
+        let mut got = 0usize;
+        for slot in slots.iter_mut() {
+            if got >= quota || out.len() >= n {
+                break;
+            }
+            let p = match slot.as_ref() {
+                Some(c) => c.est_prob,
+                None => continue,
+            };
+            if p < lo || p >= hi {
+                continue;
+            }
+            if try_take(slot, &mut out, &mut per_market, &mut per_fixture) {
+                got += 1;
+            }
+        }
+    }
+    // Spill: fill any remaining slots by global score order (covers <0.15 tails
+    // and bands with too few members).
+    for slot in slots.iter_mut() {
         if out.len() >= n {
             break;
         }
+        try_take(slot, &mut out, &mut per_market, &mut per_fixture);
     }
+    // Keep the model's view ordered by strategy score, not by band.
+    out.sort_by(|a, b| score(b).partial_cmp(&score(a)).unwrap_or(std::cmp::Ordering::Equal));
     out
 }
 

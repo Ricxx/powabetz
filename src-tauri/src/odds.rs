@@ -105,6 +105,33 @@ pub fn fold(s: &str) -> String {
         .to_lowercase()
 }
 
+/// Loose team-name match for ingested-page labels: does the FOLDED haystack
+/// mention this team? Full-name containment first; then any distinctive token
+/// of the team name (≥4 chars, not a generic suffix like "united"/"city" that
+/// would cross-match fixtures); then a reverse-prefix rule so "Barca" finds
+/// "Barcelona". Exact API names always match ("Man Utd"-style abbreviations
+/// may not — the scout no-match error lists the page labels so the user sees
+/// why and can re-process with fuller names).
+pub fn team_match(hay_folded: &str, team: &str) -> bool {
+    let t = fold(team);
+    if t.is_empty() || hay_folded.is_empty() {
+        return false;
+    }
+    if hay_folded.contains(&t) {
+        return true;
+    }
+    const STOP: [&str; 10] = [
+        "club", "city", "united", "town", "county", "real", "sporting", "athletic", "atletico", "deportivo",
+    ];
+    let hay_words: Vec<&str> = hay_folded.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    t.split(' ').any(|tok| {
+        if tok.len() < 4 || STOP.contains(&tok) {
+            return false;
+        }
+        hay_folded.contains(tok) || hay_words.iter().any(|w| w.len() >= 4 && tok.starts_with(w))
+    })
+}
+
 fn round4(x: f64) -> f64 {
     (x * 10000.0).round() / 10000.0
 }
@@ -388,9 +415,15 @@ pub fn parse_fixture_odds(json: &Value, allowed: &[String]) -> FixtureOdds {
         }
     }
 
+    // Anytime scorer is ONE-SIDED (no "no" price) and NOT single-winner (several
+    // players can score), so a sum-to-1 de-vig is impossible. Raw 1/odds still
+    // embeds the book's margin (~6-8% on props even at Pinnacle) — storing it
+    // uncorrected systematically inflated every scorer EV. Apply a flat,
+    // documented margin haircut instead: true ≈ implied / (1 + margin).
+    const PINNACLE_PROP_MARGIN: f64 = 0.07;
     for (bid, _, tag, value, odd) in &rows {
         if *bid == PINNACLE && *tag == "scorer" && *odd > 1.0 {
-            out.pin_scorer.insert(value.clone(), round4(1.0 / odd));
+            out.pin_scorer.insert(value.clone(), round4(1.0 / odd / (1.0 + PINNACLE_PROP_MARGIN)));
         }
     }
 

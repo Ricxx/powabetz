@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { errMsg, toast } from "../toast";
 import { api } from "../api";
 import Spinner from "./Spinner";
@@ -253,6 +253,9 @@ function LivePredict({ fixture, buildModel }: { fixture: LiveFixture; buildModel
         max_odds: null,
         max_per_subject: null,
         use_plausibility: false,
+        // Only the forecast is shown here — skip the model call entirely
+        // (this used to burn a full premium build and discard the tickets).
+        forecast_only: true,
       });
       setForecast(resp.result.forecast ?? null);
       if (!resp.result.forecast) toast.info("No forecast available for this match yet.");
@@ -307,8 +310,13 @@ function TicketBuilder({ fixture, defaultStake, onPlaced }: { fixture: LiveFixtu
   const chosen = [...sel].map((i) => picks[i]).filter(Boolean);
   const allPriced = chosen.length > 0 && chosen.every((p) => p.odds != null);
   const comboOdds = allPriced ? chosen.reduce((a, p) => a * (p.odds as number), 1) : null;
+  const placingRef = useRef(false); // sync double-tap guard
 
   async function place() {
+    // Sync guard before the await — double-tap used to place duplicate bets.
+    if (placingRef.current) return;
+    placingRef.current = true;
+    try {
     if (chosen.length === 0) {
       toast.error("Tap one or more picks first.");
       return;
@@ -348,6 +356,9 @@ function TicketBuilder({ fixture, defaultStake, onPlaced }: { fixture: LiveFixtu
     toast.success(`Live bet placed — $${s.toFixed(2)} · ${chosen.length} pick${chosen.length > 1 ? "s" : ""} · Live 🔴`);
     setSel(new Set());
     onPlaced?.();
+    } finally {
+      placingRef.current = false;
+    }
   }
 
   return (

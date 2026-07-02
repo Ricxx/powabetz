@@ -3,12 +3,14 @@ import { errMsg, toast } from "../toast";
 import { api } from "../api";
 import Spinner from "./Spinner";
 import Hint from "./Hint";
+import { stratLabel } from "../types";
 import type { BankrollView, CalibrationReport, PlacedBet } from "../types";
 
 function statusBadge(s: string): string {
   if (s === "won") return "bg-accent text-ink";
   if (s === "lost") return "bg-bad/30 text-bad";
   if (s === "partial") return "bg-warn/25 text-warn";
+  if (s === "void") return "bg-edge text-slate-400"; // pushed — stake refunded
   return "bg-edge text-slate-300";
 }
 
@@ -16,25 +18,32 @@ function money(n: number): string {
   return `${n < 0 ? "-" : ""}$${Math.abs(n).toFixed(2)}`;
 }
 
-function stratLabel(s: string): string {
-  if (s === "likely") return "Secret picks";
-  if (s === "favorites") return "Form faves";
-  if (s === "oracle") return "Oracle ✦";
-  if (s === "power") return "Power Stacker ⚡";
-  if (s === "bankers") return "Anchors ⚓";
-  if (s === "jackpot") return "Jackpot 🎰";
-  if (s === "predictor") return "Match Predictor 🔮";
-  if (s === "scout") return "Scout 📡";
-  if (s === "live") return "Live 🔴";
-  if (s === "custom") return "Cherry-picked 🍒";
-  if (s === "ladder") return "Acca ladder";
-  if (s === "board") return "Board";
-  return "Value +EV";
-}
-
-function BetCard({ bet, onSettle, onDelete }: { bet: PlacedBet; onSettle: () => void; onDelete: () => void }) {
+function BetCard({ bet, onSettle, onDelete, onUpdated }: { bet: PlacedBet; onSettle: () => void; onDelete: () => void; onUpdated?: (b: PlacedBet) => void }) {
   const t = bet.ticket;
   const pnl = bet.settled ? bet.returns - bet.stake : null;
+  const [oddsIn, setOddsIn] = useState("");
+  // All legs graded green/void but no price recorded → the backend keeps it open
+  // (never fabricates a break-even payout); prompt for the real odds here.
+  const needsOdds =
+    !bet.settled &&
+    t.combined_odds == null &&
+    bet.leg_results.length === t.legs.length &&
+    bet.leg_results.length > 0 &&
+    bet.leg_results.every((r) => r.won === true || r.void === true);
+  async function addOdds() {
+    const o = parseFloat(oddsIn);
+    if (!Number.isFinite(o) || o <= 1) {
+      toast.error("Enter the ticket's decimal odds (e.g. 4.50).");
+      return;
+    }
+    try {
+      const updated = await api.setBetOdds(bet.id, o);
+      onUpdated?.(updated);
+      toast.success("Odds set — bet settled.");
+    } catch (e) {
+      toast.error(e);
+    }
+  }
   return (
     <div className="card space-y-2">
       <div className="flex items-start justify-between gap-2">
@@ -54,16 +63,41 @@ function BetCard({ bet, onSettle, onDelete }: { bet: PlacedBet; onSettle: () => 
               🔍
             </span>
           )}
+          {bet.clv != null && (
+            <span
+              className={`badge ${bet.clv >= 0 ? "bg-accent/20 text-accent" : "bg-bad/20 text-bad"}`}
+              title="Closing-line value: your price vs the closing price. Consistently positive = real edge."
+            >
+              CLV {bet.clv >= 0 ? "+" : ""}{(bet.clv * 100).toFixed(1)}%
+            </span>
+          )}
           <span className={`badge ${statusBadge(bet.status)}`}>{bet.status}</span>
         </div>
       </div>
+
+      {needsOdds && (
+        <div className="flex items-center gap-2 text-xs bg-accent/10 rounded p-2">
+          <span className="text-accent">✓ All legs landed — add the ticket odds to settle:</span>
+          <input
+            className="input w-20 text-xs"
+            inputMode="decimal"
+            placeholder="4.50"
+            value={oddsIn}
+            onChange={(e) => setOddsIn(e.target.value)}
+          />
+          <button className="btn btn-primary text-xs px-2 py-1" onClick={addOdds}>
+            Settle
+          </button>
+        </div>
+      )}
 
       <div className="space-y-1">
         {t.legs.map((l, i) => {
           const r = bet.leg_results[i];
           const won = r?.won;
-          const mark = won === true ? "✓" : won === false ? "✗" : "•";
-          const color = won === true ? "text-accent" : won === false ? "text-bad" : "text-slate-500";
+          const isVoid = r?.void === true;
+          const mark = isVoid ? "∅" : won === true ? "✓" : won === false ? "✗" : "•";
+          const color = isVoid ? "text-slate-400" : won === true ? "text-accent" : won === false ? "text-bad" : "text-slate-500";
           return (
             <div key={i} className="flex items-center justify-between text-xs">
               <span className="break-words min-w-0">
@@ -140,12 +174,23 @@ export default function Tracker({ onClose }: { onClose: () => void }) {
     if (busy) return; // guard against request spam
     setBusy(true);
     setErr(null);
+    const openBefore = bets.filter((b) => !b.settled).length;
     try {
       const updated = await api.settleAll();
+      const openAfter = updated.filter((b) => !b.settled).length;
+      const justSettled = Math.max(0, openBefore - openAfter);
       setBets(updated);
       setBank(await api.getBankroll());
+      if (justSettled > 0) {
+        toast.success(`Settled ${justSettled} bet${justSettled > 1 ? "s" : ""}${openAfter > 0 ? ` · ${openAfter} still awaiting results` : ""}`);
+      } else if (openAfter > 0) {
+        toast.info(`No results yet — ${openAfter} bet${openAfter > 1 ? "s" : ""} still pending. A match only settles once the data feed marks it finished with final stats, which can lag ~10-30 min after full-time.`);
+      } else {
+        toast.info("All bets already settled — nothing pending.");
+      }
     } catch (e) {
       setErr(errMsg(e));
+      toast.error(e);
     } finally {
       setBusy(false);
     }
@@ -183,9 +228,13 @@ export default function Tracker({ onClose }: { onClose: () => void }) {
   const noGrok = split(bets.filter((b) => !b.grok_used));
 
   // ROI split by the strategy each ticket came from.
-  const strategies = ["value", "favorites", "likely", "oracle", "power", "bankers", "jackpot", "predictor", "scout", "live", "custom", "ladder", "board"].filter((s) =>
+  const strategies = ["apex", "value", "favorites", "likely", "oracle", "power", "bankers", "jackpot", "predictor", "scout", "live", "custom", "ladder", "board"].filter((s) =>
     bets.some((b) => b.strategy === s && b.settled)
   );
+  // Closing-line value: the fastest-converging proof of edge (needs far fewer
+  // bets than win/loss ROI to mean something).
+  const clvBets = bets.filter((b) => b.clv != null);
+  const avgClv = clvBets.length > 0 ? clvBets.reduce((a, b) => a + (b.clv as number), 0) / clvBets.length : null;
 
   // Group by day (descending).
   const groups = new Map<string, PlacedBet[]>();
@@ -287,6 +336,21 @@ export default function Tracker({ onClose }: { onClose: () => void }) {
         </div>
       )}
 
+      {avgClv != null && (
+        <div className="card space-y-1">
+          <div className="flex items-center gap-1 text-xs font-semibold text-slate-400">
+            Closing-line value
+            <Hint text="Your placed price vs the closing price, averaged across settled bets. Beating the close consistently is the professional standard of proof — it converges in dozens of bets where win/loss ROI needs hundreds. Positive = the market moved toward your bets after you placed them." />
+          </div>
+          <div className="flex justify-between text-xs">
+            <span className="text-slate-400">{clvBets.length} bet{clvBets.length === 1 ? "" : "s"} measured</span>
+            <b className={avgClv >= 0 ? "text-accent" : "text-bad"}>
+              avg CLV {avgClv >= 0 ? "+" : ""}{(avgClv * 100).toFixed(1)}%
+            </b>
+          </div>
+        </div>
+      )}
+
       {(withGrok.n > 0 || noGrok.n > 0) && (
         <div className="card space-y-1">
           <div className="text-xs font-semibold text-slate-400">Does Grok help? (settled bets)</div>
@@ -326,7 +390,13 @@ export default function Tracker({ onClose }: { onClose: () => void }) {
         <div key={day} className="space-y-2">
           <div className="text-xs font-semibold text-slate-400">{day}</div>
           {groups.get(day)!.map((b) => (
-            <BetCard key={b.id} bet={b} onSettle={() => settleOne(b.id)} onDelete={() => del(b.id)} />
+            <BetCard
+              key={b.id}
+              bet={b}
+              onSettle={() => settleOne(b.id)}
+              onDelete={() => del(b.id)}
+              onUpdated={(u) => setBets((prev) => prev.map((x) => (x.id === u.id ? u : x)))}
+            />
           ))}
         </div>
       ))}

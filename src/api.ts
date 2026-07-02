@@ -44,6 +44,7 @@ export const api = {
     anthropicKey: string | null,
     grokKey: string | null,
     openaiKey: string | null,
+    deepseekKey: string | null,
     parlayKey: string | null,
     model: string | null,
     dailyLimit: number | null,
@@ -60,6 +61,7 @@ export const api = {
       anthropicKey,
       grokKey,
       openaiKey,
+      deepseekKey,
       parlayKey,
       model,
       dailyLimit,
@@ -115,7 +117,8 @@ export const api = {
     seedSubjects: string[],
     variation: number,
     minOdds: number | null,
-    maxOdds: number | null
+    maxOdds: number | null,
+    onePerFixture = false
   ) =>
     invoke<BuildResult>("build_ladder", {
       fixtures,
@@ -134,6 +137,7 @@ export const api = {
       variation,
       minOdds,
       maxOdds,
+      onePerFixture,
     }),
 
   prewarmPlausibility: (fixture: FixtureInput, markets: string[]) =>
@@ -141,6 +145,9 @@ export const api = {
 
   settleGenerated: () => invoke<GenReportRow[]>("settle_generated"),
   generatedReport: () => invoke<GenReportRow[]>("generated_report"),
+  // 🧬 Darwin: paper-trade a population of deterministic micro-strategies (0 tokens).
+  darwinSweep: (fixtures: FixtureInput[], markets: string[]) =>
+    invoke<string[]>("darwin_sweep", { fixtures, markets }),
   generatedReportByKind: () => invoke<GenReportRow[]>("generated_report_by_kind"),
   generatedReportByMarket: () => invoke<MarketReportRow[]>("generated_report_by_market"),
 
@@ -186,6 +193,7 @@ export const api = {
     invoke<IngestItem>("process_ingested", { id, model: model ?? null }),
   deleteIngested: (id: number) => invoke<void>("delete_ingested", { id }),
   updateIngestNote: (id: number, note: string) => invoke<void>("update_ingest_note", { id, note }),
+  assignIngestFixture: (id: number, label: string, date?: string) => invoke<void>("assign_ingest_fixture", { id, label, date }),
 
   getBankroll: () => invoke<BankrollView>("get_bankroll"),
   setBankroll: (amount: number) => invoke<BankrollView>("set_bankroll", { amount }),
@@ -201,4 +209,6 @@ export const api = {
   deleteBet: (id: number) => invoke<void>("delete_bet", { id }),
   settleBet: (id: number) => invoke<PlacedBet>("settle_bet", { id }),
   settleAll: () => invoke<PlacedBet[]>("settle_all"),
+  // Add odds to an all-green open bet, then settle it at the real price.
+  setBetOdds: (id: number, odds: number) => invoke<PlacedBet>("set_bet_odds", { id, odds }),
 };

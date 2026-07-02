@@ -36,6 +36,7 @@ const RESET_TABLES: &[&str] = &[
     "grok_usage",
     "placed_bets",
     "generated_tickets",
+    "ingested",
 ];
 
 fn json_to_sql(v: &serde_json::Value) -> rusqlite::types::Value {
@@ -199,6 +200,49 @@ pub fn ingest_set_note(conn: &Connection, id: i64, note: &str) -> Result<(), Str
     Ok(())
 }
 
+/// Manually (re)assign an ingested page to a fixture. Also patches the extracted
+/// JSON's home/away/date so the build's matching + non-archived checks agree with
+/// the user's assignment. `label` is "Home vs Away"; `date` is "YYYY-MM-DD" or "".
+pub fn ingest_set_fixture(conn: &Connection, id: i64, label: &str, date: &str) -> Result<(), String> {
+    // Patch extracted_json home/away/date if present so everything downstream lines up.
+    let existing: Option<String> = conn
+        .query_row("SELECT extracted_json FROM ingested WHERE id=?1", params![id], |r| r.get(0))
+        .optional()
+        .map_err(|e| e.to_string())?
+        .flatten();
+    let patched: Option<String> = existing.and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok()).map(|mut v| {
+        if let Some((h, a)) = label.split_once(" vs ") {
+            v["home"] = serde_json::Value::String(h.trim().to_string());
+            v["away"] = serde_json::Value::String(a.trim().to_string());
+        }
+        if !date.is_empty() {
+            v["date"] = serde_json::Value::String(date.to_string());
+        }
+        v.to_string()
+    });
+    // A manual reassignment invalidates any AUTO-resolved fixture id — clear it
+    // so the next build re-resolves against the new label.
+    match patched {
+        Some(p) => conn.execute(
+            "UPDATE ingested SET fixture_label=?2, extracted_json=?3, fixture_id=NULL WHERE id=?1",
+            params![id, label, p],
+        ),
+        None => conn.execute("UPDATE ingested SET fixture_label=?2, fixture_id=NULL WHERE id=?1", params![id, label]),
+    }
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Resolve an ingested page to a REAL fixture (self-healing): once a build's
+/// token-matching pairs the page with a selected fixture, store the canonical
+/// id (label is left as the user/extraction set it — `ingest_set_fixture`
+/// above is the manual reassignment path and owns the label).
+pub fn ingest_resolve_fixture(conn: &Connection, id: i64, fixture_id: i64) -> Result<(), String> {
+    conn.execute("UPDATE ingested SET fixture_id=?2 WHERE id=?1", params![id, fixture_id])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 pub fn ingest_mark_used(conn: &Connection, id: i64) -> Result<(), String> {
     conn.execute("UPDATE ingested SET used=1 WHERE id=?1", params![id]).map_err(|e| e.to_string())?;
     Ok(())
@@ -268,6 +312,11 @@ pub const DEFAULT_DAILY_LIMIT: i64 = 7500;
 
 pub fn open(path: &std::path::Path) -> Result<Connection, String> {
     let conn = Connection::open(path).map_err(|e| e.to_string())?;
+    // Two writers share this file (the app + the ingest server thread). WAL
+    // lets a reader and a writer coexist; the busy timeout stops an extension
+    // POST landing mid-build from failing with a raw "database is locked".
+    let _ = conn.pragma_update(None, "journal_mode", "WAL");
+    let _ = conn.pragma_update(None, "busy_timeout", 3000);
     init(&conn)?;
     Ok(conn)
 }
@@ -405,6 +454,21 @@ fn init(conn: &Connection) -> Result<(), String> {
         "ALTER TABLE ai_usage ADD COLUMN purpose TEXT NOT NULL DEFAULT 'build'",
         [],
     );
+    // CLV (closing-line value) per placed bet (migration).
+    let _ = conn.execute("ALTER TABLE placed_bets ADD COLUMN clv REAL", []);
+    let _ = conn.execute("ALTER TABLE placed_bets ADD COLUMN clv_json TEXT", []);
+    // Calibration + settle scan the ledger by settled-state on every build/run —
+    // index it so the ever-growing ledger stays cheap to scan.
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_gen_settled ON generated_tickets(settled)",
+        [],
+    );
+    // Startup pruning — these tables grow without bound otherwise. Cache rows
+    // expired >1 day are never read again (cache_get ignores expired rows);
+    // ai_results transient keys (live tickets, plausibility) accrete forever.
+    let now = chrono::Utc::now().timestamp();
+    let _ = conn.execute("DELETE FROM cache WHERE fetched_at + ttl_secs < ?1 - 86400", params![now]);
+    let _ = conn.execute("DELETE FROM ai_results WHERE created_at < ?1 - 60 * 86400", params![now]);
     Ok(())
 }
 
@@ -682,6 +746,9 @@ pub struct PlacedRow {
     pub settled: bool,
     pub grok_used: bool,
     pub strategy: String,
+    /// Closing-line value: avg (placed_odds / closing_odds − 1) across priced
+    /// legs. Positive = beat the close — the fastest-converging edge signal.
+    pub clv: Option<f64>,
 }
 
 pub fn place_bet(
@@ -715,11 +782,12 @@ fn row_to_placed(r: &rusqlite::Row) -> rusqlite::Result<PlacedRow> {
         settled: r.get::<_, i64>(8)? != 0,
         grok_used: r.get::<_, i64>(9)? != 0,
         strategy: r.get(10)?,
+        clv: r.get(11)?,
     })
 }
 
 const PLACED_COLS: &str =
-    "id, created_at, day, ticket_json, stake, status, returns, leg_results_json, settled, grok_used, strategy";
+    "id, created_at, day, ticket_json, stake, status, returns, leg_results_json, settled, grok_used, strategy, clv";
 
 pub fn list_placed(conn: &Connection) -> Result<Vec<PlacedRow>, String> {
     let sql = format!("SELECT {PLACED_COLS} FROM placed_bets ORDER BY created_at DESC");
@@ -750,6 +818,26 @@ pub fn update_settlement(
     conn.execute(
         "UPDATE placed_bets SET status = ?2, returns = ?3, leg_results_json = ?4, settled = ?5 WHERE id = ?1",
         params![id, status, returns, leg_results_json, settled as i64],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn set_bet_clv(conn: &Connection, id: i64, clv: f64, detail_json: &str) -> Result<(), String> {
+    conn.execute(
+        "UPDATE placed_bets SET clv = ?2, clv_json = ?3 WHERE id = ?1",
+        params![id, clv, detail_json],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Update the ticket's combined odds on an OPEN bet (the Tracker's "add odds to
+/// settle" flow for all-green bets placed without a price).
+pub fn set_bet_odds(conn: &Connection, id: i64, ticket_json: &str) -> Result<(), String> {
+    conn.execute(
+        "UPDATE placed_bets SET ticket_json = ?2 WHERE id = ?1 AND settled = 0",
+        params![id, ticket_json],
     )
     .map_err(|e| e.to_string())?;
     Ok(())

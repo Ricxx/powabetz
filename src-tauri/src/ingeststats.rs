@@ -6,7 +6,7 @@
 //! primitives (Negative-Binomial tails) — the same maths a bookmaker would use
 //! on those rates. Every candidate it emits is flagged as ingest-sourced.
 
-use crate::features::{nb_over, PHI_CARDS, PHI_CORNERS, PHI_SHOTS};
+use crate::features::{nb_over, PHI_CARDS, PHI_CORNERS, PHI_SHOTS, PHI_P_SHOTS, PHI_P_SOT};
 use crate::models::Candidate;
 use serde_json::Value;
 
@@ -64,15 +64,25 @@ struct TeamStats {
     shots: Avg,
 }
 
+/// Per-game player rates scraped from a page ("Hakimi shots/game 2.1").
+#[derive(Default, Clone)]
+struct PlayerRates {
+    shots: Avg,
+    sot: Avg,
+    goals: Avg,
+}
+
 fn fold(s: &str) -> String {
     crate::odds::fold(s)
 }
 
-/// Parse the `data` array of every matched ingest into per-team stat means.
-fn parse(items: &[&Value], home: &str, away: &str) -> (TeamStats, TeamStats) {
-    let (hf, af) = (fold(home), fold(away));
+/// Parse the `data` array of every matched ingest into per-team stat means and
+/// per-PLAYER per-game rates ("Hakimi shots/game 2.1" — a label that names
+/// neither team but carries an explicit per-game rate).
+fn parse(items: &[&Value], home: &str, away: &str) -> (TeamStats, TeamStats, std::collections::HashMap<String, PlayerRates>) {
     let mut h = TeamStats::default();
     let mut a = TeamStats::default();
+    let mut players: std::collections::HashMap<String, PlayerRates> = std::collections::HashMap::new();
     for it in items {
         let data = match it.get("data").and_then(|d| d.as_array()) {
             Some(d) => d,
@@ -82,46 +92,89 @@ fn parse(items: &[&Value], home: &str, away: &str) -> (TeamStats, TeamStats) {
             let label = e.get("label").and_then(|x| x.as_str()).unwrap_or("");
             let value = e.get("value").and_then(|x| x.as_str()).unwrap_or("");
             let lf = fold(label);
-            // Whose stat? Need an unambiguous team mention in the label.
-            let team = if !hf.is_empty() && lf.contains(&hf) {
-                &mut h
-            } else if !af.is_empty() && lf.contains(&af) {
-                &mut a
-            } else {
-                continue;
-            };
             let num = match first_num(value).or_else(|| first_num(label)) {
                 Some(n) if n.is_finite() && n >= 0.0 && n < 60.0 => n,
                 _ => continue,
             };
-            // Classify the stat (order matters: SOT before generic shot).
-            if lf.contains("corner") {
-                if lf.contains("against") || lf.contains("conced") || lf.contains("faced") {
-                    team.corners_against.add(num);
-                } else {
-                    team.corners_for.add(num);
+            // Whose stat? Token-aware team matching (page spellings vary).
+            let team = if crate::odds::team_match(&lf, home) {
+                Some(&mut h)
+            } else if crate::odds::team_match(&lf, away) {
+                Some(&mut a)
+            } else {
+                None
+            };
+            if let Some(team) = team {
+                // Classify the stat (order matters: SOT before generic shot).
+                if lf.contains("corner") {
+                    if lf.contains("against") || lf.contains("conced") || lf.contains("faced") {
+                        team.corners_against.add(num);
+                    } else {
+                        team.corners_for.add(num);
+                    }
+                } else if lf.contains("card") || lf.contains("booking") {
+                    team.cards.add(num);
+                } else if lf.contains("sot") || lf.contains("ontarget") || lf.contains("shotsontarget") {
+                    // team SOT has no settle market — fold into nothing for now
+                    continue;
+                } else if lf.contains("shot") {
+                    team.shots.add(num);
                 }
-            } else if lf.contains("card") || lf.contains("booking") {
-                team.cards.add(num);
-            } else if lf.contains("sot") || lf.contains("ontarget") || lf.contains("shotsontarget") {
-                // team SOT has no settle market — fold into nothing for now
                 continue;
-            } else if lf.contains("shot") {
-                team.shots.add(num);
+            }
+            // PLAYER rate: names neither team AND is an explicit per-game rate
+            // (totals are useless without appearance counts — skip those).
+            let per_game = lf.contains("/game") || lf.contains("per game") || lf.contains("pergame");
+            if !per_game {
+                continue;
+            }
+            // Name = the label text before the stat keyword.
+            let ll = label.to_lowercase();
+            let kw = ["shots on target", "sot", "shots", "shot", "goals", "goal"]
+                .iter()
+                .filter_map(|k| ll.find(k).map(|p| (p, *k)))
+                .min_by_key(|(p, _)| *p);
+            let Some((pos, kw)) = kw else { continue };
+            let name = label[..pos].trim().trim_end_matches(['-', ':', '—']).trim();
+            let nl = fold(name);
+            const NOT_NAMES: [&str; 8] = ["total", "team", "match", "both", "home", "away", "avg", "average"];
+            if nl.len() < 3 || NOT_NAMES.iter().any(|w| nl == *w) {
+                continue;
+            }
+            let p = players.entry(name.to_string()).or_default();
+            match kw {
+                "shots on target" | "sot" => {
+                    if (0.2..=5.0).contains(&num) {
+                        p.sot.add(num);
+                    }
+                }
+                "shots" | "shot" => {
+                    if (0.3..=7.0).contains(&num) {
+                        p.shots.add(num);
+                    }
+                }
+                _ => {
+                    if (0.05..=1.2).contains(&num) {
+                        p.goals.add(num);
+                    }
+                }
             }
         }
     }
-    (h, a)
+    (h, a, players)
 }
 
-/// Validate a scraped per-game mean for a ONE-TEAM market: return None if it's
-/// above `skip_above` (almost certainly a both-teams/match total mis-scraped onto
-/// one team), otherwise clamp it into [lo, hi] so the emitted lines stay realistic.
+/// Validate a scraped per-game mean for a ONE-TEAM market: None unless it lies
+/// inside [lo, hi]. Out-of-band values are SKIPPED, not clamped — a clamped
+/// number is no longer "from ingested stats" (honest-data rule), and above
+/// `skip_above` it's almost certainly a both-teams/match total mis-scraped onto
+/// one team.
 fn sane(mu: f64, lo: f64, hi: f64, skip_above: f64) -> Option<f64> {
-    if !mu.is_finite() || mu >= skip_above {
-        None
+    let _ = skip_above; // subsumed by the hi bound; kept for call-site clarity
+    if mu.is_finite() && (lo..=hi).contains(&mu) {
+        Some(mu)
     } else {
-        Some(mu.clamp(lo, hi))
+        None
     }
 }
 
@@ -173,8 +226,9 @@ fn lines_for(
                 form_state: None,
                 xg_source: None,
                 support: vec![format!("{src} {mu:.1}/game"), "from ingested stats · Neg-Binomial".to_string()],
-                flags: vec!["source: ingested 3rd-party stats (independent of the engine)".to_string()],
+                flags: vec!["ingested stats (independent source)".to_string()],
                 plausibility: None,
+                raw_prob: None,
             });
         }
     }
@@ -183,8 +237,57 @@ fn lines_for(
 /// Deterministic candidates for ONE fixture, derived purely from its matched
 /// ingested pages. Returns empty if the pages carried no usable stats.
 pub fn candidates_for_fixture(items: &[&Value], home: &str, away: &str, fixture_label: &str, fixture_id: i64) -> Vec<Candidate> {
-    let (h, a) = parse(items, home, away);
+    let (h, a, players) = parse(items, home, away);
     let mut out = Vec::new();
+    // PLAYER candidates from page-scraped per-game rates — the pages' player
+    // numbers were previously prompt-context only; now they price real lines
+    // (same NB maths as the engine, clearly flagged as ingest-sourced).
+    for (name, pr) in &players {
+        let mk = |market: &str, group: &str, line: String, mu: f64, p: f64, src: &str| Candidate {
+            subject: name.clone(),
+            subject_kind: "player".to_string(),
+            team: String::new(),
+            opponent: String::new(),
+            fixture: fixture_label.to_string(),
+            fixture_id,
+            market: market.to_string(),
+            market_group: group.to_string(),
+            line,
+            base_rate: r2(mu),
+            est_prob: r2(clampp(p)),
+            pinnacle_prob: None,
+            book_odds: None,
+            book: None,
+            ev: None,
+            ev_source: None,
+            form_state: None,
+            xg_source: None,
+            support: vec![format!("{src} {mu:.2}/game (page)")],
+            flags: vec!["ingested stats (independent source)".to_string(), "team unknown (page-derived)".to_string()],
+            plausibility: None,
+            raw_prob: None,
+        };
+        if let Some(mu) = pr.shots.get() {
+            let (line, p) = if nb_over(1, mu, PHI_P_SHOTS) >= 0.5 {
+                ("2+ shots".to_string(), nb_over(1, mu, PHI_P_SHOTS))
+            } else {
+                ("1+ shot".to_string(), nb_over(0, mu, PHI_P_SHOTS))
+            };
+            out.push(mk("Player Shots", "pshots", line, mu, p, "shots"));
+        }
+        if let Some(mu) = pr.sot.get() {
+            let (line, p) = if nb_over(1, mu, PHI_P_SOT) >= 0.5 {
+                ("2+ shots on target".to_string(), nb_over(1, mu, PHI_P_SOT))
+            } else {
+                ("1+ shot on target".to_string(), nb_over(0, mu, PHI_P_SOT))
+            };
+            out.push(mk("Shots on Target", "sot", line, mu, p, "sot"));
+        }
+        if let Some(mu) = pr.goals.get() {
+            let p = 1.0 - (-mu).exp();
+            out.push(mk("Anytime Scorer", "scorer", "1+ goal".to_string(), mu, p, "goals"));
+        }
+    }
     for (team, opp, ts, opp_ts) in [(home, away, &h, &a), (away, home, &a, &h)] {
         // Corners — blend the team's "for" with the opponent's "against" when both
         // are present (a corner takes two teams), else use whichever we have.

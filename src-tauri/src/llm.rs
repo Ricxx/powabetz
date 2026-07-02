@@ -8,14 +8,33 @@ use sha2::{Digest, Sha256};
 use crate::models::BuildResult;
 use crate::AppState;
 
-pub const DEFAULT_MODEL: &str = "claude-opus-4-8";
+/// The default BUILD/analysis model: Haiku — sharp on qualitative work (picking,
+/// combining, explaining) and cheap. DeepSeek does the deterministic DATA
+/// crunching (plausibility, ingest extraction); Sonnet/Opus are premium, opt-in.
+pub const DEFAULT_MODEL: &str = "claude-haiku-4-5";
+/// The model for pure DATA extraction (ingest scraping) — cheap DeepSeek, huge
+/// context, thinking disabled.
+pub const DETERMINISTIC_MODEL: &str = "deepseek-v4-pro";
+/// The model for cheap QUALITATIVE helpers (plausibility, tactics) — Haiku is
+/// sharper here and caches reliably (DeepSeek was failing and re-running).
+pub const QUAL_MODEL: &str = "claude-haiku-4-5";
+
+/// Premium models — high cost, so only used when the user explicitly picks them.
+pub fn is_premium_model(m: &str) -> bool {
+    matches!(m, "claude-sonnet-5" | "claude-opus-4-8")
+}
 const ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
 const OPENAI_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
+const DEEPSEEK_ENDPOINT: &str = "https://api.deepseek.com/anthropic/v1/messages";
 
-/// Allowed model ids for the main BUILD (Claude only — the deterministic engine
-/// feeds it; we keep the sharp model on the home provider).
+/// A DeepSeek model id (OpenAI-compatible API).
+pub fn is_deepseek_model(m: &str) -> bool {
+    m.starts_with("deepseek")
+}
+
+/// Allowed model ids for the main BUILD.
 pub fn is_allowed_model(m: &str) -> bool {
-    matches!(m, "claude-opus-4-8" | "claude-sonnet-4-6" | "claude-haiku-4-5")
+    is_deepseek_model(m) || matches!(m, "claude-opus-4-8" | "claude-sonnet-5" | "claude-haiku-4-5")
 }
 
 /// An OpenAI (GPT) model id.
@@ -23,16 +42,17 @@ pub fn is_openai_model(m: &str) -> bool {
     m.starts_with("gpt-")
 }
 
-/// Models allowed for the quick ANALYSIS (a second angle) — Claude + GPT.
+/// Models allowed for the quick ANALYSIS (a second angle).
 pub fn is_allowed_analysis_model(m: &str) -> bool {
     is_allowed_model(m) || matches!(m, "gpt-5-nano" | "gpt-5-mini")
 }
 
-/// (input, output) USD price per 1M tokens. GPT prices are estimates. Unknown
-/// Claude ids fall back to Opus.
+/// (input, output) USD price per 1M tokens. GPT/DeepSeek prices are estimates.
+/// Unknown Claude ids fall back to Opus.
 pub fn model_pricing(model: &str) -> (f64, f64) {
     match model {
-        "claude-sonnet-4-6" => (3.0, 15.0),
+        _ if model.starts_with("deepseek") => (0.30, 1.20),
+        "claude-sonnet-5" => (3.0, 15.0),
         "claude-haiku-4-5" => (1.0, 5.0),
         "gpt-5-nano" => (0.05, 0.40),
         "gpt-5-mini" => (0.75, 1.25),
@@ -49,14 +69,14 @@ pub fn cost_usd(model: &str, input: i64, output: i64) -> f64 {
 
 const SYSTEM_PROMPT: &str = r#"You are a football betting research assistant building a SLATE of value-oriented tickets. You receive a compact table of PRE-COMPUTED candidate legs across many markets (player props AND team/match lines). Each row has est_prob (our model probability the line hits) and, where the market is priced, pinnacle_prob (Pinnacle's de-vigged TRUE probability — sharp), book_odds (Bet365 decimal odds — the price you'd take) and ev (= book_odds * pinnacle_prob - 1, the +EV edge). All numbers are pre-computed; never invent or recompute a probability or odd.
 
-Your job: assemble ABOUT 10 TICKETS that lean toward VALUE and calculated longshots — NOT just safe bankers. Each ticket is one of:
+Your job: assemble the requested slate of tickets leaning toward VALUE and calculated longshots — NOT just safe bankers. Quality beats quantity: a smaller slate of coherent tickets beats a padded one. Each ticket is one of:
 - "Single": one leg.
 - "SGP": 2-5 legs from the SAME fixture (same-game parlay).
-- "SGP+": a CROSS-GAME build that COMBINES same-game groups. At least ONE fixture MUST contribute 2+ CORRELATED legs (a real same-game mini-SGP), joined with more legs (a single, or another mini-SGP) from one or more OTHER fixtures. Group the legs by fixture and make each fixture's legs reinforce each other. NOTE: one leg per fixture is just a cross-game acca, NOT an SGP+ — an SGP+ always has at least one same-game multi inside it.
+- "SGP+": a Bet365-style build that COMBINES the most VIABLE same-game pieces across fixtures. It is assembled from BUILDING BLOCKS: a highly-viable same-game mini-SGP (2-3 CORRELATED legs from one match), and/or strong singles, and/or another mini-SGP from a DIFFERENT match — stacked together. At least ONE fixture MUST contribute a 2+ leg correlated mini-SGP. ALWAYS order the legs GROUPED BY FIXTURE (all of match A's legs together, then match B's) so it reads cleanly, and only include pieces that are genuinely viable on their own — an SGP+ is a bundle of GOOD bets, not padding. NOTE: one leg per fixture is just a cross-game acca, NOT an SGP+.
 
 Prioritise legs with positive ev (price beats the true probability) — that is the exploitable edge. Legs without odds (most player props aren't priced) can still be used to build bet builders from est_prob. Make the slate a MIX: some +EV singles, several SGPs, and longshot bet builders.
 
-BET BUILDERS (REQUIRED): include AT LEAST 3 multi-leg bet builders (SGP — same fixture, or SGP+ — across fixtures) of 3-5 legs each, deliberately chosen so the legs' est_prob values MULTIPLY to roughly a 10-20% combined hit chance (genuine longshots, ~5x-10x). Use each leg's est_prob to gauge this.
+BET BUILDERS: unless the strategy or allowed ticket types say otherwise, include multi-leg bet builders (SGP — same fixture, or SGP+ — across fixtures) of 3-5 legs, typically ~3 of them where the pool supports it, chosen so the legs' est_prob values MULTIPLY to roughly a 10-20% combined hit chance (genuine longshots, ~5x-10x). Use each leg's est_prob to gauge this. Skip this when it conflicts with the requested strategy/types.
 
 CORRELATED & THEMATIC SGPs (STRONGLY PREFERRED): the best same-game builders tell ONE story where the legs reinforce each other, so they hit TOGETHER more often than naive independence implies. Build at least one THEMED SGP, e.g.:
 - A "goals" theme: a team to win + their key player to score + over 1.5 team goals + BTTS.
@@ -68,7 +88,7 @@ Rules: a player who hasn't scored recently is only a strong scorer pick when for
 
 CRITICAL — TEAM vs MATCH totals: a "Team Shots / Team Corners / Team Total Cards" line is for ONE team only (e.g. Mexico's own shots), NOT the match total of both teams. Never attach a both-teams figure to a single team: one team almost never exceeds ~18 shots, ~9 corners or ~4 cards in a game, so an "over 26.5 shots" or "over 14.5 corners" line on a SINGLE team is wrong — that is a match total. Only ever use a row EXACTLY as given in the table; never invent a line or move a total onto one team.
 
-CRITICAL for matching: in every leg, copy the row's "subject" verbatim into "selection" and the row's "market" verbatim into "market" (and its "line"). Do NOT put probabilities or odds in legs — those are filled in automatically afterwards. Treat predictions and the user's notes as soft context. Output strict JSON only."#;
+CRITICAL for matching: in every leg, copy the row's "subject" verbatim into "selection" and the row's "market" verbatim into "market" (and its "line"). Do NOT put probabilities or odds in legs — those are filled in automatically afterwards. Treat predictions and the user's notes as soft context. HONESTY in "why": cite ONLY numbers and facts that appear in the table or the context blocks — NEVER invent a stat, a form run ("scored 5 in his last 3"), an injury, or an odds figure that is not shown. With no shown fact to cite, describe the construction ("high-likelihood legs, one per match") instead of inventing one. Output strict JSON only."#;
 
 /// Options that shape the requested slate.
 pub struct PromptOpts<'a> {
@@ -88,6 +108,9 @@ pub struct PromptOpts<'a> {
     pub min_legs: u32,
     /// Max times a single player/team may appear across the slate (0 = model default).
     pub max_per_subject: u32,
+    /// Apex strategy only: deterministically-priced correlated combos (Monte-
+    /// Carlo copula) rendered as prompt lines. Empty = none / not Apex.
+    pub apex_combos: String,
 }
 
 impl PromptOpts<'_> {
@@ -133,6 +156,8 @@ pub fn input_hash(
     hasher.update(opts.lucky_risky.to_le_bytes());
     hasher.update(opts.min_legs.to_le_bytes());
     hasher.update(opts.max_per_subject.to_le_bytes());
+    hasher.update(b"|");
+    hasher.update(opts.apex_combos.as_bytes());
     hasher.update(b"|");
     hasher.update(grok.unwrap_or("").as_bytes());
     format!("{:x}", hasher.finalize())
@@ -227,8 +252,17 @@ fn user_prompt(
         "power" => "POWER-STACKER mode — low-leg, high-conviction parlays: lottery-like payouts with FEWER things to connect. Build cross-game DOUBLES (occasionally a treble). Every leg must be a HIGH-LIKELIHOOD outcome that 'should happen' yet is still priced GENEROUSLY (~1.8-2.5) because the book is enticing action — a dominant favourite to win (~2.0), an in-form scorer the book shades (~2.2), a soft over. Stack TWO such legs so the COMBINED odds clear AT LEAST 4.0 (ideally 5-10x). You may pair ONE slightly-less-expected but still-likely leg (~2.5-5.0) with a near-certain ~2.0 leg to reach ~10x on something genuinely simple. Each leg from a DIFFERENT fixture; across the whole slate MAXIMISE diversity — different teams, players AND markets every ticket, never reuse the same selection. Lower variance is the point: do not over-stack. In each 'why', state the combined odds and explain why BOTH legs 'must happen'.",
         "predictor" => "MATCH-PREDICTOR mode — a DEEP read of ONE single game. The whole market for this fixture is in the table (every player prop and match prop). Build 6-8 DIFFERENT same-game tickets, each a distinct ANGLE on how the match plays out, so together they paint the full picture: e.g. (1) a SAFE banker SGP of high-likelihood legs, (2) a GOALS-themed SGP (a side to win + their scorer + over + BTTS), (3) a CARDS/physical SGP, (4) a STAR-PLAYERS SGP (the key men for shots/SOT/to score), (5) a CORRECT-SCORE-led build, (6) a VALUE longshot. Each ticket 3-5 correlated same-game legs that tell ONE coherent story. Mix player props AND match props across the set; never reuse the same selection across tickets. In each 'why', say what scenario it's betting on.",
         "jackpot" => "JACKPOT mode — deliberate LOTTERY TICKETS: small stake, life-changing-if-it-lands payout. Build big multi-leg parlays (5-8 legs) whose COMBINED hit chance is roughly 1-5% (use each leg's est_prob; the product should land ~0.01-0.05) and whose combined odds are LARGE (~20x to 150x+). Crucially these are PLAUSIBLE longshots, NOT random junk: every single leg must be a genuinely REASONABLE outcome on its own (an in-form scorer to score, a strong favourite to win, a likely card/shot/corner over) — the ticket is a longshot only because MANY reasonable things must ALL happen. Prefer POSITIVELY CORRELATED legs (same-game builds: a team to win + their striker to score + match over) so the legs reinforce each other and the true joint chance beats the naive product. Lean on the in-form flag, the API predictions and the Grok digest for which longshots are live. NEVER stack contradictory or mutually-exclusive legs. In each 'why', state the combined odds and the rough hit chance, and name the one leg most likely to break it.",
-        "scout" => "SCOUT mode — FUSE TWO INDEPENDENT SOURCES into the picks: (A) OUR full engine table above (every market, built from our API data + models), and (B) the FULL INGESTED PAGE(S) the user hand-fed for these fixtures (injected in the notes below — corners, cards, shots, form, xG, injuries, predictions, analyst reads, whatever the page carried). Some legs in the table are flagged 'from ingested stats' (derived straight from the page's numbers); the rest are ours. Your job: cross-reference the two and surface the picks they JOINTLY support. Rules: (1) Where our number and the ingested number AGREE on a line, that's your strongest conviction — lead with those. (2) Where they DISAGREE, judge which source to trust for that market and SAY why (e.g. the page has fresher corner data; our injury read is better). (3) Use the page's EXTRA angles our table can't see (a noted suspension, a tactical mismatch, a predicted scoreline) to pick or veto legs across ANY market, not just corners/cards/shots. (4) The ingested data is the user's EDGE — it must materially shape the slate, not be ignored. Build a varied set — singles and 2-5 leg builds across the fixtures. Never stack mutually-implied or same-team-same-market lines. In each 'why', name what BOTH sources said (e.g. 'our 5.6 + page 6.4 corners → over 4.5 strong' or 'page flags their CB suspended → fade their clean sheet').",
+        "scout" => "SCOUT mode — FUSE TWO INDEPENDENT SOURCES into the picks: (A) OUR full engine table above (every market, built from our API data + models), and (B) the FULL INGESTED PAGE(S) the user hand-fed for these fixtures (injected in the notes below — corners, cards, shots, form, xG, injuries, predictions, analyst reads, whatever the page carried). Some legs in the table are flagged 'from ingested stats' (derived straight from the page's numbers); the rest are ours. Your job: cross-reference the two and surface the picks they JOINTLY support. Rules: (1) Where our number and the ingested number AGREE on a line, that's your strongest conviction — lead with those. (2) Where they DISAGREE, judge which source to trust for that market and SAY why (e.g. the page has fresher corner data; our injury read is better). (3) Use the page's EXTRA angles our table can't see (a noted suspension, a tactical mismatch, a predicted scoreline) to pick or veto legs across ANY market, not just corners/cards/shots. (4) The ingested data is the user's EDGE — it must materially shape the slate, not be ignored. Build a WIDE, varied set — lots of singles plus 2-5 leg builds across the fixtures, so the user can cherry-pick. Surface not just near-certainties but SOLID MODERATE picks too: any leg with est_prob down to ~0.30 is legitimate data worth showing (a ~30-45% shot on a decent price is exactly the kind of edge to surface) — do NOT restrict to only high-probability lines. Never stack mutually-implied or same-team-same-market lines. In each 'why', name what BOTH sources said (e.g. 'our 5.6 + page 6.4 corners → over 4.5 strong' or 'page flags their CB suspended → fade their clean sheet').",
+        "apex" => "APEX mode — the discipline strategy: bet ONLY where a PROVEN edge mechanism exists, pass on everything else. Two ticket sources, nothing more: (1) SHARP-EDGE SINGLES — legs where ev_source is sharp and ev ≥ +2% (the takeable price beats Pinnacle's de-vigged truth) AND our est_prob roughly agrees with pinnacle_prob (a big gap = one read is wrong = pass). (2) CORRELATED SGPs — ONLY the pre-priced combos listed in the CORRELATED COMBOS block below; copy each one verbatim as its own SGP ticket. Do NOT assemble any other multi-leg ticket, do NOT pad with likelihood-only legs, do NOT chase longshots. If few legs qualify, return a SHORT slate and say so — Apex passing on a thin slate IS the strategy working. In each 'why', name the edge mechanism and its size (e.g. 'sharp 55% vs 1.95 takeable = +7% EV' or 'copula lift x1.22 → corr-EV +9%').",
         _ => "Lean value/longshot: prioritise +EV legs (best price beats the true probability) — that is the exploitable edge.",
+    };
+    let apex_block = if opts.apex_combos.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nCORRELATED COMBOS (deterministically priced by our Monte-Carlo copula; 'corr' already accounts for the legs reinforcing each other — these are the ONLY multi-leg tickets allowed in Apex mode):\n{}\nBuild EACH combo as its own SGP ticket, copying every leg's subject/market/line verbatim from the table. Drop a combo only if team news clearly invalidates a leg (say so).",
+            opts.apex_combos.trim()
+        )
     };
     let variation_block = if opts.variation > 0 || !opts.exclude.is_empty() {
         format!(
@@ -272,13 +306,13 @@ Match context — predictions, league standings (motivation), head-to-head, weat
 Pre-computed candidate legs (each may carry "plausibility" 1-5 — a real-world context score from a scout pass: 5 = very plausible for this match, 1 = implausible/trap (rotation/role/matchup risk). PREFER higher-plausibility legs; avoid plausibility 1-2 unless the value is exceptional and you say why):
 {table}
 
-Build EXACTLY {count} main tickets — hitting this exact COUNT is the #1 HARD requirement, above every preference below. {typerule}{minlegs} {strategy} Each ticket must differ from every other by at least one leg, but tickets MAY SHARE legs: if the candidate pool is thin, REUSE legs and subjects across tickets (re-combining them differently) to reach the full count — that is REQUIRED, not optional. Any FEELING LUCKY tickets requested below are ADDITIONAL, on top of these {count}. NEVER return fewer than {count} main tickets; if you cannot make them all maximally diverse, return them anyway with repeated legs.
+Build UP TO {count} main tickets — aim for the full {count} when the candidate pool genuinely supports it, but QUALITY BEATS COUNT: never pad the slate with weak, incoherent or near-duplicate tickets just to hit a number. If the pool is thin, return fewer, better tickets and say why in data_quality_notes. {typerule}{minlegs} {strategy} Each ticket must differ from every other by at least one leg; tickets MAY share legs when re-combined into genuinely different constructions. Any FEELING LUCKY tickets requested below are ADDITIONAL, on top of the main slate.
 
-DIVERSITY IS PREFERRED (but never at the cost of the count):
-- Prefer to spread subjects around so one result can't sink the whole slate — ideally a single subject (player or team) appears in only a small share of tickets — but the exact ticket count ALWAYS wins: if respecting diversity would mean returning fewer than {count}, repeat subjects/legs instead and still return {count}.{diversitycap}
+DIVERSITY:
+- Spread subjects around so one result can't sink the whole slate — ideally a single subject (player or team) appears in only a small share of tickets.{diversitycap}
 - Vary the leg combinations and odds ranges (some shorter banker-ish, some bigger longshots) so tickets aren't near-duplicates — never just swap one leg.
 - Spread MARKETS too: don't lean on one market (e.g. all anytime-scorer). Mix scorer/SOT/goals/corners/result/etc. across the slate so no single market or subject is over-used.
-{why}{lucky}{bias}{variation}
+{why}{lucky}{bias}{apex}{variation}
 
 Output STRICT JSON ONLY, no prose outside the JSON, matching exactly:
 {{
@@ -299,7 +333,7 @@ Output STRICT JSON ONLY, no prose outside the JSON, matching exactly:
 
 Each leg's "selection" and "market" MUST be copied verbatim from a table row's "subject" and "market". Do not put numbers in legs.
 
-FINAL CHECK before you answer: count the objects in "tickets". It MUST equal {count} main tickets PLUS every Feeling-Lucky ticket requested. If it's short, ADD more by re-combining existing legs until the count is exact — do not stop early."#,
+FINAL CHECK before you answer: (1) no ticket stacks mutually-implied, contradictory or nested same-player legs; (2) every leg's selection/market/line exists VERBATIM in the table; (3) every requested Feeling-Lucky ticket is present and titled exactly as named. Prefer dropping a weak ticket over shipping it."#,
         markets = markets.join(", "),
         types = types,
         notes = notes_block,
@@ -314,6 +348,7 @@ FINAL CHECK before you answer: count the objects in "tickets". It MUST equal {co
         why = why_clause,
         lucky = lucky_block,
         bias = bias_block,
+        apex = apex_block,
         variation = variation_block,
     )
 }
@@ -342,22 +377,35 @@ pub async fn call_model(
 
     let prompt = user_prompt(table, markets, reasoning, notes, predictions, grok, opts);
 
-    // Scale the output budget to the requested slate size so the JSON isn't cut off.
+    // Scale the output budget to the requested slate size so the JSON isn't cut
+    // off. Thinking-capable models (Sonnet 5, Opus) can spend a chunk of the
+    // budget on reasoning, so keep a generous ceiling.
     let count = if opts.count == 0 { 10 } else { opts.count } as i64;
-    let max_tokens = (2400 + count * 540 + opts.lucky_total() as i64 * 560).clamp(3000, 16000);
+    // Enough for the JSON slate + some thinking headroom, but NOT so high that a
+    // thinking model runs for minutes and trips the request timeout.
+    let max_tokens = (3000 + count * 560 + opts.lucky_total() as i64 * 560).clamp(4000, 24000);
 
-    // First attempt — strict parse, then salvage a truncated slate.
-    let (text, in1, out1) = request_text(state, model, &prompt, max_tokens).await?;
-    if let Ok(parsed) = parse_result(&text) {
-        return Ok(ModelCall { result: parsed, input_tokens: in1, output_tokens: out1 });
+    // First attempt — strict parse, then salvage a truncated slate. A request
+    // error here (e.g. "no text block" when the model spent the budget thinking)
+    // is NOT fatal: fall through to the bigger-budget retry.
+    let (mut in1, mut out1) = (0i64, 0i64);
+    if let Ok((text, i, o)) = request_text(state, model, &prompt, max_tokens).await {
+        in1 = i;
+        out1 = o;
+        if let Ok(parsed) = parse_result(&text) {
+            return Ok(ModelCall { result: parsed, input_tokens: in1, output_tokens: out1 });
+        }
     }
 
-    // Retry once, bigger budget + stricter nudge.
+    // Retry once, bigger budget + stricter nudge (covers both unparseable JSON
+    // and a first attempt that returned no usable text). The retry budget must
+    // be STRICTLY LARGER than the first attempt — the old `.min(18000)` made it
+    // SMALLER for big slates, exactly the case where truncation happens.
     let stricter = format!(
-        "{prompt}\n\nIMPORTANT: Output ONLY the JSON object, starting with {{ and ending with }}. No markdown, no commentary. Keep each 'why' to one short sentence so the JSON is complete."
+        "{prompt}\n\nIMPORTANT: Output ONLY the JSON object, starting with {{ and ending with }}. No markdown, no commentary, no preamble. Be concise — keep each 'why' to one short sentence so the JSON is COMPLETE and not truncated."
     );
     let (text2, in2, out2) =
-        request_text(state, model, &stricter, (max_tokens + 2000).min(12000)).await?;
+        request_text(state, model, &stricter, (max_tokens + 4000).min(30000)).await?;
     let result =
         parse_result(&text2).map_err(|e| format!("model returned unparseable JSON: {e}"))?;
     Ok(ModelCall {
@@ -373,7 +421,66 @@ async fn request_text(
     prompt: &str,
     max_tokens: i64,
 ) -> Result<(String, i64, i64), String> {
-    anthropic_call(state, model, SYSTEM_PROMPT, prompt, max_tokens).await
+    chat_call(state, model, SYSTEM_PROMPT, prompt, max_tokens).await
+}
+
+const REFINE_SYSTEM: &str = r#"You are the senior analyst doing a FINAL pass on draft betting tickets a faster model assembled from a PRE-COMPUTED candidate table. Every number (est_prob, pinnacle_prob, book_odds, ev) is fixed and authoritative — NEVER change or invent a number. Return the FINAL polished slate as strict JSON with the SAME shape: {"tickets":[ ... ]} (each ticket: type, title, confidence, legs[{match,market,selection,line}], why).
+Improve the draft: DROP incoherent, weak or duplicate tickets; FIX any ticket that stacks mutually-implied or contradictory legs (BTTS + Over 1.5; a team to win + that same team's Double Chance; two lines of the same team market; a both-teams total pinned on ONE team); where the table clearly offers a stronger leg, SWAP it in. Every leg's selection/market/line MUST exist VERBATIM in the table. Any "why" you keep or write must cite only facts shown in the table — never invented stats or form claims. Keep the best tickets and roughly the same count where quality allows. Output ONLY the JSON object."#;
+
+/// Stage 2 of a two-stage build: a sharper model finalises the cheap model's
+/// draft tickets. It only SELECTS/DROPS/SWAPS from the same table — never invents
+/// numbers. Returns the refined tickets (an Err lets the caller keep the draft).
+pub async fn refine_tickets(
+    state: &AppState,
+    model: &str,
+    draft: &BuildResult,
+    table: &str,
+    strategy: &str,
+) -> Result<(Vec<crate::models::Ticket>, i64, i64), String> {
+    let draft_json = serde_json::to_string(&serde_json::json!({ "tickets": draft.tickets })).unwrap_or_default();
+    let user = format!(
+        "STRATEGY: {strategy}\n\nCANDIDATE TABLE (the ONLY legs allowed; all numbers are fixed):\n{table}\n\nDRAFT TICKETS to finalise:\n{draft_json}\n\nReturn the FINAL slate as strict JSON: {{\"tickets\":[ ... ]}}."
+    );
+    // Scale the output budget to the slate: the old flat 4000 truncated any
+    // 10+-ticket slate, the parse failed, and the caller silently shipped the
+    // draft — you paid for the refine model and got nothing.
+    let refine_budget = (2000 + draft.tickets.len() as i64 * 450).clamp(4000, 16000);
+    let (text, gin, gout) = chat_call(state, model, REFINE_SYSTEM, &user, refine_budget).await?;
+    let parsed = parse_result(&text)?;
+    if parsed.tickets.is_empty() {
+        return Err("refine returned no tickets".to_string());
+    }
+    Ok((parsed.tickets, gin, gout))
+}
+
+/// Two-stage build: a cheap high-throughput model (Haiku) drafts the slate from
+/// the full data, then a sharper model (Sonnet) does a tight final pass. Returns
+/// (final call, draft_input_tokens, draft_output_tokens) so the caller can bill
+/// each model separately. If the final pass fails, the draft is shipped as-is.
+pub async fn call_model_two_stage(
+    state: &AppState,
+    draft_model: &str,
+    final_model: &str,
+    table: &str,
+    markets: &[String],
+    reasoning: bool,
+    notes: &str,
+    predictions: &[String],
+    grok: Option<&str>,
+    opts: &PromptOpts<'_>,
+) -> Result<(ModelCall, i64, i64), String> {
+    // Stage 1 — cheap model drafts from the full context.
+    let draft = call_model(state, draft_model, table, markets, reasoning, notes, predictions, grok, opts).await?;
+    let (draft_in, draft_out) = (draft.input_tokens, draft.output_tokens);
+    // Stage 2 — sharper model finalises. On any failure, keep the draft.
+    match refine_tickets(state, final_model, &draft.result, table, &opts.strategy).await {
+        Ok((tickets, in2, out2)) => {
+            let mut result = draft.result;
+            result.tickets = tickets;
+            Ok((ModelCall { result, input_tokens: in2, output_tokens: out2 }, draft_in, draft_out))
+        }
+        Err(_) => Ok((ModelCall { result: draft.result, input_tokens: 0, output_tokens: 0 }, draft_in, draft_out)),
+    }
 }
 
 /// Generic Anthropic call → (text, input_tokens, output_tokens). Fetches the key.
@@ -384,52 +491,112 @@ pub async fn anthropic_call(
     user: &str,
     max_tokens: i64,
 ) -> Result<(String, i64, i64), String> {
+    // DeepSeek exposes an Anthropic-format API, so the same request shape works —
+    // we just swap the endpoint + key. A LOCAL DeepSeek key wins; otherwise
+    // proxy-mode installs route via the worker's /deepseek/ path (which holds
+    // the real key) — DeepSeek used to be the one provider that ignored the
+    // proxy, so Server-mode users couldn't use it at all.
+    let deepseek = is_deepseek_model(model);
     let (api_key, proxy) = {
         let keys = state.keys.lock().map_err(|_| "keys lock")?;
-        (keys.anthropic.clone(), keys.proxy())
+        if deepseek {
+            let local = keys.deepseek.clone();
+            let proxy = if local.is_none() { keys.proxy() } else { None };
+            (local, proxy)
+        } else {
+            (keys.anthropic.clone(), keys.proxy())
+        }
     };
     if proxy.is_none() && api_key.is_none() {
-        return Err("Anthropic key not set. Add it in Settings.".to_string());
+        return Err(if deepseek { "DeepSeek key not set. Add it in Settings (or configure the proxy)." } else { "Anthropic key not set. Add it in Settings." }.to_string());
     }
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": model,
-        "max_tokens": max_tokens,
+        "max_tokens": if deepseek { max_tokens.clamp(2000, 32000) } else { max_tokens },
         "system": system,
         "messages": [{ "role": "user", "content": user }]
     });
+    if deepseek {
+        // The numbers are already computed deterministically in Rust — DeepSeek is
+        // only INTERPRETING/selecting, so heavy chain-of-thought just adds minutes
+        // and burns the output budget on hidden reasoning. Turn extended thinking
+        // OFF so responses are fast and the answer isn't starved.
+        body["thinking"] = serde_json::json!({ "type": "disabled" });
+    }
 
-    let endpoint = match &proxy {
-        Some((base, _)) => format!("{base}/anthropic/v1/messages"),
-        None => ENDPOINT.to_string(),
+    let endpoint = if deepseek {
+        match &proxy {
+            Some((base, _)) => format!("{base}/deepseek/anthropic/v1/messages"),
+            None => DEEPSEEK_ENDPOINT.to_string(),
+        }
+    } else {
+        match &proxy {
+            Some((base, _)) => format!("{base}/anthropic/v1/messages"),
+            None => ENDPOINT.to_string(),
+        }
     };
-    let mut req = state
+    let (hk, hv) = match &proxy {
+        Some((_, token)) => ("x-proxy-token", token.clone()),
+        None => ("x-api-key", api_key.clone().unwrap_or_default()),
+    };
+    let resp = state
         .http
         .post(&endpoint)
         .header("anthropic-version", "2023-06-01")
-        .header("content-type", "application/json");
-    req = match &proxy {
-        Some((_, token)) => req.header("x-proxy-token", token),
-        None => req.header("x-api-key", api_key.unwrap_or_default()),
-    };
-    let resp = req.json(&body)
+        .header("content-type", "application/json")
+        .header(hk, &hv)
+        .json(&body)
         .send()
         .await
         .map_err(|e| format!("anthropic request failed: {e}"))?;
-
-    let status = resp.status();
-    let text = resp.text().await.map_err(|e| e.to_string())?;
+    let mut status = resp.status();
+    let mut text = resp.text().await.map_err(|e| e.to_string())?;
+    // DeepSeek: if it rejects the `thinking` field, retry once WITHOUT it so a
+    // single unsupported param can't break every call.
+    if deepseek && !status.is_success() && body.get("thinking").is_some() {
+        let mut b2 = body.clone();
+        if let Some(o) = b2.as_object_mut() {
+            o.remove("thinking");
+        }
+        if let Ok(resp2) = state
+            .http
+            .post(&endpoint)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .header(hk, &hv)
+            .json(&b2)
+            .send()
+            .await
+        {
+            status = resp2.status();
+            text = resp2.text().await.unwrap_or_default();
+        }
+    }
     if !status.is_success() {
         return Err(format!("anthropic {status}: {text}"));
     }
 
     let json: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-    let out = json
+    // Concatenate ALL text blocks (a response may lead with thinking blocks, then
+    // text). If none, surface the stop_reason so the failure is diagnosable rather
+    // than a blank "no text block" (usually max_tokens spent on reasoning).
+    let out: String = json
         .get("content")
         .and_then(|c| c.as_array())
-        .and_then(|arr| arr.iter().find(|b| b.get("type").and_then(|t| t.as_str()) == Some("text")))
-        .and_then(|b| b.get("text"))
-        .and_then(|t| t.as_str())
-        .ok_or_else(|| "no text block in model response".to_string())?;
+        .map(|arr| {
+            arr.iter()
+                .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default();
+    if out.trim().is_empty() {
+        let stop = json.get("stop_reason").and_then(|v| v.as_str()).unwrap_or("unknown");
+        return Err(format!(
+            "model returned no text (stop_reason: {stop}). It likely spent the token budget reasoning — retrying with a larger budget."
+        ));
+    }
     let input_tokens = json.get("usage").and_then(|u| u.get("input_tokens")).and_then(|v| v.as_i64()).unwrap_or(0);
     let output_tokens = json.get("usage").and_then(|u| u.get("output_tokens")).and_then(|v| v.as_i64()).unwrap_or(0);
     Ok((out.to_string(), input_tokens, output_tokens))
@@ -498,7 +665,9 @@ pub async fn openai_call(
     Ok((out.to_string(), input_tokens, output_tokens))
 }
 
-/// Route an analysis call to the right provider by model id.
+/// Route an analysis call to the right provider by model id. DeepSeek exposes an
+/// Anthropic-format endpoint, so it goes through `anthropic_call` (which detects
+/// the deepseek id and swaps the endpoint + key).
 pub async fn chat_call(
     state: &AppState,
     model: &str,
@@ -519,7 +688,7 @@ const PLAUSIBILITY_SYSTEM: &str = r#"You are a sharp football analyst scoring ho
 3 = neutral / ordinary.
 2 = shaky (role mismatch, fringe player, matchup works against it).
 1 = implausible or a TRAP (likely benched/rotated/injured, wrong role, contradicted by how this game will be played).
-Use your football knowledge of these specific teams and players. Do NOT invent probabilities or odds — qualitative judgement only. Give a 3-8 word reason per line. Output strict JSON only."#;
+Use your football knowledge of these specific teams and players — but ONLY what you actually know. If you do NOT recognize a player or team well enough to judge role and rotation risk, score 3 with reason "unknown to me" — NEVER invent a role, rotation pattern or recent-form claim for someone you can't place; a confidently wrong reason is worse than an honest 3. Do NOT invent probabilities or odds — qualitative judgement only. Give a 3-8 word reason per line. Output strict JSON only."#;
 
 /// One Haiku call PER FIXTURE that scores every candidate line's real-world
 /// plausibility (1-5 + short reason). Cached by (fixture + lines + context) hash
@@ -563,7 +732,7 @@ Output ONLY this JSON, one entry per line in the same order:
     Ok((out, gin, gout))
 }
 
-const INGEST_SYSTEM: &str = r#"You turn a raw web page's text into structured, betting-relevant data for ONE football fixture. Identify which match it is about (home & away team, date if shown, competition). PULL EVERY STATISTIC the page shows — be a careful data-scraper, not a summariser. Capture team numbers (corners for/against per game, shots & shots-on-target per game, cards & fouls per game, possession %, xG / xGA, goals for/against per game, clean-sheet %, form W-D-L) and key-player numbers (goals, assists, shots/SOT per game), plus any predicted score / 1X2 % / analyst angle. Be faithful — copy numbers exactly, NEVER invent them. Output strict JSON only."#;
+const INGEST_SYSTEM: &str = r#"You turn a raw web page's text into structured, betting-relevant data for ONE football fixture. Identify which match it is about (home & away team, date if shown, competition). PULL EVERY STATISTIC the page shows — be a careful data-scraper, not a summariser. Capture team numbers (corners for/against per game, shots & shots-on-target per game, cards & fouls per game, possession %, xG / xGA, goals for/against per game, clean-sheet %, form W-D-L) and key-player numbers (goals, assists, shots/SOT per game), plus any predicted score / 1X2 % / analyst angle. Be faithful — copy numbers exactly, NEVER invent them; the "summary" must only RESTATE what the page itself says (no extrapolation, no predictions of your own). Output strict JSON only."#;
 
 /// Haiku-structure an ingested web page (its visible text) into fixture-tagged
 /// JSON. Honours an optional user note ("extract only xyz"). Returns the JSON
@@ -595,13 +764,40 @@ fn clean_page_text(s: &str) -> String {
     out
 }
 
+/// Budget-aware truncation for scraped pages: if the cleaned text exceeds the
+/// cap, keep every line that carries a NUMBER (the stats we're extracting) plus
+/// short heading-like lines, and only then trim. A blind head-truncate at 24k
+/// chars paid for nav/prose and could cut the stats table off the bottom.
+fn cap_page_text(cleaned: &str, cap: usize) -> String {
+    if cleaned.len() <= cap {
+        return cleaned.to_string();
+    }
+    let mut out = String::with_capacity(cap);
+    for line in cleaned.lines() {
+        let keep = line.chars().any(|c| c.is_ascii_digit()) || line.len() <= 60;
+        if !keep {
+            continue;
+        }
+        if out.len() + line.len() + 1 > cap {
+            break;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if out.is_empty() {
+        cleaned.chars().take(cap).collect()
+    } else {
+        out
+    }
+}
+
 pub async fn extract_ingest(
     state: &AppState,
     model: &str,
     page_text: &str,
     note: &str,
 ) -> Result<(String, i64, i64), String> {
-    let text: String = clean_page_text(page_text).chars().take(24_000).collect();
+    let text = cap_page_text(&clean_page_text(page_text), 16_000);
     let note_line = if note.trim().is_empty() {
         String::new()
     } else {
@@ -643,7 +839,7 @@ For EACH ticket return exactly these fields:
 
 RATING MUST BE CONSISTENT AND ANCHORED TO THE LEG'S PROBABILITY (the "est"/"pin" given): est ≥ 0.60 → "solid"; 0.45-0.60 → "ok"; 0.30-0.45 → "risky"; < 0.30 OR genuinely contradicted/trap → "trap". A given leg gets the SAME rating no matter which ticket it appears in — do not flip Hakimi "2+ shots" between "risky" and "won't happen" across tickets; its probability is fixed. Only deviate from the probability band when there's a HARD real-world reason (player ruled out, obvious rotation, a real trap) — and then say it in the note. You are HELPING the user bet, not talking them out of it: flag genuine traps, but never reflexively rate a decent-probability leg as risky.
 
-Call out TRAPS explicitly (likely-rested star, public trap favourite, deceptively short price, nested/contradictory legs, or a bet the LIVE score has already settled) via a "trap" rating. Be concrete and concise. Output strict JSON only."#;
+Call out TRAPS explicitly (likely-rested star, public trap favourite, deceptively short price, nested/contradictory legs, or a bet the LIVE score has already settled) via a "trap" rating. KNOW YOUR LIMITS: if you do not genuinely recognize a player/team, do NOT invent lineups, rotation or form — rate by the probability band and note "no strong real-world read". Never state a stat (goals, cards, a form run) that was not supplied. Be concrete and concise. Output strict JSON only."#;
 
 /// Evaluate a set of tickets with a (usually cheaper) model. Returns the
 /// per-ticket analysis + token usage.

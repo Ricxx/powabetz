@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
-import { errMsg } from "../toast";
+import { errMsg, toast } from "../toast";
 import { api } from "../api";
+import { stratLabel } from "../types";
 import type { GenReportRow, MarketReportRow, ModelPurposeRow } from "../types";
 
 function purposeLabel(p: string): string {
@@ -78,22 +79,6 @@ function ModelPurposeTable({ rows }: { rows: ModelPurposeRow[] }) {
       })}
     </div>
   );
-}
-
-function stratLabel(s: string): string {
-  if (s === "likely") return "Secret picks";
-  if (s === "favorites") return "Form faves";
-  if (s === "oracle") return "Oracle ✦";
-  if (s === "power") return "Power Stacker ⚡";
-  if (s === "bankers") return "Anchors ⚓";
-  if (s === "jackpot") return "Jackpot 🎰";
-  if (s === "predictor") return "Match Predictor 🔮";
-  if (s === "scout") return "Scout 📡";
-  if (s === "live") return "Live 🔴";
-  if (s === "custom") return "Cherry-picked 🍒";
-  if (s === "ladder") return "Acca ladder";
-  if (s === "board") return "Board";
-  return "Value +EV";
 }
 
 function ReportTable({
@@ -246,10 +231,22 @@ export default function Ledger({ onClose }: { onClose: () => void }) {
     setBusy(true);
     setErr(null);
     try {
-      setRows(await api.settleGenerated());
+      const before = rows?.reduce((a, r) => a + (r.total - r.settled), 0) ?? 0;
+      const updated = await api.settleGenerated();
+      const after = updated.reduce((a, r) => a + (r.total - r.settled), 0);
+      const settled = Math.max(0, before - after);
+      setRows(updated);
       loadAgg();
+      toast[settled > 0 ? "success" : "info"](
+        settled > 0
+          ? `Settled ${settled} generated leg-set${settled > 1 ? "s" : ""}${after > 0 ? ` · ${after} still awaiting results` : ""}`
+          : after > 0
+            ? `No new results — ${after} still pending (a fixture settles once the feed marks it finished, ~10-30 min after full-time).`
+            : "Everything already settled."
+      );
     } catch (e) {
       setErr(errMsg(e));
+      toast.error(e);
     } finally {
       setBusy(false);
     }

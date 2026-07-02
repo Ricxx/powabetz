@@ -17,6 +17,7 @@ export default function Settings({
   const [an, setAn] = useState("");
   const [grok, setGrok] = useState("");
   const [openai, setOpenai] = useState("");
+  const [deepseek, setDeepseek] = useState("");
   const [model, setModel] = useState(settings.model);
   const [limit, setLimit] = useState(String(settings.meter.limit));
   const [selBooks, setSelBooks] = useState<Set<string>>(new Set(settings.books));
@@ -53,6 +54,7 @@ export default function Settings({
         an || null,
         grok || null,
         openai || null,
+        deepseek || null,
         null,
         model,
         Number.isFinite(lim) && lim > 0 ? lim : null,
@@ -69,6 +71,7 @@ export default function Settings({
       setAn("");
       setGrok("");
       setOpenai("");
+      setDeepseek("");
       setProxyToken("");
       toast.success("Settings saved.");
     } catch (e) {
@@ -118,14 +121,28 @@ export default function Settings({
     }
   }
 
+  // Two-click confirm — a native confirm() is unreliable inside the webview, so
+  // the first click arms and the second click actually wipes.
+  const [resetArmed, setResetArmed] = useState(false);
+  const [resetting, setResetting] = useState(false);
   async function doReset() {
-    if (!confirm("Reset everything? This permanently clears ALL bets, generated tickets, saved picks, stats, calibration learning and caches. Your API keys and settings are kept. This cannot be undone.")) return;
+    if (!resetArmed) {
+      setResetArmed(true);
+      setDataMsg(null);
+      setTimeout(() => setResetArmed(false), 5000); // auto-disarm
+      return;
+    }
+    setResetArmed(false);
+    setResetting(true);
+    setErr(null);
     try {
       await api.resetData();
-      setDataMsg("Reset complete. Reloading…");
-      setTimeout(() => window.location.reload(), 700);
+      setDataMsg("Reset complete — clearing screen…");
+      setTimeout(() => window.location.reload(), 600);
     } catch (e) {
+      setResetting(false);
       setErr(errMsg(e));
+      setDataMsg(null);
     }
   }
 
@@ -344,6 +361,12 @@ export default function Settings({
           onChange={setGrok}
         />
         <KeyInput
+          label="DeepSeek key — default engine (builds, Scout, live, analysis)"
+          set={settings.has_deepseek_key}
+          value={deepseek}
+          onChange={setDeepseek}
+        />
+        <KeyInput
           label="OpenAI key — GPT analysis (2nd angle), optional"
           set={settings.has_openai_key}
           value={openai}
@@ -413,8 +436,12 @@ export default function Settings({
             <input type="file" accept="application/json,.json" className="hidden" onChange={doImport} />
           </label>
         </div>
-        <button className="btn btn-ghost w-full text-sm text-bad border-bad/40" onClick={doReset}>
-          ⚠ Reset all data (clears bets, picks, stats &amp; learning)
+        <button
+          className={`btn w-full text-sm ${resetArmed ? "btn-primary bg-bad border-bad text-white" : "btn-ghost text-bad border-bad/40"}`}
+          disabled={resetting}
+          onClick={doReset}
+        >
+          {resetting ? "Resetting…" : resetArmed ? "⚠ Tap again to CONFIRM wipe (bets, picks, stats, ingests, cache)" : "⚠ Reset all data (clears bets, picks, stats, ingests &amp; learning)"}
         </button>
         {dataMsg && <div className="text-xs text-accent">{dataMsg}</div>}
         <p className="text-[10px] text-slate-500">

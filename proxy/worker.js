@@ -8,9 +8,12 @@
 //   /af/<path>          -> https://v3.football.api-sports.io/<path>   (x-apisports-key)
 //   /anthropic/<path>   -> https://api.anthropic.com/<path>           (x-api-key)
 //   /xai/<path>         -> https://api.x.ai/<path>                    (Authorization: Bearer)
+//   /deepseek/<path>    -> https://api.deepseek.com/<path>            (Authorization: Bearer)
+//     (the app calls /deepseek/anthropic/v1/messages — DeepSeek's
+//      Anthropic-compatible endpoint)
 //
 // Secrets (set with `wrangler secret put NAME`):
-//   API_FOOTBALL_KEY, ANTHROPIC_KEY, XAI_KEY
+//   API_FOOTBALL_KEY, ANTHROPIC_KEY, XAI_KEY, OPENAI_KEY, DEEPSEEK_KEY
 //   PROXY_TOKENS  -> comma-separated list of allowed user tokens, e.g. "alice-xyz,bob-abc"
 
 const ROUTES = {
@@ -18,6 +21,9 @@ const ROUTES = {
   "/anthropic/": { base: "https://api.anthropic.com/", header: "x-api-key", env: "ANTHROPIC_KEY" },
   "/xai/": { base: "https://api.x.ai/", header: "Authorization", env: "XAI_KEY", bearer: true },
   "/openai/": { base: "https://api.openai.com/", header: "Authorization", env: "OPENAI_KEY", bearer: true },
+  // DeepSeek's Anthropic-compatible endpoint authenticates like Anthropic
+  // (x-api-key), not Bearer — the app only calls /deepseek/anthropic/… here.
+  "/deepseek/": { base: "https://api.deepseek.com/", header: "x-api-key", env: "DEEPSEEK_KEY" },
 };
 
 export default {

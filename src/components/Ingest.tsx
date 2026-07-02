@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { errMsg, toast } from "../toast";
 import { api } from "../api";
 import Spinner from "./Spinner";
@@ -29,7 +29,7 @@ export default function Ingest({ onClose }: { onClose: () => void }) {
   const [expanded, setExpanded] = useState<Set<number>>(new Set());
   const [openGroups, setOpenGroups] = useState<Set<string>>(new Set()); // collapsed by default
   const [showArchive, setShowArchive] = useState(false);
-  const [procModel, setProcModel] = useState("claude-haiku-4-5");
+  const [procModel, setProcModel] = useState("deepseek-v4-pro");
 
   function load() {
     api.ingestInfo().then(setInfo).catch(() => {});
@@ -52,9 +52,16 @@ export default function Ingest({ onClose }: { onClose: () => void }) {
   }
   useEffect(load, []);
   // Auto-refresh so pages sent from the browser appear without a manual reload.
+  // The poll filters out rows with a PENDING deferred delete — it used to
+  // resurrect an optimistically-removed item mid-undo-window (flash back, then
+  // vanish again when the deferred delete landed).
+  const pendingDelete = useRef<Set<number>>(new Set());
   useEffect(() => {
     const t = setInterval(() => {
-      api.listIngested().then(setItems).catch(() => {});
+      api
+        .listIngested()
+        .then((list) => setItems(list.filter((x) => !pendingDelete.current.has(x.id))))
+        .catch(() => {});
     }, 5000);
     return () => clearInterval(t);
   }, []);
@@ -100,17 +107,31 @@ export default function Ingest({ onClose }: { onClose: () => void }) {
   const processAllNew = () => processIds(items.filter((x) => x.status !== "processed").map((x) => x.id));
   function del(id: number) {
     setItems((prev) => prev.filter((x) => x.id !== id)); // optimistic
+    pendingDelete.current.add(id);
     const timer = setTimeout(() => {
-      api.deleteIngested(id).catch(toast.error);
+      api
+        .deleteIngested(id)
+        .catch(toast.error)
+        .finally(() => pendingDelete.current.delete(id));
     }, 5000);
     toast.undo("Page removed", () => {
       clearTimeout(timer);
+      pendingDelete.current.delete(id);
       load(); // still on the server — restore the list
     });
   }
   async function saveNote(id: number, note: string) {
     try {
       await api.updateIngestNote(id, note);
+    } catch (e) {
+      toast.error(e);
+    }
+  }
+  async function assignFixture(it: IngestItem, label: string) {
+    try {
+      await api.assignIngestFixture(it.id, label, it.fixture_date || undefined);
+      toast.success(`Assigned to ${label}`);
+      load();
     } catch (e) {
       toast.error(e);
     }
@@ -146,7 +167,11 @@ export default function Ingest({ onClose }: { onClose: () => void }) {
     groups.get(key)!.items.push(it);
   }
   // Active = matches today/upcoming (or undated); Archive = day already passed.
-  const today = new Date().toISOString().slice(0, 10);
+  // Use LOCAL calendar dates (not UTC) so an evening kickoff isn't pushed to
+  // "tomorrow" when UTC has already rolled over.
+  const ymd = (d: Date) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  const today = ymd(new Date());
+  const tomorrow = ymd(new Date(Date.now() + 86400_000));
   const all = [...groups.values()];
   const active = all
     .filter((g) => !g.date || g.date >= today)
@@ -157,7 +182,7 @@ export default function Ingest({ onClose }: { onClose: () => void }) {
     if (!d) return "Undated";
     const dt = new Date(d + "T00:00:00");
     if (d === today) return "Today";
-    if (d === new Date(Date.now() + 86400_000).toISOString().slice(0, 10)) return "Tomorrow";
+    if (d === tomorrow) return "Tomorrow";
     return dt.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" });
   };
 
@@ -179,6 +204,20 @@ export default function Ingest({ onClose }: { onClose: () => void }) {
         <span className={`badge shrink-0 ${it.status === "processed" ? "bg-accent/20 text-accent" : "bg-edge text-slate-300"}`}>
           {it.status === "processed" ? "processed" : "new"}
         </span>
+      </div>
+
+      {/* Fixture assignment — correct a mis-tagged page or assign an unmatched one. */}
+      <div className="flex items-center gap-1.5 text-[11px]">
+        <span className="text-slate-500 shrink-0" title="Which match this page is about — fix it if wrong">📌</span>
+        <input
+          className={`flex-1 rounded bg-ink border px-1.5 py-1 text-slate-200 ${it.fixture_label ? "border-edge" : "border-warn/60"}`}
+          defaultValue={it.fixture_label || ""}
+          placeholder="Home vs Away — assign this page's match"
+          onBlur={(e) => {
+            const v = e.target.value.trim();
+            if (v && v !== (it.fixture_label || "")) assignFixture(it, v);
+          }}
+        />
       </div>
 
       {it.summary && <p className="text-xs text-slate-400">{it.summary}</p>}

@@ -41,6 +41,10 @@ pub fn start(db_path: PathBuf, token: String, port: u16) {
                 return;
             }
         };
+        // The app holds its own connection to this file — WAL + a busy timeout
+        // stop a POST during a build's cache writes failing "database is locked".
+        let _ = conn.pragma_update(None, "journal_mode", "WAL");
+        let _ = conn.pragma_update(None, "busy_timeout", 3000);
         eprintln!("ingest: listening on http://127.0.0.1:{port}/ingest");
         for mut req in server.incoming_requests() {
             let method = req.method().clone();
@@ -87,8 +91,14 @@ fn handle(conn: &Connection, body: &str) -> Result<i64, String> {
     let note = v.get("note").and_then(|x| x.as_str()).unwrap_or("");
     let mut content = v.get("content").and_then(|x| x.as_str()).unwrap_or("").to_string();
     // Bound the stored/forwarded text so one giant page can't blow up tokens.
+    // Walk back to a char boundary — truncate() PANICS mid-UTF-8 (any accented
+    // player name near the cut killed the ingest server silently).
     if content.len() > 120_000 {
-        content.truncate(120_000);
+        let mut cut = 120_000;
+        while cut > 0 && !content.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        content.truncate(cut);
     }
     let url_hash = format!("{:x}", Sha256::digest(url.as_bytes()));
     let now = std::time::SystemTime::now()

@@ -57,6 +57,7 @@ export interface SettingsView {
   has_anthropic_key: boolean;
   has_grok_key: boolean;
   has_openai_key: boolean;
+  has_deepseek_key: boolean;
   has_parlay_key: boolean;
   model: string;
   books: string[];
@@ -106,14 +107,16 @@ export const COMMON_BOOKS = [
 ];
 
 export const MODEL_OPTIONS = [
-  { id: "claude-opus-4-8", label: "Opus 4.8", note: "$5 / $25 per 1M — sharpest" },
-  { id: "claude-sonnet-4-6", label: "Sonnet 4.6", note: "$3 / $15 per 1M — balanced" },
-  { id: "claude-haiku-4-5", label: "Haiku 4.5", note: "$1 / $5 per 1M — cheapest" },
+  { id: "claude-haiku-4-5", label: "Haiku 4.5", note: "$1 / $5 per 1M — default, sharp + cheap" },
+  { id: "deepseek-v4-pro", label: "DeepSeek v4 Pro", note: "~$0.30 / $1.20 — data crunching, weaker prose" },
+  { id: "claude-sonnet-5", label: "Sonnet 5", note: "$3 / $15 — premium, higher cost" },
+  { id: "claude-opus-4-8", label: "Opus 4.8", note: "$5 / $25 — premium, sharpest" },
 ];
 
 // Models for the per-ticket quick analysis (a second angle). GPT needs an OpenAI key.
 export const ANALYSIS_MODELS = [
   { id: "claude-haiku-4-5", label: "Haiku", provider: "claude" },
+  { id: "deepseek-v4-pro", label: "DeepSeek", provider: "deepseek" },
   { id: "gpt-5-nano", label: "GPT-5 nano", provider: "openai" },
   { id: "gpt-5-mini", label: "GPT-5 mini", provider: "openai" },
 ];
@@ -131,6 +134,7 @@ export interface TicketLeg {
   book?: string | null;
   ev?: number | null;
   ev_source?: string | null;
+  raw_prob?: number | null; // engine prob before the calibration shrink
 }
 
 export interface Ticket {
@@ -331,6 +335,7 @@ export interface LegResult {
   won: boolean | null;
   detail: string;
   margin?: number | null; // O/U: signed gap to the line (+ = cleared, − = missed by)
+  void?: boolean; // book-refunded (didn't feature / postponed) — settled, counts neither way
 }
 
 export interface PlacedBet {
@@ -344,7 +349,10 @@ export interface PlacedBet {
   leg_results: LegResult[];
   settled: boolean;
   grok_used: boolean;
-  strategy: string; // value | likely | board
+  strategy: string;
+  /// Closing-line value: avg (placed/close − 1) across priced legs. Positive =
+  /// beat the close — the fastest-converging proof of real edge.
+  clv?: number | null; // value | likely | board
 }
 
 export interface BankrollView {
@@ -412,10 +420,57 @@ export interface BuildSelection {
   max_odds: number | null;
   max_per_subject: number | null;
   use_plausibility: boolean;
+  min_plausibility?: number | null;
   simple?: boolean;
+  /// Deterministic forecast only — backend skips the model call (0 tokens).
+  forecast_only?: boolean;
+  /// Voided subjects (players/teams) to drop from the candidate pool.
+  exclude_subjects?: string[];
 }
 
 export const TICKET_TYPES = ["Single", "SGP", "SGP+"];
+
+/// ONE ticket-kind rule for every screen (Results/PicksBoard/CustomSlip used to
+/// classify the same legs three different ways, and the label persists into the
+/// ledger's by-type report). Matches the backend's reground rule: SGP+ needs a
+/// same-game core (some fixture contributing 2+ legs); one leg per fixture is
+/// just a cross-game Acca.
+export function classifyTicket(matches: string[]): string {
+  if (matches.length <= 1) return "Single";
+  const counts: Record<string, number> = {};
+  for (const m of matches) counts[m] = (counts[m] || 0) + 1;
+  const nFix = Object.keys(counts).length;
+  if (nFix <= 1) return "SGP";
+  return Math.max(...Object.values(counts)) >= 2 ? "SGP+" : "Acca";
+}
+
+/// Shared strategy display names (was copy-pasted in Tracker + Ledger).
+export function stratLabel(s: string): string {
+  if (s.startsWith("dw:")) return `🧬 ${s.slice(3)}`; // Darwin paper variants
+  if (s === "apex") return "Apex 🎯";
+  if (s === "likely") return "Secret picks";
+  if (s === "favorites") return "Form faves";
+  if (s === "oracle") return "Oracle ✦";
+  if (s === "power") return "Power Stacker ⚡";
+  if (s === "bankers") return "Anchors ⚓";
+  if (s === "jackpot") return "Jackpot 🎰";
+  if (s === "predictor") return "Match Predictor 🔮";
+  if (s === "scout") return "Scout 📡";
+  if (s === "live") return "Live 🔴";
+  if (s === "custom") return "Cherry-picked 🍒";
+  if (s === "ladder") return "Acca ladder";
+  if (s === "board") return "Board";
+  return "Value +EV";
+}
+
+/// Shared probability formatter. Sub-1% shows "<1%" — Jackpot tickets target
+/// ~1-5% hit chances and Math.round showed them as a broken-looking "0%".
+export function pct(p?: number | null): string {
+  if (p == null) return "—";
+  if (p > 0 && p < 0.01) return "<1%";
+  if (p < 0.05) return `${(p * 100).toFixed(1)}%`;
+  return `${Math.round(p * 100)}%`;
+}
 
 export const GROK_CATEGORIES: { id: string; label: string }[] = [
   { id: "injuries", label: "Injuries" },
@@ -568,27 +623,20 @@ export const MARKETS: MarketDef[] = [
   { key: "tackles", label: "Tackles", group: "player", sub: "Involvement" },
   { key: "fouls", label: "Fouls", group: "player", sub: "Involvement" },
   { key: "cards", label: "Cards", group: "player", sub: "Involvement" },
-  { key: "passes", label: "Passes", group: "player", sub: "Involvement" },
   { key: "win", label: "Match Result", group: "team", sub: "Result" },
   { key: "dc", label: "Double Chance", group: "team", sub: "Result" },
-  { key: "ahandicap", label: "Asian Handicap", group: "team", sub: "Result" },
   { key: "half1", label: "1st-half result", group: "team", sub: "Result" },
   { key: "half2", label: "2nd-half result", group: "team", sub: "Result" },
   { key: "ou25", label: "Goals O/U (1.5 / 2.5 / 3.5)", group: "team", sub: "Goals" },
   { key: "h1goals", label: "1st-half Goals O/U", group: "team", sub: "Goals" },
   { key: "h2goals", label: "2nd-half Goals O/U", group: "team", sub: "Goals" },
   { key: "exactscore", label: "Correct Score", group: "team", sub: "Goals" },
-  { key: "goalsrange", label: "Goals Range (2-4, 1-6, …)", group: "team", sub: "Goals" },
-  { key: "firstscore", label: "First Team to Score", group: "team", sub: "Goals" },
   { key: "tgoals", label: "Team Total Goals", group: "team", sub: "Goals" },
   { key: "btts", label: "BTTS", group: "team", sub: "Goals" },
   { key: "tcorners", label: "Team Corners — one team (recent form)", group: "team", sub: "Goals" },
   { key: "tshots", label: "Team Shots — one team (recent form)", group: "team", sub: "Goals" },
-  { key: "mostcorners", label: "Most Corners (which team)", group: "team", sub: "Goals" },
-  { key: "mostshots", label: "Most Shots (which team)", group: "team", sub: "Goals" },
   { key: "toffsides", label: "Team Offsides — one team (recent form)", group: "team", sub: "Involvement" },
   { key: "tcards", label: "Team Cards — one team", group: "team", sub: "Involvement" },
   { key: "bothcards", label: "Both Teams Carded", group: "team", sub: "Involvement" },
   { key: "mostcards", label: "Most Cards (which team)", group: "team", sub: "Involvement" },
-  { key: "saves", label: "Goalkeeper Saves", group: "player", sub: "Involvement" },
 ];

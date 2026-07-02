@@ -1,8 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import TicketAnalysis from "./TicketAnalysis";
 import StakeBumps from "./StakeBumps";
 import { api } from "../api";
-import { kellyStake, legKey, shortTeam, type SgpPrice, type Ticket, type TicketLeg } from "../types";
+import { classifyTicket, kellyStake, legKey, shortTeam, type SgpPrice, type Ticket, type TicketLeg } from "../types";
 
 // A cherry-picked slip: legs the user pulled from across different generated
 // tickets. Recomputes combined prob/odds, suggests a Kelly stake, and places it
@@ -28,6 +28,7 @@ export default function CustomSlip({
 }) {
   const [open, setOpen] = useState(true);
   const [placed, setPlaced] = useState(false);
+  const placingRef = useRef(false); // sync double-tap guard for confirm()
   const [stake, setStake] = useState("");
   const [odds, setOdds] = useState("");
 
@@ -60,7 +61,7 @@ export default function CustomSlip({
 
   if (legs.length === 0) return null;
 
-  const kind = legs.length <= 1 ? "Single" : new Set(legs.map((l) => l.match)).size <= 1 ? "SGP" : "Custom";
+  const kind = classifyTicket(legs.map((l) => l.match));
 
   function ticket(): Ticket {
     const title = legs.map((l) => `${shortTeam(l.team) || l.selection}`).slice(0, 4).join(" + ");
@@ -78,15 +79,22 @@ export default function CustomSlip({
   }
 
   async function confirm() {
-    const s = parseFloat(stake);
-    if (!Number.isFinite(s) || s <= 0 || legs.length === 0) return;
-    const o = parseFloat(odds);
-    await onPlace(ticket(), s, Number.isFinite(o) && o > 0 ? o : null);
-    setPlaced(true);
-    onClear();
-    setStake("");
-    setOdds("");
-    setTimeout(() => setPlaced(false), 2500);
+    // Sync guard before the await — double-tap used to place duplicate bets.
+    if (placingRef.current) return;
+    placingRef.current = true;
+    try {
+      const s = parseFloat(stake);
+      if (!Number.isFinite(s) || s <= 0 || legs.length === 0) return;
+      const o = parseFloat(odds);
+      await onPlace(ticket(), s, Number.isFinite(o) && o > 0 ? o : null);
+      setPlaced(true);
+      onClear();
+      setStake("");
+      setOdds("");
+      setTimeout(() => setPlaced(false), 2500);
+    } finally {
+      placingRef.current = false;
+    }
   }
 
   return (

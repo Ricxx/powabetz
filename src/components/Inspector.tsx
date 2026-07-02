@@ -196,7 +196,7 @@ export default function Inspector({
                             )}
                             {!t.loaded && (
                               <div className="text-[11px] text-slate-500 px-1 mt-1">
-                                Squad not cached — open this match in the Players step first.
+                                Squad not cached yet — run a Build (or open the Data board) for this match first.
                               </div>
                             )}
                             <div className="flex flex-wrap gap-1.5 mt-3">

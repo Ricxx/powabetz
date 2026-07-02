@@ -22,6 +22,7 @@ import Spinner from "./components/Spinner";
 import Settings from "./components/Settings";
 import History from "./components/History";
 import Inspector from "./components/Inspector";
+import IngestedStats from "./components/IngestedStats";
 import Tracker from "./components/Tracker";
 import Newsfeed from "./components/Newsfeed";
 import Ledger from "./components/Ledger";
@@ -216,13 +217,19 @@ function AppInner() {
   const [useGrok, setUseGrok] = useState(false);
   const [grokVeto, setGrokVeto] = useState(true);
   const [grokCats, setGrokCats] = useState<Set<string>>(new Set(["injuries", "news"]));
-  const [useWeather, setUseWeather] = useState(true);
+  // Weather defaults OFF — low-value token clutter; Grok's digest mentions
+  // weather when it actually matters. Still toggleable in Advanced.
+  const [useWeather, setUseWeather] = useState(false);
   const [useStandings, setUseStandings] = useState(true);
   const [useH2h, setUseH2h] = useState(true);
   const [useLineups, setUseLineups] = useState(true);
   const [usePredictions, setUsePredictions] = useState(true);
-  const [useXg, setUseXg] = useState(false);
-  const [useTactics, setUseTactics] = useState(false);
+  const [useXg, setUseXg] = useState(true);
+  const [useTactics, setUseTactics] = useState(true);
+  // Min plausibility (1-5) filter — 1 = show everything, higher = only realistic lines.
+  const [minPlausibility, setMinPlausibility] = useState(1);
+  // Advanced expander for the redundant strategies + data-source knobs.
+  const [showAdvanced, setShowAdvanced] = useState(false);
   const [ladderCount, setLadderCount] = useState(5);
   const [ladderMinProb, setLadderMinProb] = useState(0.55);
   const [ladderScope, setLadderScope] = useState("mixed");
@@ -231,6 +238,9 @@ function AppInner() {
   const [ladderMaxPerSubject, setLadderMaxPerSubject] = useState(2);
   const [ladderOuSide, setLadderOuSide] = useState("auto");
   const [ladderMinLegs, setLadderMinLegs] = useState(2);
+  // Diversified cross-game acca: max ONE leg per match (truly independent legs).
+  const [ladderOnePerFixture, setLadderOnePerFixture] = useState(false);
+  const [darwinBusy, setDarwinBusy] = useState(false);
   const [ladderDiversityReset, setLadderDiversityReset] = useState(true);
   const [ladderVariation, setLadderVariation] = useState(0);
   // Shared per-leg odds sweet-spot (applies to regular + acca builds). 1 / 1000 = off.
@@ -239,7 +249,7 @@ function AppInner() {
   // Regular build: minimum legs per ticket (4-fold etc.) and diversity cap.
   const [regMinLegs, setRegMinLegs] = useState(1);
   const [regMaxPerSubject, setRegMaxPerSubject] = useState(0); // 0 = model default
-  const [usePlausibility, setUsePlausibility] = useState(true); // Haiku pre-score
+  const [usePlausibility] = useState(true); // Haiku pre-score — always on (filter via slider)
   const [useIngest, setUseIngest] = useState(true); // feed ingested page data into builds
   const [prewarmBusy, setPrewarmBusy] = useState(false);
   const [prewarmProgress, setPrewarmProgress] = useState<{ done: number; total: number } | null>(null);
@@ -253,14 +263,17 @@ function AppInner() {
   const [luckyModerate, setLuckyModerate] = useState(1);
   const [luckyRisky, setLuckyRisky] = useState(2);
   const [variation, setVariation] = useState(0);
+  // What kind of build produced the current result — so "Generate a new set"
+  // replays the same thing (Simple stays Simple; a ladder re-ladders).
+  const lastBuildRef = useRef<{ kind: "regular" | "simple" | "ladder" }>({ kind: "regular" });
   const [showCost, setShowCost] = useState(false);
   const [costBreak, setCostBreak] = useState<UsageBreakdown | null>(null);
 
   const [result, setResult] = useState<BuildResult | null>(null);
   const [usage, setUsage] = useState<BuildUsage | null>(null);
-  const [model, setModel] = useState("claude-opus-4-8");
-  const [showInspector, setShowInspector] = useState(false);
+  const [model, setModel] = useState("claude-haiku-4-5");
   const [showBoard, setShowBoard] = useState(false);
+  const [dataTab, setDataTab] = useState<"picks" | "inspector" | "ingested">("picks");
   const [boardMode, setBoardMode] = useState<"all" | "bankers">("all");
   const [bankroll, setBankroll] = useState(0);
   const [buildStrategy, setBuildStrategy] = useState("value");
@@ -442,6 +455,7 @@ function AppInner() {
     if (busy || prewarmBusy) return; // guard against double-fire / request spam
     const v = opts?.variation ?? 0;
     const simple = opts?.simple ?? false;
+    lastBuildRef.current = { kind: simple ? "simple" : "regular" };
     // Best-in-class presets per Simple risk dial.
     const RISK: Record<string, { strategy: string; safe: number; mod: number; risky: number }> = {
       safe: { strategy: "favorites", safe: 1, mod: 0, risky: 0 },
@@ -465,24 +479,28 @@ function AppInner() {
         implied_prob: impliedProb,
         notes,
         model,
-        ticket_count: simple ? 12 : ticketCount,
+        ticket_count: simple ? 25 : ticketCount,
         ticket_types: simple ? [...TICKET_TYPES] : [...ticketTypes],
         variation: v,
         exclude: opts?.exclude ?? [],
-        bias_builders: biasBuilders,
+        // Voided subjects persist into rebuilds (they used to only affect ladders).
+        exclude_subjects: [...voidedSubjects.entries()].filter(([, n]) => n > 0).map(([s]) => s),
+        // Simple advertises "zero setup" — hidden Advanced knobs (leg-prob
+        // ceiling, builder bias, data toggles) must NOT leak into it.
+        bias_builders: simple ? false : biasBuilders,
         most_likely: simple ? false : strategy === "likely",
         strategy: simple ? rk.strategy : strategy,
-        max_leg_prob: maxLegProb,
+        max_leg_prob: simple ? 1 : maxLegProb,
         use_grok: simple ? false : useGrok,
-        grok_veto: grokVeto,
+        grok_veto: simple ? false : grokVeto,
         grok_categories: [...grokCats],
-        use_weather: useWeather,
-        use_standings: useStandings,
-        use_h2h: useH2h,
-        use_lineups: useLineups,
-        use_predictions: usePredictions,
-        use_xg: useXg,
-        use_tactics: useTactics,
+        use_weather: simple ? false : useWeather,
+        use_standings: simple ? true : useStandings,
+        use_h2h: simple ? true : useH2h,
+        use_lineups: simple ? true : useLineups,
+        use_predictions: simple ? true : usePredictions,
+        use_xg: simple ? true : useXg,
+        use_tactics: simple ? false : useTactics,
         lucky_safe: simple ? rk.safe : luckySafe,
         lucky_moderate: simple ? rk.mod : luckyModerate,
         lucky_risky: simple ? rk.risky : luckyRisky,
@@ -492,6 +510,7 @@ function AppInner() {
         max_odds: simple ? null : oddsMax < 999 ? oddsMax : null,
         max_per_subject: simple ? null : regMaxPerSubject > 0 ? regMaxPerSubject : null,
         use_plausibility: usePlausibility,
+        min_plausibility: !simple && minPlausibility > 1 ? minPlausibility : null,
         simple,
       };
       const resp = await api.buildTickets(selection);
@@ -510,8 +529,15 @@ function AppInner() {
   }
 
   function newSet() {
+    // Replay the SAME kind of build the user last ran. Regenerating a Simple
+    // slate used to silently rebuild with the (hidden) Advanced settings, and
+    // regenerating after a ladder switched it to a model build.
+    if (lastBuildRef.current.kind === "ladder") {
+      buildLadder(true);
+      return;
+    }
     const exclude = result ? result.tickets.map(ticketSig) : [];
-    build({ variation: variation + 1, exclude });
+    build({ variation: variation + 1, exclude, simple: lastBuildRef.current.kind === "simple" });
   }
 
   // Background one-time plausibility pre-score for the selected slate. Runs one
@@ -550,11 +576,16 @@ function AppInner() {
     ) {
       runPrewarm();
     }
+    // `prewarmBusy` is a dep on purpose: if the fixture selection changes while
+    // a prewarm is mid-flight, the busy guard skips the new sig — when the run
+    // finishes and busy flips false, this re-fires and prewarms the NEW slate
+    // (it used to wedge: "✓ ready" never appeared for the changed selection).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [step, usePlausibility, fixturesSig]);
+  }, [step, usePlausibility, fixturesSig, prewarmBusy]);
 
   async function buildLadder(append = false) {
     if (busy || prewarmBusy) return; // guard against double-fire / request spam
+    lastBuildRef.current = { kind: "ladder" };
     setBusy(true);
     setError(null);
     try {
@@ -582,7 +613,8 @@ function AppInner() {
         seed,
         variation,
         oddsMin > 1.01 ? oddsMin : null,
-        oddsMax < 999 ? oddsMax : null
+        oddsMax < 999 ? oddsMax : null,
+        ladderOnePerFixture
       );
       if (append && result) {
         if (res.tickets.length === 0) {
@@ -789,7 +821,7 @@ function AppInner() {
       onNav={setOverlay}
       ingestBadge={ingestPending}
       current={null}
-      onInspect={() => setShowInspector(true)}
+      onInspect={() => { setBoardMode("all"); setDataTab("picks"); setShowBoard(true); }}
       canInspect={selectedFixtures.length > 0}
     >
       {showCost && (
@@ -817,22 +849,47 @@ function AppInner() {
           )}
         </div>
       )}
-      {showInspector && selectedFixtures.length > 0 && (
-        <Inspector fixtures={toFixtureInputs(selectedFixtures)} onClose={() => setShowInspector(false)} />
-      )}
       {showBoard && selectedFixtures.length > 0 && (
         <div className="fixed inset-0 z-40 bg-ink overflow-y-auto">
           <div className="max-w-md mx-auto p-4">
-            <PicksBoard
-              fixtures={toFixtureInputs(selectedFixtures)}
-              markets={[...selMarkets]}
-              bankroll={bankroll}
-              kellyFraction={settings?.kelly_fraction ?? 0}
-              defaultStake={settings?.default_stake ?? 0.5}
-              mode={boardMode}
-              onClose={() => setShowBoard(false)}
-              onPlaced={() => api.getBankroll().then((b) => setBankroll(b.current)).catch(() => {})}
-            />
+            {/* Data view — 3 tabs: the picks table, raw inspector, ingested stats. */}
+            {boardMode === "all" && (
+              <div className="flex gap-1.5 mb-3">
+                {([
+                  ["picks", "📊 Picks"],
+                  ["inspector", "🔍 Inspector"],
+                  ["ingested", "🧲 Ingested"],
+                ] as const).map(([id, label]) => (
+                  <button
+                    key={id}
+                    className={`flex-1 text-center text-sm rounded-lg py-2 ${
+                      dataTab === id ? "bg-accent text-ink font-semibold" : "bg-panel border border-edge text-slate-300"
+                    }`}
+                    onClick={() => setDataTab(id)}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            )}
+            {(boardMode === "bankers" || dataTab === "picks") && (
+              <PicksBoard
+                fixtures={toFixtureInputs(selectedFixtures)}
+                markets={[...selMarkets]}
+                bankroll={bankroll}
+                kellyFraction={settings?.kelly_fraction ?? 0}
+                defaultStake={settings?.default_stake ?? 0.5}
+                mode={boardMode}
+                onClose={() => setShowBoard(false)}
+                onPlaced={() => api.getBankroll().then((b) => setBankroll(b.current)).catch(() => {})}
+              />
+            )}
+            {boardMode === "all" && dataTab === "inspector" && (
+              <Inspector fixtures={toFixtureInputs(selectedFixtures)} onClose={() => setShowBoard(false)} />
+            )}
+            {boardMode === "all" && dataTab === "ingested" && (
+              <IngestedStats fixtures={toFixtureInputs(selectedFixtures)} onClose={() => setShowBoard(false)} />
+            )}
           </div>
         </div>
       )}
@@ -845,7 +902,7 @@ function AppInner() {
         </div>
       )}
 
-      <StepDots step={step} onJump={setStep} />
+      <StepDots step={step} onJump={setStep} hasResult={result != null} />
 
       {/* DATE */}
       {step === "date" && (
@@ -875,7 +932,7 @@ function AppInner() {
               ))}
             </div>
             <p className="text-[11px] text-slate-500 mt-1">
-              {days === 1 ? "Just this date." : `${days} days from this date (one request per day).`}
+              {days === 1 ? "Just this date (≤3 requests, tz-padded)." : `${days} days from this date (~${days + 2} requests, cached after).`}
             </p>
           </div>
 
@@ -932,17 +989,17 @@ function AppInner() {
       {step === "matches" && (
         <div className="space-y-3 pb-28">
           <Header title={`Matches · ${date}`} onBack={() => setStep("date")} />
-          <p className="text-xs text-slate-400 -mt-1">Step 2 of 4 — tap the matches you want to research (2–4 works best).</p>
+          <p className="text-xs text-slate-400 -mt-1">Step 2 of 4 — tap the matches you want to research (up to ~10).</p>
           <div
             className={`text-[11px] rounded-lg px-2.5 py-1.5 ${
-              selFixtureIds.size > 4
+              selFixtureIds.size > 10
                 ? "bg-warn/15 text-warn"
                 : "bg-ink text-slate-500 border border-edge"
             }`}
           >
-            {selFixtureIds.size > 4
-              ? `${selFixtureIds.size} matches selected — too many spreads the analysis thin. 2–4 gives the sharpest tickets.`
-              : "Tip: pick 2–4 matches for the sharpest analysis. Going wide dilutes quality."}
+            {selFixtureIds.size > 10
+              ? `${selFixtureIds.size} matches selected — the table and context get thin past ~10. For big cross-game accas, the Ladder's one-leg-per-match mode handles any count for free.`
+              : "Pick up to ~10 matches — the pool and context scale with your selection (past 6, low-value context is auto-trimmed)."}
           </div>
           {fixtures.length === 0 && (
             <div className="card text-sm text-slate-400 space-y-2">
@@ -1165,8 +1222,6 @@ function AppInner() {
               [
                 ["regular", "🎯 Regular"],
                 ["acca", "🪜 Acca ladder"],
-                ["board", "🧮 Picks board"],
-                ["bankers", "🏦 Bankers"],
               ] as const
             ).map(([id, label]) => (
               <button
@@ -1181,35 +1236,35 @@ function AppInner() {
             ))}
           </div>
 
-          <div className="card space-y-2">
-            <div>
-              <div className="text-xs font-semibold text-slate-200">🧠 AI plausibility scoring</div>
-              <p className="text-[11px] text-slate-500 mt-0.5">
-                Before building, a fast AI (Haiku) reads each match and rates every possible pick
-                <b className="text-slate-300"> 1–5 on how realistic it is in real life</b> — e.g. is this
-                player likely to start, does the bet suit how the game will be played. Higher-rated picks
-                get prioritised and traps pushed down. It runs once per slate, then it's cached (free after).
-              </p>
+          {/* Plausibility FILTER — a fast AI rates every pick 1–5 on how realistic it
+              is (likely to start, fits the game). Slide up to hide traps/fringe lines. */}
+          <div className="card space-y-1.5">
+            <div className="flex items-center justify-between">
+              <div className="text-xs font-semibold text-slate-200">🧠 Plausibility filter</div>
+              <span className="text-[11px] text-accent font-mono">
+                {minPlausibility === 1 ? "off" : `${minPlausibility}+/5`}
+                {prewarmBusy ? " · scoring…" : prewarmedRef.current === fixturesSig ? " · ✓ ready" : ""}
+              </span>
             </div>
-            <Toggle label="Use plausibility scoring" on={usePlausibility} onChange={setUsePlausibility} />
-            <Toggle
-              label="Include ingested page data as context"
-              on={useIngest}
-              onChange={setUseIngest}
+            <input
+              type="range"
+              min={1}
+              max={5}
+              step={1}
+              value={minPlausibility}
+              onChange={(e) => setMinPlausibility(parseInt(e.target.value, 10))}
+              className="w-full accent-accent"
             />
-            {usePlausibility && (
-              <div className="text-[11px] text-slate-400 inline-flex items-center gap-2">
-                {prewarmBusy ? (
-                  <>
-                    <Spinner /> Building plausibility data in the background…
-                  </>
-                ) : prewarmedRef.current === fixturesSig ? (
-                  <span className="text-accent">✓ Plausibility data ready (cached for this slate).</span>
-                ) : (
-                  "Plausibility data builds automatically in the background — no action needed."
-                )}
-              </div>
-            )}
+            <p className="text-[10px] text-slate-500">
+              {[
+                "", // index 0 unused
+                "1 · Off — every candidate, including fringe & unlikely lines. Widest, noisiest.",
+                "2 · Drops the clearest traps (benched/injured, wrong role). Light clean-up.",
+                "3 · Solid picks only — neutral-or-better realism. Good default for quality.",
+                "4 · Strong picks — fits the player's role and the matchup well. Tighter, fewer options.",
+                "5 · Only the most bankable, textbook-realistic lines. Very strict — can thin the slate a lot.",
+              ][minPlausibility]}
+            </p>
           </div>
 
           {buildTab === "regular" && (
@@ -1218,17 +1273,24 @@ function AppInner() {
             <div>
               <div className="text-xs font-semibold text-slate-400 mb-2">Strategy</div>
               <div className="flex flex-wrap gap-1.5">
-                {([
+                {(([
+                  // Primary strategies always shown; the redundant/niche ones live
+                  // behind the ⚙ Advanced expander.
+                  ["apex", "Apex 🎯"],
+                  ["scout", "Scout 📡"],
                   ["value", "Value +EV"],
-                  ["favorites", "Form faves"],
-                  ["likely", "Secret picks"],
-                  ["oracle", "Oracle ✦"],
-                  ["power", "Power Stacker ⚡"],
                   ["bankers", "Anchors ⚓"],
                   ["jackpot", "Jackpot 🎰"],
                   ["predictor", "Match Predictor 🔮"],
-                  ["scout", "Scout 📡"],
-                ] as [string, string][]).map(([id, label]) => {
+                  ...(showAdvanced
+                    ? [
+                        ["favorites", "Form faves"],
+                        ["likely", "Secret picks"],
+                        ["oracle", "Oracle ✦"],
+                        ["power", "Power Stacker ⚡"],
+                      ]
+                    : []),
+                ] as [string, string][])).map(([id, label]) => {
                   // Match Predictor needs exactly one fixture — show it but disable
                   // it (with a hint) otherwise, so it's discoverable.
                   const dis = id === "predictor" && selFixtureIds.size !== 1;
@@ -1238,7 +1300,7 @@ function AppInner() {
                       disabled={dis}
                       title={dis ? "Select exactly ONE match to use Match Predictor" : undefined}
                       className={`chip flex-1 text-center whitespace-nowrap ${strategy === id ? "chip-on" : ""} ${
-                        id === "oracle" || id === "power" || id === "bankers" || id === "jackpot" || id === "predictor" || id === "scout" ? "border-accent/60" : ""
+                        id === "apex" || id === "oracle" || id === "power" || id === "bankers" || id === "jackpot" || id === "predictor" || id === "scout" ? "border-accent/60" : ""
                       } ${dis ? "opacity-40 cursor-not-allowed" : ""}`}
                       onClick={() => !dis && setStrategy(id)}
                     >
@@ -1246,12 +1308,21 @@ function AppInner() {
                     </button>
                   );
                 })}
+                <button
+                  className="chip text-center text-slate-400"
+                  onClick={() => setShowAdvanced((v) => !v)}
+                  title="Show/hide the extra strategies and data-source knobs"
+                >
+                  {showAdvanced ? "▴ Less" : "⚙ Advanced"}
+                </button>
               </div>
               {selFixtureIds.size !== 1 && (
                 <p className="text-[10px] text-slate-500 mt-1">🔮 Match Predictor needs exactly one match selected (you have {selFixtureIds.size}).</p>
               )}
               <p className="text-[11px] text-slate-500 mt-1">
-                {strategy === "favorites"
+                {strategy === "apex"
+                  ? "🎯 Apex — the discipline strategy: bets ONLY where a proven edge mechanism exists. (1) Sharp-edge singles: the takeable price beats Pinnacle's de-vigged truth by 2%+ AND our model agrees. (2) Correlated SGPs: combos our Monte-Carlo copula prices as reinforcing each other more than the book charges for (lift ×1.08+, corr-EV 2%+) — found deterministically, the model just copies them. No padding, no longshots; a short slate means Apex is passing, which IS the strategy. Judge it by CLV in the Tracker."
+                  : strategy === "favorites"
                   ? "In-form favourites at useful odds (~1.5–2.5): known scorers, strong wins — bankable parlays, not chalk or longshots."
                   : strategy === "likely"
                     ? "Wide scan for motivated underdogs & value picks with a reason (must-win, momentum) — leans on Grok/standings. Pairs best with Grok on."
@@ -1266,9 +1337,28 @@ function AppInner() {
                             : strategy === "predictor"
                               ? "🔮 Match Predictor — a deep read of THIS one game. Forces every market, shows a forecast (likely result, scores, goals, cards, key players with %), then builds several same-game SGP variations. If the match is already in-play, it pulls the LIVE score/stats and the model adjusts every suggestion for the time remaining. (Single fixture only.)"
                               : strategy === "scout"
-                                ? "📡 Scout — FUSES your ingested pages with our data through the model. It builds our full table (every market, our API + models), pulls in the WHOLE ingested page (corners, cards, shots, form, xG, injuries, predictions, analyst reads — whatever you scraped), and the model cross-references the two: leaning in where they agree, judging where they differ, and using the page's extra angles to pick across any market. Needs at least one processed page matching your fixtures (a stats/preview page → 🧲 Ingest → process). Your hand-fed edge, run through the model."
+                                ? "📡 Scout — FUSES your ingested pages with our data through the model. It builds our table for the markets you pick above (or all of them if you pick none), pulls in the WHOLE ingested page (corners, cards, shots, form, xG, injuries, predictions, analyst reads — whatever you scraped), and the model cross-references the two: leaning in where they agree, judging where they differ, using the page's extra angles. Needs at least one processed page matching your fixtures (a stats/preview page → 🧲 Ingest → process). Your hand-fed edge, run through the model."
                                 : "Ranks by +EV — value/longshots where the price beats the true probability."}
               </p>
+              <button
+                className="btn btn-ghost w-full text-xs py-2 border border-edge mt-2"
+                disabled={darwinBusy || selFixtureIds.size === 0}
+                title="Paper-trades 8 deterministic micro-strategies (sharp-EV ×2, form-gap, line-room, correlated combos, cross-game shooters, chalk treble, contrarian unders) on this slate into the Ledger. Zero model tokens; the Ledger becomes a survival-of-the-fittest leaderboard."
+                onClick={async () => {
+                  if (darwinBusy) return;
+                  setDarwinBusy(true);
+                  try {
+                    const lines = await api.darwinSweep(toFixtureInputs(selectedFixtures), [...selMarkets]);
+                    toast.success(`🧬 Darwin sweep papered: ${lines.join(" · ")}. Watch the Ledger's 🧬 rows.`);
+                  } catch (e) {
+                    toast.error(e);
+                  } finally {
+                    setDarwinBusy(false);
+                  }
+                }}
+              >
+                {darwinBusy ? "🧬 Sweeping…" : "🧬 Darwin sweep — paper-trade 8 micro-strategies on this slate (0 tokens)"}
+              </button>
             </div>
             <div>
               <div className="text-[11px] text-slate-500 mb-1">
@@ -1547,7 +1637,19 @@ function AppInner() {
             </div>
             <OddsBand min={oddsMin} max={oddsMax} setMin={setOddsMin} setMax={setOddsMax} />
             <Toggle
-              label="Reset diversity on “Add more” (new batch can reuse players)"
+              label="🎯 One leg per match"
+              on={ladderOnePerFixture}
+              onChange={setLadderOnePerFixture}
+            />
+            {ladderOnePerFixture && (
+              <p className="text-[10px] text-slate-500 -mt-1">
+                Max one leg from each match, so legs are truly independent — e.g. select 10 matches +
+                the SOT market, min prob ~60%: the 10 best shooters, one per game, priced at the
+                product of their odds. Deterministic — no model tokens.
+              </p>
+            )}
+            <Toggle
+              label="Reset diversity on “Add more”"
               on={ladderDiversityReset}
               onChange={setLadderDiversityReset}
             />
@@ -1620,13 +1722,15 @@ function AppInner() {
           </div>
           )}
 
+          {showAdvanced && (
           <div className="card space-y-2">
-            <div className="text-xs font-semibold text-slate-400">Data inputs</div>
+            <div className="text-xs font-semibold text-slate-400">Data inputs — all on by default</div>
             <p className="text-[11px] text-slate-500">
-              Toggle what feeds the engine — turn off anything you find clouds judgement (also
-              speeds up the build). The markets you pick above already decide which player/team
-              stats are used.
+              Everything that feeds the engine is on by default. Turn off anything you find clouds
+              judgement (also speeds up the build). The markets you pick above already decide which
+              player/team stats are used.
             </p>
+            <Toggle label="Include ingested page data as context" on={useIngest} onChange={setUseIngest} />
             <Toggle label="Real xG — recent form (slower, more requests)" on={useXg} onChange={setUseXg} />
             <Toggle label="Coach & tactics play-style (Haiku, cached)" on={useTactics} onChange={setUseTactics} />
             <Toggle label="Confirmed lineups (starting XI only)" on={useLineups} onChange={setUseLineups} />
@@ -1645,6 +1749,7 @@ function AppInner() {
               </ul>
             </details>
           </div>
+          )}
 
           <Sticky>
             {prewarmBusy && prewarmProgress && (
@@ -1895,9 +2000,9 @@ function Shell({
                   : "flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs whitespace-nowrap text-slate-700 cursor-not-allowed"
               }
               onClick={() => canInspect && onInspect()}
-              title={canInspect ? "Data viewer" : "Select matches first"}
+              title={canInspect ? "All picks — data board (every prop, our true probability)" : "Select matches first"}
             >
-              <span>🔍</span>
+              <span>📊</span>
               <span>Data</span>
             </button>
           )}
@@ -1909,20 +2014,24 @@ function Shell({
 }
 
 const STEP_LABELS: Record<Step, string> = { date: "Date", matches: "Matches", markets: "Markets", results: "Tickets" };
-function StepDots({ step, onJump }: { step: Step; onJump?: (s: Step) => void }) {
+function StepDots({ step, onJump, hasResult }: { step: Step; onJump?: (s: Step) => void; hasResult?: boolean }) {
   const order: Step[] = ["date", "matches", "markets", "results"];
   const i = order.indexOf(step);
   return (
     <div className="flex gap-1.5 mb-4">
       {order.map((s, k) => {
-        const back = k < i; // only jump backward to a completed step (state is kept)
+        // Backward jumps always allowed (state is kept). Forward only to an
+        // EXISTING result — Back from Results used to be a one-way door: the
+        // tickets stayed in memory but the only way to see them again was to
+        // build again.
+        const jumpable = k < i || (s === "results" && !!hasResult && k > i);
         return (
           <button
             key={k}
-            disabled={!back || !onJump}
-            onClick={() => back && onJump?.(s)}
-            title={back ? `Back to ${STEP_LABELS[s]}` : STEP_LABELS[s]}
-            className={`h-1.5 flex-1 rounded-full transition ${k <= i ? "bg-accent" : "bg-edge"} ${back ? "cursor-pointer hover:opacity-80" : "cursor-default"}`}
+            disabled={!jumpable || !onJump}
+            onClick={() => jumpable && onJump?.(s)}
+            title={jumpable ? (k < i ? `Back to ${STEP_LABELS[s]}` : "View your tickets") : STEP_LABELS[s]}
+            className={`h-1.5 flex-1 rounded-full transition ${k <= i || (s === "results" && hasResult) ? "bg-accent" : "bg-edge"} ${jumpable ? "cursor-pointer hover:opacity-80" : "cursor-default"}`}
           />
         );
       })}
