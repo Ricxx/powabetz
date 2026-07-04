@@ -273,6 +273,7 @@ pub fn run() {
             commands::cancel_build,
             commands::refresh_fixture_data,
             commands::get_lineups,
+            commands::picks_ai_build,
             commands::build_team_index,
             commands::list_team_index,
             commands::index_league_teams,

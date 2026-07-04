@@ -633,6 +633,7 @@ export interface LeagueOption {
 
 export const MARKETS: MarketDef[] = [
   { key: "scorer", label: "Anytime Scorer", group: "player", sub: "Attacking" },
+  { key: "goalassist", label: "Score or Assist", group: "player", sub: "Attacking" },
   { key: "assists", label: "Anytime Assist", group: "player", sub: "Attacking" },
   { key: "sot", label: "Shots on Target", group: "player", sub: "Attacking" },
   { key: "pshots", label: "Player Shots", group: "player", sub: "Attacking" },

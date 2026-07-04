@@ -740,6 +740,28 @@ pub fn build_player_candidates_entry(
                     vec![],
                 ));
             }
+            "goalassist" => {
+                // Combined involvement: P(≥1 goal OR assist) from the summed
+                // rate — the bet365 "Player to Score or Assist" group.
+                let ga90 = goals_p90 + assists_p90;
+                if ga90 < 0.10 {
+                    continue;
+                }
+                let lambda = ga90 * min_scale;
+                let est = clampp(pois_ge1(lambda) * avail_mult);
+                let af = if hot { vec!["in-form (league top scorer/assister)".to_string()] } else { vec![] };
+                let mut c = base(
+                    "To Score or Assist",
+                    "goalassist",
+                    "1+ goal or assist",
+                    ga90,
+                    est,
+                    vec![format!("g+a/90 {ga90:.2}"), format!("exp_min {exp_min:.0}")],
+                    af,
+                );
+                c.xg_source = Some("proxy".to_string());
+                out.push(c);
+            }
             "assists" => {
                 let lambda = assists_p90 * min_scale;
                 if assists_p90 < 0.05 {
@@ -1655,6 +1677,23 @@ pub fn shortlist(
         out.push(slot.take().unwrap());
         true
     };
+    // FIXTURE-PRESENCE reserve: the user SELECTED every fixture — one that ends
+    // up with zero rows in the shortlist is useless to any strategy and makes
+    // cover-all builds structurally impossible. Guarantee each fixture its top
+    // 2 rows (by strategy score) before the bands compete for the rest.
+    let mut fx_reserved: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
+    for slot in slots.iter_mut() {
+        let fid = match slot.as_ref() {
+            Some(c) => c.fixture_id,
+            None => continue,
+        };
+        if *fx_reserved.get(&fid).unwrap_or(&0) >= 2 {
+            continue;
+        }
+        if try_take(slot, &mut out, &mut per_market, &mut per_fixture) {
+            *fx_reserved.entry(fid).or_insert(0) += 1;
+        }
+    }
     // CORRECT-SCORE rescue: score lines live at ~5-14% — below the lowest band —
     // so on busy slates they were squeezed out before the model ever saw them
     // and "predict the score" builds had nothing to work with. Reserve the top

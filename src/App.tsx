@@ -23,6 +23,7 @@ import Settings from "./components/Settings";
 import History from "./components/History";
 import Inspector from "./components/Inspector";
 import Lineups from "./components/Lineups";
+import MyPicks from "./components/MyPicks";
 import IngestedStats from "./components/IngestedStats";
 import Tracker from "./components/Tracker";
 import Newsfeed from "./components/Newsfeed";
@@ -313,6 +314,13 @@ function AppInner() {
   const prewarmedRef = useRef<string>("");
   // Players the user voided in the current results — kept out of "add more" tickets.
   const [voidedSubjects, setVoidedSubjects] = useState<Map<string, number>>(new Map());
+  // 📌 My Picks board — personal shortlist, persisted across restarts.
+  const [myPicks, setMyPicks] = useState<TicketLeg[]>(() => {
+    try { return JSON.parse(localStorage.getItem("pbz-mypicks") || "[]"); } catch { return []; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem("pbz-mypicks", JSON.stringify(myPicks)); } catch {}
+  }, [myPicks]);
   // Cherry-picked legs pulled from across different tickets into one custom slip.
   const [cart, setCart] = useState<TicketLeg[]>([]);
   const [buildTab, setBuildTab] = useState<"regular" | "acca" | "board" | "bankers">("regular");
@@ -330,7 +338,7 @@ function AppInner() {
   const [usage, setUsage] = useState<BuildUsage | null>(null);
   const [model, setModel] = useState("claude-haiku-4-5");
   const [showBoard, setShowBoard] = useState(false);
-  const [dataTab, setDataTab] = useState<"picks" | "bankers" | "inspector" | "ingested" | "lineups">("picks");
+  const [dataTab, setDataTab] = useState<"picks" | "bankers" | "inspector" | "ingested" | "lineups" | "mypicks">("picks");
 
   const [bankroll, setBankroll] = useState(0);
   const [buildStrategy, setBuildStrategy] = useState("value");
@@ -925,6 +933,7 @@ function AppInner() {
               <div className="flex gap-1.5">
                 {([
                   ["picks", "📊 Picks"],
+                  ["mypicks", "📌 Mine"],
                   ["bankers", "🏦 Bankers"],
                   ["lineups", "👥 XIs"],
                   ["inspector", "🔍 Inspector"],
@@ -952,6 +961,15 @@ function AppInner() {
                 defaultStake={settings?.default_stake ?? 0.5}
                 mode={dataTab === "bankers" ? "bankers" : "all"}
                 onPlaced={() => api.getBankroll().then((b) => setBankroll(b.current)).catch(() => {})}
+              />
+            )}
+            {dataTab === "mypicks" && (
+              <MyPicks
+                picks={myPicks}
+                selectedFixtureIds={selectedFixtures.map((f) => f.fixture_id)}
+                onRemove={(k) => setMyPicks((prev) => prev.filter((l) => legKey(l) !== k))}
+                onClear={() => setMyPicks([])}
+                onPlace={(t, stake, odds) => placeTicket(t, stake, odds, "custom")}
               />
             )}
             {dataTab === "lineups" && <Lineups fixtures={toFixtureInputs(selectedFixtures)} />}
@@ -1575,17 +1593,6 @@ function AppInner() {
                 ))}
               </div>
             </div>
-            <Toggle
-              label="🧩 Cover every match"
-              on={coverAll}
-              onChange={setCoverAll}
-            />
-            {coverAll && (
-              <p className="text-[10px] text-slate-500 -mt-1">
-                Every multi-leg ticket must include at least one leg from EVERY selected match — the
-                model is told to call out (not skip) a match with no defensible leg.
-              </p>
-            )}
             <div>
               <div className="text-[11px] text-slate-500 mb-1">
                 Diversity — {regMaxPerSubject === 0 ? "auto (≤¼ of tickets)" : `max ${regMaxPerSubject} ticket(s) per player/team`}
@@ -1627,19 +1634,27 @@ function AppInner() {
                 })}
               </div>
             </div>
-            <div>
+            <div className="space-y-1">
+              <Toggle label="🧩 Cover every match" on={coverAll} onChange={setCoverAll} />
+              {coverAll && (
+                <p className="text-[10px] text-slate-500">
+                  Every ticket takes at least one usable leg from EVERY selected match.
+                </p>
+              )}
+            </div>
+            <div className="space-y-1">
               <Toggle label="🧲 Use ingested data" on={useIngest} onChange={setUseIngest} />
               {useIngest && (
-                <p className="text-[10px] text-slate-500 mt-1 mb-2">
+                <p className="text-[10px] text-slate-500">
                   Feeds your processed pages into the build. Tracked on every ticket (🧲) so the
                   Ledger can show whether your ingested data actually helps.
                 </p>
               )}
             </div>
-            <div>
+            <div className="space-y-1">
               <Toggle label="🍀 Feeling Lucky" on={feelingLucky} onChange={setFeelingLucky} />
               {feelingLucky && (
-                <p className="text-[10px] text-slate-500 mt-1">
+                <p className="text-[10px] text-slate-500">
                   Adds 6 extra parlays on top of the main slate: 2 safe (~75%+), 2 moderate (~40%), 2 risky (~10%+ longshots).
                 </p>
               )}
@@ -2082,6 +2097,14 @@ function AppInner() {
             onRemove={removeCartLeg}
             onClear={() => setCart([])}
             onPlace={(t, stake, odds) => placeTicket(t, stake, odds, "custom")}
+            onSaveToPicks={(legs) => {
+              setMyPicks((prev) => {
+                const seen = new Set(prev.map(legKey));
+                return [...prev, ...legs.filter((l) => !seen.has(legKey(l)))];
+              });
+              setCart([]);
+              toast.success("Saved to 📌 My Picks (Data → Mine).");
+            }}
           />
           {buildStrategy === "ladder" && (
             <button

@@ -657,7 +657,7 @@ fn grade_leg(leg: &TicketLeg, r: &FixtureResult) -> LegResult {
             _ => ungraded("no half-time score"),
         },
         // Player markets
-        "Anytime Scorer" | "Multi Scorer (2+)" | "Anytime Assist" | "Shots on Target" | "Player Shots" | "Tackles"
+        "Anytime Scorer" | "Multi Scorer (2+)" | "Anytime Assist" | "To Score or Assist" | "Shots on Target" | "Player Shots" | "Tackles"
         | "Fouls Committed" | "Fouls Drawn" | "To Be Carded" | "Passes Completed" | "Goalkeeper Saves" => {
             let p = match lookup_player(&r.players, &leg.selection) {
                 Lookup::Found(p) => p,
@@ -681,6 +681,7 @@ fn grade_leg(leg: &TicketLeg, r: &FixtureResult) -> LegResult {
                 "Anytime Scorer" => won(p.goals >= 1.0, format!("{} goals{et}", p.goals as i64)),
                 "Multi Scorer (2+)" => won(p.goals >= 2.0, format!("{} goals{et}", p.goals as i64)),
                 "Anytime Assist" => won(p.assists >= 1.0, format!("{} assists{et}", p.assists as i64)),
+                "To Score or Assist" => won(p.goals + p.assists >= 1.0, format!("{}g {}a{et}", p.goals as i64, p.assists as i64)),
                 "Shots on Target" => won(p.sot >= k, format!("{} on target{et}", p.sot as i64)),
                 "Player Shots" => won(p.shots >= k, format!("{} shots{et}", p.shots as i64)),
                 "Tackles" => won(p.tackles >= k, format!("{} tackles{et}", p.tackles as i64)),

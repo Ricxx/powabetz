@@ -1007,7 +1007,7 @@ async fn team_tactics(state: &AppState, team: &str, coach: Option<&str>, formati
 fn is_player_market(m: &str) -> bool {
     matches!(
         m,
-        "scorer" | "sot" | "tackles" | "fouls" | "cards" | "passes" | "assists" | "pshots" | "saves"
+        "scorer" | "sot" | "tackles" | "fouls" | "cards" | "passes" | "assists" | "goalassist" | "pshots" | "saves"
     )
 }
 
@@ -1039,8 +1039,8 @@ fn map_availability(kind: &str, reason: &str) -> String {
 
 // ---------- build tickets ----------
 
-const ALL_MARKETS: [&str; 23] = [
-    "scorer", "sot", "pshots", "assists", "tackles", "fouls", "cards", "win", "dc",
+const ALL_MARKETS: [&str; 24] = [
+    "scorer", "sot", "pshots", "assists", "goalassist", "tackles", "fouls", "cards", "win", "dc",
     "btts", "half1", "half2", "ou25", "tgoals", "tcorners", "tshots", "h1goals",
     "h2goals", "exactscore", "toffsides", "tcards", "bothcards", "mostcards",
 ];
@@ -1273,7 +1273,14 @@ fn reground_tickets(
     // Enforce the allowed ticket types (e.g. drop singles the model slipped in
     // despite being disabled).
     if !allowed_types.is_empty() {
-        result.tickets.retain(|t| allowed_types.iter().any(|a| a.eq_ignore_ascii_case(&t.kind)));
+        result.tickets.retain(|t| {
+            allowed_types.iter().any(|a| a.eq_ignore_ascii_case(&t.kind))
+                // A one-leg-per-fixture cross-game parlay classifies as "Acca" —
+                // the natural shape of Stacker / cover-all builds. The UI's SGP+
+                // chip covers it; silently deleting these returned 4 tickets
+                // when the model had built the requested 10.
+                || (t.kind == "Acca" && allowed_types.iter().any(|a| a.eq_ignore_ascii_case("SGP+")))
+        });
     }
     let after_types = result.tickets.len();
 
@@ -1819,18 +1826,30 @@ fn forecast_from_candidates(all: &[Candidate], fixture_label: &str, home: &str, 
     };
     let mut sections: Vec<ForecastSection> = Vec::new();
 
-    // Result
+    // Result — ONLY when result markets were actually computed. With a props-
+    // only build hw = aw = 0 and "draw = 1 − 0 − 0" printed a fabricated
+    // "Draw 100%" for every match. No data → no section.
     let hw = prob("win", &|c| c.subject == home);
     let aw = prob("win", &|c| c.subject == away);
-    let draw = (1.0 - hw - aw).max(0.0);
-    sections.push(ForecastSection {
-        title: "Result".into(),
-        lines: vec![mk(format!("{home} win"), hw), mk("Draw".into(), draw), mk(format!("{away} win"), aw)],
-    });
+    let have_result = hw + aw > 0.0;
+    if have_result {
+        let draw = (1.0 - hw - aw).max(0.0);
+        sections.push(ForecastSection {
+            title: "Result".into(),
+            lines: vec![mk(format!("{home} win"), hw), mk("Draw".into(), draw), mk(format!("{away} win"), aw)],
+        });
+    }
 
-    // Goals
+    // Goals — same rule: only lines whose market groups exist in this build.
     let over25 = prob("ou25", &|c| c.line.to_lowercase().starts_with("over 2.5"));
-    let mut goals = vec![mk("Over 2.5 goals".into(), over25), mk("Both teams to score".into(), prob("btts", &|_| true))];
+    let btts = prob("btts", &|_| true);
+    let mut goals = Vec::new();
+    if over25 > 0.0 {
+        goals.push(mk("Over 2.5 goals".into(), over25));
+    }
+    if btts > 0.0 {
+        goals.push(mk("Both teams to score".into(), btts));
+    }
     if let Some(gr) = fc_best(cands, "goalsrange", |_| true) {
         goals.push(mk(format!("Most likely: {}", gr.line), gr.est_prob));
     }
@@ -1839,7 +1858,9 @@ fn forecast_from_candidates(all: &[Candidate], fixture_label: &str, home: &str, 
         goals.push(mk(format!("{home} score first"), fh));
         goals.push(mk(format!("{away} score first"), prob("firstscore", &|c| c.subject == away)));
     }
-    sections.push(ForecastSection { title: "Goals".into(), lines: goals });
+    if !goals.is_empty() {
+        sections.push(ForecastSection { title: "Goals".into(), lines: goals });
+    }
 
     // Most likely scorelines
     let scores = top_n("exactscore", 4);
@@ -1899,18 +1920,25 @@ fn forecast_from_candidates(all: &[Candidate], fixture_label: &str, home: &str, 
         sections.push(ForecastSection { title: "Likely players".into(), lines: players });
     }
 
-    let lean = if hw > aw + 0.12 {
+    let lean = if !have_result {
+        "Props-only read (add result/goals markets for the full forecast)".to_string()
+    } else if hw > aw + 0.12 {
         format!("{home} favoured")
     } else if aw > hw + 0.12 {
         format!("{away} favoured")
     } else {
         "Tight match".to_string()
     };
-    let goalsy = if over25 >= 0.55 { "high-scoring" } else if over25 <= 0.42 { "low-scoring" } else { "moderate goals" };
+    let headline = if over25 > 0.0 {
+        let goalsy = if over25 >= 0.55 { "high-scoring" } else if over25 <= 0.42 { "low-scoring" } else { "moderate goals" };
+        format!("{lean} · {goalsy}")
+    } else {
+        lean
+    };
     crate::models::MatchForecast {
         home: home.to_string(),
         away: away.to_string(),
-        headline: format!("{lean} · {goalsy}"),
+        headline,
         sections,
     }
 }
@@ -2660,6 +2688,31 @@ pub async fn build_tickets(
         pool_n = (pool_n + (n_fx - 4) * 10).min(220);
         market_cap = market_cap.max((n_fx * 3) / 2);
     }
+    // COVER-ALL sizing: every ticket needs ≥1 leg from EVERY fixture, so the
+    // pool must hold count × fixtures worth of DISTINCT legs (a 12-row scorer
+    // cap on 8 matches produced two near-identical 7-leg tickets).
+    if selection.cover_all.unwrap_or(false) {
+        pool_n = pool_n.max(((total_tickets as usize) * n_fx / 2 + 30).min(220));
+        market_cap = market_cap.max(n_fx * 3);
+    }
+    // FEW MARKETS selected → the per-market cap IS the whole pool; widen it so
+    // a single-market build (e.g. scorers only) still has ticket-count variety.
+    if markets.len() <= 2 {
+        market_cap = market_cap.max(pool_n / markets.len().max(1));
+    }
+    // MODEL-AWARE HEADROOM: the caps exist to keep premium-model prompts cheap,
+    // but DeepSeek is ~5x cheaper than Haiku with a huge context — starving it
+    // to a 13k-token prompt wastes assessment quality that costs cents. Scale
+    // the table up for cheap models (still ONE call — hard rule #2 is about
+    // call count, not prompt size).
+    if llm::is_deepseek_model(&model) {
+        pool_n = (pool_n * 5 / 2).min(500);
+        market_cap = market_cap.saturating_mul(2);
+    } else if model == llm::DEFAULT_MODEL {
+        // Haiku: cheap enough for a solid bump, not the full firehose.
+        pool_n = (pool_n * 3 / 2).min(320);
+        market_cap = (market_cap * 3) / 2;
+    }
     let per_fixture_cap = if n_fx >= 3 { ((pool_n * 5) / (n_fx * 2)).max(6) } else { 0 };
     // Tag candidates with their team's tactical style (visible at pick time).
     if !tactics_tags.is_empty() {
@@ -3031,6 +3084,41 @@ pub async fn build_tickets(
                 r.data_quality_notes.push(format!("Two-stage build: {draft_model} drafted, {model} finalised."));
             }
             reground_tickets(&mut r, &shortlist, &selection.ticket_types, total_tickets as usize, selection.max_per_subject);
+            // COVER-ALL audit (deterministic — the model's own notes can't be
+            // trusted to confess): report any multi-leg ticket that misses
+            // fixtures, and whether the table even had rows for them.
+            if selection.cover_all.unwrap_or(false) && selection.fixtures.len() > 1 {
+                let table_fx: HashSet<&str> = shortlist.iter().map(|c| c.fixture.as_str()).collect();
+                let mut gaps: Vec<String> = Vec::new();
+                for (i, t) in r.tickets.iter().enumerate() {
+                    if t.legs.len() < 2 {
+                        continue;
+                    }
+                    let covered: HashSet<&str> = t.legs.iter().map(|l| l.r#match.as_str()).collect();
+                    let missing: Vec<String> = selection
+                        .fixtures
+                        .iter()
+                        .map(|f| format!("{} vs {}", f.home_team, f.away_team))
+                        .filter(|fl| !covered.contains(fl.as_str()))
+                        .map(|fl| {
+                            if table_fx.contains(fl.as_str()) {
+                                fl
+                            } else {
+                                format!("{fl} (no usable rows in the table)")
+                            }
+                        })
+                        .collect();
+                    if !missing.is_empty() {
+                        gaps.push(format!("ticket {}: missing {}", i + 1, missing.join(", ")));
+                    }
+                }
+                if !gaps.is_empty() {
+                    r.data_quality_notes.push(format!(
+                        "⚠ Cover-all shortfall — {}. (Fixtures marked 'no usable rows' had nothing in the shortlist for your selected markets; the rest the model failed to include.)",
+                        gaps.join(" · ")
+                    ));
+                }
+            }
             let stored = serde_json::to_string(&r).map_err(|e| e.to_string())?;
             {
                 let conn = state.db.lock().map_err(|_| "db lock")?;
@@ -6795,6 +6883,103 @@ pub async fn get_lineups(state: State<'_, AppState>, fixtures: Vec<FixtureInput>
             !crate::odds::team_match(&plain, &fx.home_team)
         });
         out.push(LineupView { fixture_id: fx.fixture_id, label, sides });
+    }
+    Ok(out)
+}
+
+/// 📌 My Picks → AI: assemble tickets from ONLY the user's hand-picked legs.
+/// One cheap cached call (analysis model); legs keep OUR numbers — the model
+/// only combines and explains. Returns ready tickets.
+#[tauri::command]
+pub async fn picks_ai_build(
+    state: State<'_, AppState>,
+    legs: Vec<crate::models::TicketLeg>,
+    model: Option<String>,
+) -> Result<Vec<Ticket>, String> {
+    if legs.len() < 2 {
+        return Err("Add at least 2 picks to the board first.".to_string());
+    }
+    let model = model
+        .filter(|m| llm::is_allowed_analysis_model(m))
+        .unwrap_or_else(|| llm::QUAL_MODEL.to_string());
+    let listing: Vec<String> = legs
+        .iter()
+        .enumerate()
+        .map(|(i, l)| {
+            format!(
+                "{i}: {} — {}{} · {} · est {:.0}%{}",
+                l.selection,
+                l.market,
+                l.line.as_deref().map(|x| format!(" {x}")).unwrap_or_default(),
+                l.r#match,
+                l.est_prob.unwrap_or(0.0) * 100.0,
+                l.book_odds.map(|o| format!(" @{o:.2}")).unwrap_or_default()
+            )
+        })
+        .collect();
+    let system = "You assemble betting tickets from a user's HAND-PICKED shortlist. Use ONLY the numbered picks given — never invent a leg. Build 3-6 tickets of 2-6 legs: a safer core parlay, one or two balanced mid builds, and one bigger stack; prefer positively-correlated same-game pairings and NEVER combine nested legs for the same player (goal implies shot) or contradictory outcomes. Reply STRICT JSON only.";
+    let user = format!(
+        "PICKS:\n{}\n\nReply JSON: {{\"tickets\":[{{\"title\":\"short label\",\"legs\":[0,2,5],\"why\":\"one sentence\"}}]}} — legs are pick indices.",
+        listing.join("\n")
+    );
+    let hash = {
+        let mut h = Sha256::new();
+        h.update(b"picksai|");
+        h.update(model.as_bytes());
+        h.update(user.as_bytes());
+        format!("{:x}", h.finalize())
+    };
+    let cached = {
+        let conn = state.db.lock().map_err(|_| "db lock")?;
+        db::ai_get(&conn, &hash)?
+    };
+    let reply = if let Some(j) = cached {
+        j
+    } else {
+        let (text, tin, tout) = llm::anthropic_call(&state, &model, system, &user, 3000).await?;
+        let conn = state.db.lock().map_err(|_| "db lock")?;
+        let _ = db::usage_add(&conn, af::now_ts(), &model, tin, tout, "eval");
+        db::ai_put(&conn, &hash, &text, &model, af::now_ts())?;
+        text
+    };
+    let start = reply.find('{').ok_or("model returned no JSON")?;
+    let end = reply.rfind('}').ok_or("model returned no JSON")?;
+    let v: Value = serde_json::from_str(&reply[start..=end]).map_err(|e| e.to_string())?;
+    let mut out: Vec<Ticket> = Vec::new();
+    for t in v.get("tickets").and_then(|x| x.as_array()).unwrap_or(&vec![]) {
+        let idxs: Vec<usize> = t
+            .get("legs")
+            .and_then(|l| l.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_u64().map(|n| n as usize)).filter(|&i| i < legs.len()).collect())
+            .unwrap_or_default();
+        if idxs.len() < 2 {
+            continue;
+        }
+        let tlegs: Vec<crate::models::TicketLeg> = idxs.iter().map(|&i| legs[i].clone()).collect();
+        // Numbers are OURS (already on the legs); model only combined them.
+        let probs: Vec<f64> = tlegs.iter().filter_map(|l| l.est_prob).collect();
+        let books: Vec<f64> = tlegs.iter().filter_map(|l| l.book_odds).collect();
+        let all_priced = books.len() == tlegs.len() && !books.is_empty();
+        let mut fixtures: HashMap<String, usize> = HashMap::new();
+        for l in &tlegs {
+            *fixtures.entry(l.r#match.clone()).or_insert(0) += 1;
+        }
+        let max_pf = fixtures.values().copied().max().unwrap_or(0);
+        let kind = if fixtures.len() <= 1 { "SGP" } else if max_pf >= 2 { "SGP+" } else { "Acca" };
+        out.push(Ticket {
+            kind: kind.to_string(),
+            title: t.get("title").and_then(|x| x.as_str()).unwrap_or("My picks build").to_string(),
+            confidence: String::new(),
+            combined_prob: (probs.len() == tlegs.len() && !probs.is_empty()).then(|| probs.iter().product()),
+            combined_odds: all_priced.then(|| books.iter().product()),
+            combined_ev: None,
+            legs: tlegs,
+            flags: vec!["from my picks".to_string()],
+            why: t.get("why").and_then(|x| x.as_str()).map(|s| s.to_string()),
+        });
+    }
+    if out.is_empty() {
+        return Err("The model returned no usable combinations — try more/varied picks.".to_string());
     }
     Ok(out)
 }

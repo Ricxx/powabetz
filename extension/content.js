@@ -49,6 +49,7 @@
     "anytime scorer": ["player to score", "to score at any time", "goalscorer"],
     "multi scorer (2+)": ["player to score", "to score 2 or more"],
     "anytime assist": ["player to score or assist", "to assist"],
+    "to score or assist": ["player to score or assist"],
     "shots on target": ["player shots on target"],
     "player shots": ["player shots"],
     "to be carded": ["player cards", "to be booked"],

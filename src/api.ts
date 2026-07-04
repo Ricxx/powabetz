@@ -213,6 +213,8 @@ export const api = {
   liveSnapshot: (fixture: LiveFixture) => invoke<LiveSnapshot>("live_snapshot", { fixture }),
   liveTicket: (fixture: LiveFixture, model: string) => invoke<LiveTicket>("live_ticket", { fixture, model }),
   priceSgp: (legs: TicketLeg[]) => invoke<SgpPrice>("price_sgp", { legs }),
+  // 📌 My Picks → one cheap cached AI pass assembling the user's shortlist.
+  picksAiBuild: (legs: TicketLeg[], model?: string) => invoke<Ticket[]>("picks_ai_build", { legs, model: model ?? null }),
   getBankers: (fixtures: FixtureInput[], markets: string[]) =>
     invoke<Candidate[]>("get_bankers", { fixtures, markets }),
 

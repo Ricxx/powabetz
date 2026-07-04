@@ -16,6 +16,7 @@ export default function CustomSlip({
   onRemove,
   onClear,
   onPlace,
+  onSaveToPicks,
 }: {
   legs: TicketLeg[];
   bankroll?: number;
@@ -25,6 +26,7 @@ export default function CustomSlip({
   onRemove: (key: string) => void;
   onClear: () => void;
   onPlace: (t: Ticket, stake: number, odds: number | null) => Promise<void>;
+  onSaveToPicks?: (legs: TicketLeg[]) => void;
 }) {
   const [open, setOpen] = useState(true);
   const [placed, setPlaced] = useState(false);
@@ -169,9 +171,16 @@ export default function CustomSlip({
 
           <div className="flex items-center justify-between text-[11px] text-slate-400">
             <span>{kind === "Custom" ? "cross-game parlay" : kind}</span>
-            <button className="underline hover:text-slate-200" onClick={onClear}>
-              clear all
-            </button>
+            <span className="flex items-center gap-3">
+              {onSaveToPicks && (
+                <button className="underline text-accent" title="Move these legs to your 📌 My Picks board (Data → Mine) — build combos or an AI set from there" onClick={() => onSaveToPicks(legs)}>
+                  📌 save to My Picks
+                </button>
+              )}
+              <button className="underline hover:text-slate-200" onClick={onClear}>
+                clear all
+              </button>
+            </span>
           </div>
 
           <TicketAnalysis key={legs.map(legKey).join("|")} ticket={ticket()} leagues={leagues} />
