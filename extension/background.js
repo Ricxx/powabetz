@@ -59,6 +59,24 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         sendResponse(r.ok ? await r.json() : null);
         return;
       }
+      if (msg?.type === "pbz-ticket") {
+        // Latest built slate from the app - for the on-page slip assistant.
+        try {
+          const r = await fetch(`${base}/ticket`, {
+            headers: { "x-ingest-token": cfg.token || "" },
+          });
+          if (r.status === 401) {
+            sendResponse({ ok: false, error: "Unauthorized — the token in the extension popup doesn't match the app (Settings → ingest token)." });
+          } else if (!r.ok) {
+            sendResponse({ ok: false, error: `App answered HTTP ${r.status} — is the app up to date? (rebuild + restart)` });
+          } else {
+            sendResponse(await r.json());
+          }
+        } catch {
+          sendResponse({ ok: false, error: "Can't reach the app on 127.0.0.1:8765 — is Powabetz running?" });
+        }
+        return;
+      }
       if (msg?.type === "pbz-ingest") {
         const ok = await send(msg.payload);
         badge(ok ? "✓" : "!", ok);

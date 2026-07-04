@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { errMsg, toast } from "../toast";
 import { api } from "../api";
 import Hint from "./Hint";
-import { COMMON_BOOKS, MODEL_OPTIONS, TIMEZONES, type BankrollView, type SettingsView } from "../types";
+import { COMMON_BOOKS, MODEL_OPTIONS, TIMEZONES, type BankrollView, type IndexLeagueView, type LeagueOption, type SettingsView, type TeamPerfRow } from "../types";
 
 export default function Settings({
   settings,
@@ -32,6 +32,16 @@ export default function Settings({
   const [bank, setBank] = useState<BankrollView | null>(null);
   const [bankInput, setBankInput] = useState("");
   const [ingestEnabled, setIngestEnabled] = useState(true);
+  // Opponent-strength index state.
+  const [useIndex, setUseIndex] = useState(settings.use_team_index ?? true);
+  const [idxLeagues, setIdxLeagues] = useState<IndexLeagueView[]>([]);
+  const [leagueOpts, setLeagueOpts] = useState<LeagueOption[]>([]);
+  const [idxLeagueSel, setIdxLeagueSel] = useState<number | "">("");
+  const seasonGuess = new Date().getMonth() >= 6 ? new Date().getFullYear() : new Date().getFullYear() - 1;
+  const [idxSeason, setIdxSeason] = useState(seasonGuess);
+  const [idxBusy, setIdxBusy] = useState(false);
+  const [perf, setPerf] = useState<TeamPerfRow[] | null>(null);
+  const [idxMsg, setIdxMsg] = useState<string | null>(null);
 
   useEffect(() => {
     api.getBankroll().then((b) => {
@@ -39,6 +49,8 @@ export default function Settings({
       setBankInput(String(b.bankroll));
     }).catch(() => {});
     api.ingestInfo().then((i) => setIngestEnabled(i.enabled)).catch(() => {});
+    api.listTeamIndex().then(setIdxLeagues).catch(() => {});
+    api.fetchLeagues().then(setLeagueOpts).catch(() => {});
   }, []);
 
   const meter = settings.meter;
@@ -64,7 +76,8 @@ export default function Settings({
         tz,
         proxyUrl.trim(),
         proxyToken || null,
-        ingestEnabled
+        ingestEnabled,
+        useIndex
       );
       onSaved(next);
       setAf("");
@@ -419,6 +432,164 @@ export default function Settings({
             <span className={`absolute top-1 w-5 h-5 rounded-full bg-ink transition-all ${ingestEnabled ? "left-6" : "left-1"}`} />
           </button>
         </div>
+      </div>
+
+      <div className="card space-y-2">
+        <div className="flex items-center justify-between">
+          <div className="min-w-0">
+            <div className="text-xs font-semibold text-slate-300">🧭 Opponent-strength index</div>
+            <div className="text-[11px] text-slate-500">
+              Per-league attack/defence ratings (schedule-corrected, from each team's last ~10
+              matches). Builds adjust every expectation for WHO the opponent is — a shots line
+              earned against soft defences deflates against a top block. Building is manual and
+              cache-first (a league costs ~20–170 requests cold, far less warm).
+            </div>
+          </div>
+          <button
+            className={`shrink-0 w-12 h-7 rounded-full transition relative ${useIndex ? "bg-accent" : "bg-edge"}`}
+            onClick={() => setUseIndex((v) => !v)}
+            aria-label="toggle opponent index"
+            title="Use the built index in builds (Save to apply). Off = raw recent-form rates only."
+          >
+            <span className={`absolute top-1 w-5 h-5 rounded-full bg-ink transition-all ${useIndex ? "left-6" : "left-1"}`} />
+          </button>
+        </div>
+        {idxLeagues.length > 0 && (
+          <div className="space-y-1">
+            {idxLeagues.map((l) => {
+              const days = Math.floor((Date.now() / 1000 - l.built_at) / 86400);
+              const name = leagueOpts.find((o) => o.id === l.league_id)?.name ?? `League ${l.league_id}`;
+              return (
+                <div key={`${l.league_id}-${l.season}`} className="flex items-center justify-between gap-2 text-xs rounded-lg bg-ink border border-edge px-2.5 py-1.5">
+                  <span className="min-w-0 truncate">
+                    {name} <span className="text-slate-500">· {l.season} · {l.teams} teams · built {days === 0 ? "today" : `${days}d ago`}{days > 7 ? " ⚠ stale" : ""}</span>
+                  </span>
+                  <button
+                    className="text-accent underline shrink-0 disabled:opacity-40"
+                    disabled={idxBusy}
+                    onClick={async () => {
+                      setIdxBusy(true); setIdxMsg(null);
+                      try {
+                        await api.buildTeamIndex(l.league_id, l.season);
+                        setIdxLeagues(await api.listTeamIndex());
+                        setIdxMsg("Rebuilt.");
+                      } catch (e) { toast.error(e); } finally { setIdxBusy(false); }
+                    }}
+                  >
+                    ↻ rebuild
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        )}
+        <div className="flex items-center gap-1.5">
+          <select
+            className="input flex-1 text-xs"
+            value={idxLeagueSel}
+            onChange={(e) => setIdxLeagueSel(e.target.value === "" ? "" : Number(e.target.value))}
+          >
+            <option value="">Pick a league to index…</option>
+            {leagueOpts.map((o) => (
+              <option key={o.id} value={o.id}>{o.name} ({o.country})</option>
+            ))}
+          </select>
+          <select className="input w-20 text-xs" value={idxSeason} onChange={(e) => setIdxSeason(Number(e.target.value))}>
+            {[seasonGuess, seasonGuess - 1].map((y) => <option key={y} value={y}>{y}</option>)}
+          </select>
+          <button
+            className="btn btn-ghost text-xs px-2.5 py-2 shrink-0 disabled:opacity-40"
+            disabled={idxBusy || idxLeagueSel === ""}
+            onClick={async () => {
+              if (idxLeagueSel === "") return;
+              setIdxBusy(true); setIdxMsg(null);
+              try {
+                const v = await api.buildTeamIndex(idxLeagueSel, idxSeason);
+                setIdxLeagues(await api.listTeamIndex());
+                setIdxMsg(`Indexed ${v.teams} teams.`);
+              } catch (e) { toast.error(e); } finally { setIdxBusy(false); }
+            }}
+          >
+            {idxBusy ? "Building…" : "🧭 Build"}
+          </button>
+        </div>
+        <div className="flex gap-2">
+          <button
+            className="btn btn-ghost flex-1 text-xs disabled:opacity-40"
+            disabled={idxBusy || idxLeagues.length === 0}
+            title="Fill in actuals for finished fixtures we predicted, then show which teams run hotter/colder than our ratings"
+            onClick={async () => {
+              setIdxBusy(true); setIdxMsg(null);
+              try { setPerf(await api.indexReview()); } catch (e) { toast.error(e); } finally { setIdxBusy(false); }
+            }}
+          >
+            📋 Audit
+          </button>
+          <button
+            className="btn btn-ghost flex-1 text-xs disabled:opacity-40"
+            disabled={idxBusy || !perf || perf.length === 0}
+            title="Fold audited residuals into the weights — bounded (30% of the gap, clamped) and consumes the audited rows"
+            onClick={async () => {
+              setIdxBusy(true);
+              try {
+                setIdxMsg(await api.recalibrateIndex());
+                setPerf(null);
+              } catch (e) { toast.error(e); } finally { setIdxBusy(false); }
+            }}
+          >
+            ⚖ Recalibrate
+          </button>
+          <button
+            className="btn btn-ghost flex-1 text-xs disabled:opacity-40"
+            disabled={idxLeagues.length === 0}
+            onClick={async () => {
+              try {
+                const json = await api.exportTeamIndex();
+                await navigator.clipboard.writeText(json);
+                setIdxMsg("Weights JSON copied to clipboard.");
+              } catch (e) { toast.error(e); }
+            }}
+          >
+            ⬇ Export
+          </button>
+          <button
+            className="btn btn-ghost flex-1 text-xs text-bad disabled:opacity-40"
+            disabled={idxBusy || idxLeagues.length === 0}
+            onClick={async () => {
+              try {
+                await api.resetTeamIndex(null);
+                setIdxLeagues([]);
+                setPerf(null);
+                setIdxMsg("All weights + audits cleared.");
+              } catch (e) { toast.error(e); }
+            }}
+          >
+            ✕ Reset
+          </button>
+        </div>
+        {perf && (
+          <div className="space-y-0.5 max-h-48 overflow-y-auto">
+            {perf.length === 0 && <div className="text-[11px] text-slate-500">No audited predictions yet — build tickets, let the matches finish, audit again.</div>}
+            {perf
+              .slice()
+              .sort((a, b) => Math.abs(b.ratio - 1) - Math.abs(a.ratio - 1))
+              .slice(0, 30)
+              .map((r) => (
+                <div key={`${r.team_id}-${r.family}`} className="flex items-center justify-between text-[11px]">
+                  <span className="truncate">{r.team_name} <span className="text-slate-500">{r.family} ×{r.games}</span></span>
+                  <span className={r.ratio > 1.1 ? "text-accent" : r.ratio < 0.9 ? "text-bad" : "text-slate-400"}>
+                    {r.avg_actual.toFixed(1)} vs {r.avg_predicted.toFixed(1)} pred ({r.ratio > 1 ? "+" : ""}{Math.round((r.ratio - 1) * 100)}%)
+                  </span>
+                </div>
+              ))}
+          </div>
+        )}
+        {idxMsg && <div className="text-xs text-accent">{idxMsg}</div>}
+        <p className="text-[10px] text-slate-500">
+          Audit compares what we PREDICTED per team (goals, shots, corners) against what actually
+          happened — the receipts for whether the biases work. Recalibrate nudges ratings 30% of
+          the observed gap (bounded), so the index self-corrects as the season moves.
+        </p>
       </div>
 
       <div className="card space-y-2">

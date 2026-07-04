@@ -53,9 +53,19 @@ pub fn start(db_path: PathBuf, token: String, port: u16) {
                 let _ = req.respond(cors(204, ""));
                 continue;
             }
+            // TEMP DIAGNOSTIC: the webview beacons JS boot progress + errors
+            // here so frontend crashes are visible in this terminal.
+            if req.url().starts_with("/jslog") {
+                let q = req.url().split_once('?').map(|(_, q)| q).unwrap_or("");
+                let msg = q.strip_prefix("m=").map(url_decode).unwrap_or_default();
+                eprintln!("[webview] {}", msg.chars().take(600).collect::<String>());
+                let _ = req.respond(cors(200, "ok"));
+                continue;
+            }
             let is_post_ingest = method == tiny_http::Method::Post && req.url().starts_with("/ingest");
             let is_status = method == tiny_http::Method::Get && req.url().starts_with("/status");
-            if !is_post_ingest && !is_status {
+            let is_ticket = method == tiny_http::Method::Get && req.url().starts_with("/ticket");
+            if !is_post_ingest && !is_status && !is_ticket {
                 let status = if req.url() == "/" { 200 } else { 404 };
                 let _ = req.respond(cors(status, "powabetz ingest"));
                 continue;
@@ -69,6 +79,17 @@ pub fn start(db_path: PathBuf, token: String, port: u16) {
                 .unwrap_or_default();
             if tok != token {
                 let _ = req.respond(cors(401, "{\"ok\":false,\"error\":\"unauthorized\"}"));
+                continue;
+            }
+            // GET /ticket → the latest built slate (auto-saved on every fresh
+            // build) for the extension's slip assistant on Bet365.
+            if is_ticket {
+                let payload = crate::db::latest_saved_ticket(&conn)
+                    .ok()
+                    .flatten()
+                    .map(|(ts, json)| format!("{{\"ok\":true,\"created_at\":{ts},\"result\":{json}}}"))
+                    .unwrap_or_else(|| "{\"ok\":false,\"error\":\"no builds yet\"}".to_string());
+                let _ = req.respond(cors(200, &payload));
                 continue;
             }
             // GET /status?url=<encoded> → counts + whether THIS page is already

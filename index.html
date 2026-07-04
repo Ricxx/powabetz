@@ -1,6 +1,26 @@
 <!doctype html>
 <html lang="en">
   <head>
+    <script>
+      // TEMP DIAGNOSTIC — reports webview boot + any JS error to the local app terminal.
+      (function () {
+        var log = function (m) {
+          try { fetch("http://127.0.0.1:8765/jslog?m=" + encodeURIComponent(m)).catch(function () {}); } catch (e) {}
+        };
+        window.__pbzlog = log;
+        log("boot:html");
+        window.onerror = function (msg, src, line, col, err) {
+          log("JS ERROR: " + msg + " @ " + src + ":" + line + ":" + col + " :: " + (err && err.stack ? String(err.stack).slice(0, 400) : ""));
+        };
+        window.addEventListener("unhandledrejection", function (e) {
+          log("PROMISE REJECTION: " + (e.reason && e.reason.stack ? String(e.reason.stack).slice(0, 400) : String(e.reason)));
+        });
+        setTimeout(function () {
+          var root = document.getElementById("root");
+          log("boot:3s root-children=" + (root ? root.children.length : "no-root"));
+        }, 3000);
+      })();
+    </script>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/png" href="/powabetz-favicon.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />

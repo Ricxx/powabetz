@@ -118,6 +118,7 @@ pub struct SettingsView {
     pub timezone: String,
     pub proxy_url: String,
     pub has_proxy_token: bool,
+    pub use_team_index: bool,
     pub meter: RequestMeter,
     pub usage: UsageTotal,
 }
@@ -229,6 +230,9 @@ pub struct BuildResult {
     /// carried onto placed bets / the ledger for A/B tracking like grok_used.
     #[serde(default)]
     pub ingest_used: bool,
+    /// Whether the opponent-strength index adjusted this build (A/B tracking).
+    #[serde(default)]
+    pub index_used: bool,
     #[serde(default)]
     pub grok_digest: Option<String>,
 }
@@ -350,6 +354,9 @@ pub struct BuildSelection {
     /// Minimum legs per ticket (e.g. 4 = only 4-folds and up). 1 = off.
     #[serde(default)]
     pub min_legs: Option<u32>,
+    /// Every multi-leg ticket must include ≥1 leg from EVERY selected fixture.
+    #[serde(default)]
+    pub cover_all: Option<bool>,
     /// Per-leg odds band — drop priced legs cheaper than min or longer than max
     /// (the "sweet spot", e.g. 1.3–7.0). None = no floor / no ceiling.
     #[serde(default)]
@@ -444,6 +451,11 @@ pub struct LiveFixture {
     pub home_goals: i64,
     pub away_goals: i64,
     pub has_stats: bool, // live in-match stats available (big leagues)
+    /// Kickoff (RFC3339) — REQUIRED downstream: every live-awareness check in a
+    /// build gates on date_utc, and this struct omitting it made Live-screen
+    /// re-predicts silently behave as pre-match.
+    #[serde(default)]
+    pub date_utc: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -751,4 +763,70 @@ pub struct PlayerInspect {
     pub cards: f64,
     pub passes: f64,
     pub per90: PlayerRates,
+}
+
+/// Opponent-strength index factors for one team (league-relative, schedule-
+/// corrected, shrunken toward 1.0 by sample size). 1.0 = league average;
+/// def < 1.0 = suppressive (concedes less than average).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TeamFactors {
+    pub atk_goals: f64,
+    pub def_goals: f64,
+    pub atk_shots: f64,
+    pub def_shots: f64,
+    pub atk_corners: f64,
+    pub def_corners: f64,
+    /// Strength-of-schedule multipliers already folded INTO the atk/def factors
+    /// above; kept for display ("earned vs soft schedule").
+    pub sos_atk: f64,
+    pub sos_def: f64,
+    pub games: i64,
+}
+
+/// One team's row in the index UI.
+#[derive(Debug, Clone, Serialize)]
+pub struct TeamIndexView {
+    pub team_id: i64,
+    pub name: String,
+    pub factors: TeamFactors,
+    pub games: i64,
+}
+
+/// A built (league, season) summary for the Settings list.
+#[derive(Debug, Clone, Serialize)]
+pub struct IndexLeagueView {
+    pub league_id: i64,
+    pub season: i64,
+    pub teams: i64,
+    pub built_at: i64,
+}
+
+/// Per-team audit row: is a team running stronger/weaker than our rating said?
+#[derive(Debug, Clone, Serialize)]
+pub struct TeamPerfRow {
+    pub team_id: i64,
+    pub team_name: String,
+    pub league_id: i64,
+    pub family: String,
+    pub games: i64,
+    pub avg_predicted: f64,
+    pub avg_actual: f64,
+    /// actual / predicted — >1 the team over-delivers vs our rating.
+    pub ratio: f64,
+}
+
+/// One team's starting XI for the Data tab lineup viewer.
+#[derive(Debug, Clone, Serialize)]
+pub struct LineupSide {
+    pub team: String,
+    /// "api" (confirmed feed) | "ingested" (your page) | "none".
+    pub source: String,
+    pub players: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LineupView {
+    pub fixture_id: i64,
+    pub label: String,
+    pub sides: Vec<LineupSide>,
 }

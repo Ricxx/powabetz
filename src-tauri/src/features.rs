@@ -128,6 +128,12 @@ const AWAY_ADJ: f64 = 0.95;
 /// Typical per-team goals/game baseline that normalizes the Maher attack×defence
 /// interaction (so an average attack vs an average defence returns the average).
 const LEAGUE_AVG_GOALS: f64 = 1.35;
+/// Per-team baselines for the volume stats — normalize the same attack×defence
+/// crossing on shots/corners/offsides. (Top-league typical values; the per-league
+/// team index refines these with the league's real averages when built.)
+const LEAGUE_AVG_SHOTS: f64 = 12.5;
+const LEAGUE_AVG_CORNERS: f64 = 5.0;
+const LEAGUE_AVG_OFFSIDES: f64 = 2.0;
 
 /// (home win, draw, away win) read straight off a score grid. The difference of
 /// two independent Poissons is the Skellam distribution — summing the grid below
@@ -340,6 +346,10 @@ pub struct FixtureCtx {
     pub opponent: String,
     pub is_home: bool,
     pub availability: String,
+    /// Opponent's defensive index factors (league-relative; <1 = suppressive).
+    /// Dampened (^0.7) onto player shot/SOT/goal rates when the index is on.
+    pub opp_def_shots: Option<f64>,
+    pub opp_def_goals: Option<f64>,
 }
 
 /// Per-player recent-match CONSISTENCY: how OFTEN (over recent appearances) a
@@ -473,9 +483,14 @@ pub fn build_player_candidates_entry(
         (s.apps * rate + SHRINK_K * prior) / (s.apps + SHRINK_K)
     };
 
-    let goals_p90 = per90(s.goals);
-    let shots_p90 = per90(s.shots);
-    let sot_p90 = per90(s.sot);
+    // Opponent-index suppression: a player's shot/goal volume vs THIS opponent
+    // scales with what the defence concedes (dampened — game state still lets
+    // shots happen). Only active when the league index is built + enabled.
+    let sup_shots = ctx.opp_def_shots.map(|f| f.clamp(0.6, 1.5).powf(0.7)).unwrap_or(1.0);
+    let sup_goals = ctx.opp_def_goals.map(|f| f.clamp(0.6, 1.5).powf(0.7)).unwrap_or(1.0);
+    let goals_p90 = per90(s.goals) * sup_goals;
+    let shots_p90 = per90(s.shots) * sup_shots;
+    let sot_p90 = per90(s.sot) * sup_shots;
     let tackles_p90 = shrink(per90(s.tackles), baselines[0][g]);
     let fouls_p90 = shrink(per90(s.fouls_for), baselines[1][g]);
     let fdrawn_p90 = per90(s.fouls_drawn);
@@ -583,6 +598,24 @@ pub fn build_player_candidates_entry(
                 c.form_state = Some(form);
                 c.xg_source = Some("proxy".to_string());
                 out.push(c);
+                // MULTI SCORER (2+ goals) — the "brace" leg for stat-led stacks.
+                // Poisson on the per-match goal expectation; only emitted for
+                // genuine volume scorers so the table isn't flooded with junk.
+                let lam_g = goals_p90 * min_scale;
+                let p2 = (1.0 - (-lam_g).exp() * (1.0 + lam_g)) * avail_mult;
+                if p2 >= 0.05 {
+                    let mut c2 = base(
+                        "Multi Scorer (2+)",
+                        "scorer",
+                        "2+ goals",
+                        goals_p90,
+                        clampp(p2),
+                        vec![format!("goals/90 {goals_p90:.2}"), format!("exp_min {exp_min:.0}"), "Poisson 2+".to_string()],
+                        vec![],
+                    );
+                    c2.xg_source = Some("proxy".to_string());
+                    out.push(c2);
+                }
             }
             "sot" => {
                 let lambda = sot_p90 * min_scale;
@@ -877,14 +910,19 @@ pub fn parse_team_stats(json: &Value, name: &str) -> Option<TeamStats> {
 }
 
 /// Team/match-line candidates. `groups` are the selected team-market keys.
-pub fn build_team_candidates(
-    home: &TeamStats,
-    away: &TeamStats,
-    fixture_label: &str,
-    fixture_id: i64,
-    groups: &[String],
-) -> Vec<Candidate> {
-    let mut out = Vec::new();
+/// Per-match expectations for both sides — goals λ plus the opponent-crossed
+/// volume stats. One set of formulas shared by the candidate engine and the
+/// team-performance prediction ledger (predicted-vs-actual audits).
+pub struct MatchExp {
+    pub home_goals: f64,
+    pub away_goals: f64,
+    pub home_shots: Option<f64>,
+    pub away_shots: Option<f64>,
+    pub home_corners: Option<f64>,
+    pub away_corners: Option<f64>,
+}
+
+pub fn match_expectations(home: &TeamStats, away: &TeamStats) -> MatchExp {
     // Use real xG (recent fixtures) where both teams have it — averaging a team's
     // attack xG with the opponent's defensive xG-conceded — else season goal rates.
     let h_for = home.xg_for.unwrap_or(home.gf_avg);
@@ -900,8 +938,42 @@ pub fn build_team_candidates(
         let m = atk * opp_conceded / LEAGUE_AVG_GOALS;
         0.5 * m + 0.5 * (atk + opp_conceded) / 2.0
     };
-    let lambda_home = (maher(h_for, a_against) * HOME_ADV).max(0.05);
-    let lambda_away = (maher(a_for, h_against) * AWAY_ADJ).max(0.05);
+    // Same crossing for the VOLUME stats: a team's shots expectation vs THIS
+    // opponent is its own rate crossed with what the opponent concedes (a 13
+    // shots/g attack means little against a block conceding 8). 50/50 damped
+    // like goals; falls back to the raw rate when the opponent side is unknown.
+    let cross = |own: Option<f64>, opp_conceded: Option<f64>, avg: f64| -> Option<f64> {
+        let own = own?;
+        Some(match opp_conceded {
+            Some(oc) => 0.5 * (own * oc / avg) + 0.5 * (own + oc) / 2.0,
+            None => own,
+        })
+    };
+    MatchExp {
+        home_goals: (maher(h_for, a_against) * HOME_ADV).max(0.05),
+        away_goals: (maher(a_for, h_against) * AWAY_ADJ).max(0.05),
+        home_shots: cross(home.shots_for, away.shots_against, LEAGUE_AVG_SHOTS),
+        away_shots: cross(away.shots_for, home.shots_against, LEAGUE_AVG_SHOTS),
+        home_corners: cross(home.corners_for, away.corners_against, LEAGUE_AVG_CORNERS),
+        away_corners: cross(away.corners_for, home.corners_against, LEAGUE_AVG_CORNERS),
+    }
+}
+
+pub fn build_team_candidates(
+    home: &TeamStats,
+    away: &TeamStats,
+    fixture_label: &str,
+    fixture_id: i64,
+    groups: &[String],
+) -> Vec<Candidate> {
+    let mut out = Vec::new();
+    let exp = match_expectations(home, away);
+    let (lambda_home, lambda_away) = (exp.home_goals, exp.away_goals);
+    let (h_shots, a_shots) = (exp.home_shots, exp.away_shots);
+    let (h_corners, a_corners) = (exp.home_corners, exp.away_corners);
+    let opp_adj_shots = home.shots_against.is_some() || away.shots_against.is_some();
+    let opp_adj_corners = home.corners_against.is_some() || away.corners_against.is_some();
+    let _ = LEAGUE_AVG_OFFSIDES; // offsides-against isn't threaded yet — raw rate stands
     let xg_used = home.xg_for.is_some() && away.xg_for.is_some();
     let crude = if xg_used {
         "xG-based (recent form)".to_string()
@@ -1046,12 +1118,15 @@ pub fn build_team_candidates(
                 out.push(mk("No goal", "First Team to Score", "firstscore", "no goal", p_no * 100.0, clampp(p_no), sup));
             }
             "tcorners" => {
-                for (team, cf) in [(&home.name, home.corners_for), (&away.name, away.corners_for)] {
+                for (team, cf) in [(&home.name, h_corners), (&away.name, a_corners)] {
                     if let Some(lam) = cf {
-                        for line in [2.5_f64, 3.5, 4.5, 5.5] {
+                        for line in [2.5_f64, 3.5, 4.5, 5.5, 6.5, 7.5] {
                             let thr = line.floor() as u32;
                             let over = nb_over(thr, lam, PHI_CORNERS);
-                            let sup = vec![format!("corners/g {lam:.1}"), "Neg-Binomial".into()];
+                            let sup = vec![
+                                if opp_adj_corners { format!("corners/g {lam:.1} (opp-adjusted)") } else { format!("corners/g {lam:.1}") },
+                                "Neg-Binomial".into(),
+                            ];
                             out.push(mk(team, "Team Corners", "tcorners", &format!("Over {line:.1}"), lam, over, sup.clone()));
                             out.push(mk(team, "Team Corners", "tcorners", &format!("Under {line:.1}"), lam, 1.0 - over, sup));
                         }
@@ -1095,7 +1170,7 @@ pub fn build_team_candidates(
             }
             "mostcorners" => {
                 // Which team takes the most corners (either-team market).
-                if let (Some(hc), Some(ac)) = (home.corners_for, away.corners_for) {
+                if let (Some(hc), Some(ac)) = (h_corners, a_corners) {
                     let (ph, pa) = (prob_more(hc, ac), prob_more(ac, hc));
                     out.push(mk(&home.name, "Most Corners", "mostcorners", "most corners", ph, clampp(ph), vec![format!("corners/g {hc:.1} vs {ac:.1}")]));
                     out.push(mk(&away.name, "Most Corners", "mostcorners", "most corners", pa, clampp(pa), vec![format!("corners/g {ac:.1} vs {hc:.1}")]));
@@ -1103,7 +1178,7 @@ pub fn build_team_candidates(
             }
             "mostshots" => {
                 // Which team has the most shots (either-team market).
-                if let (Some(hs), Some(as_)) = (home.shots_for, away.shots_for) {
+                if let (Some(hs), Some(as_)) = (h_shots, a_shots) {
                     let (ph, pa) = (prob_more(hs, as_), prob_more(as_, hs));
                     out.push(mk(&home.name, "Most Shots", "mostshots", "most shots", ph, clampp(ph), vec![format!("shots/g {hs:.1} vs {as_:.1}")]));
                     out.push(mk(&away.name, "Most Shots", "mostshots", "most shots", pa, clampp(pa), vec![format!("shots/g {as_:.1} vs {hs:.1}")]));
@@ -1123,14 +1198,17 @@ pub fn build_team_candidates(
                 }
             }
             "tshots" => {
-                for (team, sf) in [(&home.name, home.shots_for), (&away.name, away.shots_for)] {
+                for (team, sf) in [(&home.name, h_shots), (&away.name, a_shots)] {
                     if let Some(lam) = sf {
                         let base = lam.round();
                         for off in [-2.5_f64, -0.5, 1.5] {
                             let line = (base + off).max(2.5);
                             let thr = line.floor() as u32;
                             let over = nb_over(thr, lam, PHI_SHOTS);
-                            let sup = vec![format!("shots/g {lam:.1}"), "Neg-Binomial".into()];
+                            let sup = vec![
+                                if opp_adj_shots { format!("shots/g {lam:.1} (opp-adjusted)") } else { format!("shots/g {lam:.1}") },
+                                "Neg-Binomial".into(),
+                            ];
                             out.push(mk(team, "Team Shots", "tshots", &format!("Over {line:.1}"), lam, over, sup.clone()));
                             out.push(mk(team, "Team Shots", "tshots", &format!("Under {line:.1}"), lam, 1.0 - over, sup));
                         }
@@ -1577,6 +1655,23 @@ pub fn shortlist(
         out.push(slot.take().unwrap());
         true
     };
+    // CORRECT-SCORE rescue: score lines live at ~5-14% — below the lowest band —
+    // so on busy slates they were squeezed out before the model ever saw them
+    // and "predict the score" builds had nothing to work with. Reserve the top
+    // 2 per fixture up front (they're already in score order).
+    let mut cs_per_fix: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
+    for slot in slots.iter_mut() {
+        let (is_cs, fid) = match slot.as_ref() {
+            Some(c) => (c.market_group == "exactscore", c.fixture_id),
+            None => continue,
+        };
+        if !is_cs || *cs_per_fix.get(&fid).unwrap_or(&0) >= 2 {
+            continue;
+        }
+        if try_take(slot, &mut out, &mut per_market, &mut per_fixture) {
+            *cs_per_fix.entry(fid).or_insert(0) += 1;
+        }
+    }
     for (lo, hi, quota) in bands {
         let mut got = 0usize;
         for slot in slots.iter_mut() {

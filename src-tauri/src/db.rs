@@ -468,13 +468,226 @@ fn init(conn: &Connection) -> Result<(), String> {
         "CREATE INDEX IF NOT EXISTS idx_gen_settled ON generated_tickets(settled)",
         [],
     );
-    // Startup pruning — these tables grow without bound otherwise. Cache rows
-    // expired >1 day are never read again (cache_get ignores expired rows);
-    // ai_results transient keys (live tickets, plausibility) accrete forever.
-    let now = chrono::Utc::now().timestamp();
-    let _ = conn.execute("DELETE FROM cache WHERE fetched_at + ttl_secs < ?1 - 86400", params![now]);
-    let _ = conn.execute("DELETE FROM ai_results WHERE created_at < ?1 - 60 * 86400", params![now]);
+    // Whether the opponent-strength index adjusted the build (A/B, like grok/ingest).
+    let _ = conn.execute("ALTER TABLE generated_tickets ADD COLUMN index_used INTEGER NOT NULL DEFAULT 0", []);
+    let _ = conn.execute("ALTER TABLE placed_bets ADD COLUMN index_used INTEGER NOT NULL DEFAULT 0", []);
+    // Opponent-strength index: per-league team attack/defence factors (built
+    // manually, cache-first) + the predicted-vs-actual ledger that audits them.
+    let _ = conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS team_index (
+            league_id INTEGER NOT NULL,
+            season    INTEGER NOT NULL,
+            team_id   INTEGER NOT NULL,
+            name      TEXT NOT NULL,
+            factors   TEXT NOT NULL,
+            games     INTEGER NOT NULL,
+            built_at  INTEGER NOT NULL,
+            PRIMARY KEY (league_id, season, team_id)
+        );
+        CREATE TABLE IF NOT EXISTS team_pred (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            fixture_id INTEGER NOT NULL,
+            team_id    INTEGER NOT NULL,
+            team_name  TEXT NOT NULL DEFAULT '',
+            league_id  INTEGER NOT NULL,
+            season     INTEGER NOT NULL,
+            family     TEXT NOT NULL,
+            predicted  REAL NOT NULL,
+            actual     REAL,
+            created_at INTEGER NOT NULL,
+            UNIQUE (fixture_id, team_id, family)
+        );
+        "#,
+    );
     Ok(())
+}
+
+// ---------- opponent-strength team index ----------
+
+pub struct TeamIndexRow {
+    pub team_id: i64,
+    pub name: String,
+    pub factors: String, // JSON (models::TeamFactors)
+    pub games: i64,
+    pub built_at: i64,
+}
+
+pub fn index_put(
+    conn: &Connection,
+    league_id: i64,
+    season: i64,
+    team_id: i64,
+    name: &str,
+    factors: &str,
+    games: i64,
+    built_at: i64,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT OR REPLACE INTO team_index (league_id, season, team_id, name, factors, games, built_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![league_id, season, team_id, name, factors, games, built_at],
+    )
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+pub fn index_get_league(conn: &Connection, league_id: i64, season: i64) -> Result<Vec<TeamIndexRow>, String> {
+    let mut st = conn
+        .prepare("SELECT team_id, name, factors, games, built_at FROM team_index WHERE league_id = ?1 AND season = ?2")
+        .map_err(|e| e.to_string())?;
+    let rows = st
+        .query_map(params![league_id, season], |r| {
+            Ok(TeamIndexRow {
+                team_id: r.get(0)?,
+                name: r.get(1)?,
+                factors: r.get(2)?,
+                games: r.get(3)?,
+                built_at: r.get(4)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
+}
+
+/// One summary row per built (league, season): team count + oldest built_at.
+pub fn index_leagues(conn: &Connection) -> Result<Vec<(i64, i64, i64, i64)>, String> {
+    let mut st = conn
+        .prepare("SELECT league_id, season, COUNT(*), MIN(built_at) FROM team_index GROUP BY league_id, season ORDER BY MIN(built_at) DESC")
+        .map_err(|e| e.to_string())?;
+    let rows = st
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
+}
+
+/// Delete one league's index (or ALL when league_id is None). Prunes the
+/// matching prediction ledger too — audits of deleted weights are meaningless.
+pub fn index_reset(conn: &Connection, league_id: Option<i64>) -> Result<usize, String> {
+    let n = match league_id {
+        Some(id) => {
+            let _ = conn.execute("DELETE FROM team_pred WHERE league_id = ?1", params![id]);
+            conn.execute("DELETE FROM team_index WHERE league_id = ?1", params![id])
+        }
+        None => {
+            let _ = conn.execute("DELETE FROM team_pred", []);
+            conn.execute("DELETE FROM team_index", [])
+        }
+    }
+    .map_err(|e| e.to_string())?;
+    Ok(n)
+}
+
+/// Everything, for export.
+pub fn index_export(conn: &Connection) -> Result<Vec<(i64, i64, TeamIndexRow)>, String> {
+    let mut st = conn
+        .prepare("SELECT league_id, season, team_id, name, factors, games, built_at FROM team_index")
+        .map_err(|e| e.to_string())?;
+    let rows = st
+        .query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                TeamIndexRow { team_id: r.get(2)?, name: r.get(3)?, factors: r.get(4)?, games: r.get(5)?, built_at: r.get(6)? },
+            ))
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
+}
+
+// ---------- team-performance prediction ledger ----------
+
+/// Record a per-match expectation (idempotent per fixture+team+family).
+pub fn pred_add(
+    conn: &Connection,
+    fixture_id: i64,
+    team_id: i64,
+    team_name: &str,
+    league_id: i64,
+    season: i64,
+    family: &str,
+    predicted: f64,
+    now: i64,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT OR IGNORE INTO team_pred (fixture_id, team_id, team_name, league_id, season, family, predicted, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![fixture_id, team_id, team_name, league_id, season, family, predicted, now],
+    )
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+/// Distinct fixtures with any un-audited prediction (oldest first, capped).
+pub fn pred_pending_fixtures(conn: &Connection, cap: i64) -> Result<Vec<i64>, String> {
+    let mut st = conn
+        .prepare("SELECT DISTINCT fixture_id FROM team_pred WHERE actual IS NULL ORDER BY created_at ASC LIMIT ?1")
+        .map_err(|e| e.to_string())?;
+    let rows = st
+        .query_map(params![cap], |r| r.get(0))
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
+}
+
+pub fn pred_set_actual(conn: &Connection, fixture_id: i64, team_id: i64, family: &str, actual: f64) -> Result<(), String> {
+    conn.execute(
+        "UPDATE team_pred SET actual = ?4 WHERE fixture_id = ?1 AND team_id = ?2 AND family = ?3",
+        params![fixture_id, team_id, family, actual],
+    )
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+/// Per (team, family) audit: n, avg predicted, avg actual — audited rows only.
+pub fn pred_report(conn: &Connection) -> Result<Vec<(i64, String, i64, String, i64, f64, f64)>, String> {
+    let mut st = conn
+        .prepare(
+            "SELECT team_id, team_name, league_id, family, COUNT(*), AVG(predicted), AVG(actual)
+             FROM team_pred WHERE actual IS NOT NULL
+             GROUP BY team_id, league_id, family HAVING COUNT(*) >= 2
+             ORDER BY team_name, family",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = st
+        .query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
+}
+
+/// Prune dead rows in SMALL BATCHES — run from a background task, never on the
+/// launch path. The cache stores full API bodies (this table can be hundreds
+/// of MB); a single unbatched DELETE at startup froze the app before the
+/// window even appeared. Returns rows deleted this pass; call until it
+/// returns 0.
+pub fn prune_batch(conn: &Connection) -> usize {
+    let now = chrono::Utc::now().timestamp();
+    let a = conn
+        .execute(
+            "DELETE FROM cache WHERE rowid IN (
+                SELECT rowid FROM cache WHERE fetched_at + ttl_secs < ?1 - 86400 LIMIT 500)",
+            params![now],
+        )
+        .unwrap_or(0);
+    let b = conn
+        .execute(
+            "DELETE FROM ai_results WHERE rowid IN (
+                SELECT rowid FROM ai_results WHERE created_at < ?1 - 60 * 86400 LIMIT 500)",
+            params![now],
+        )
+        .unwrap_or(0);
+    a + b
 }
 
 // ---------- cache ----------
@@ -757,6 +970,7 @@ pub struct PlacedRow {
     pub clv: Option<f64>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn place_bet(
     conn: &Connection,
     created_at: i64,
@@ -765,12 +979,13 @@ pub fn place_bet(
     stake: f64,
     grok_used: bool,
     ingest_used: bool,
+    index_used: bool,
     strategy: &str,
 ) -> Result<i64, String> {
     conn.execute(
-        "INSERT INTO placed_bets (created_at, day, ticket_json, stake, status, returns, leg_results_json, settled, grok_used, ingest_used, strategy)
-         VALUES (?1, ?2, ?3, ?4, 'open', 0, '[]', 0, ?5, ?6, ?7)",
-        params![created_at, day, ticket_json, stake, grok_used as i64, ingest_used as i64, strategy],
+        "INSERT INTO placed_bets (created_at, day, ticket_json, stake, status, returns, leg_results_json, settled, grok_used, ingest_used, index_used, strategy)
+         VALUES (?1, ?2, ?3, ?4, 'open', 0, '[]', 0, ?5, ?6, ?7, ?8)",
+        params![created_at, day, ticket_json, stake, grok_used as i64, ingest_used as i64, index_used as i64, strategy],
     )
     .map_err(|e| e.to_string())?;
     Ok(conn.last_insert_rowid())
@@ -862,6 +1077,7 @@ pub struct GenRow {
 /// Insert a generated ticket (ignored if the same one already exists for that
 /// day + strategy + grok flag — so repeated builds don't double-count).
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn gen_add(
     conn: &Connection,
     now: i64,
@@ -869,6 +1085,7 @@ pub fn gen_add(
     strategy: &str,
     grok_used: bool,
     ingest_used: bool,
+    index_used: bool,
     kind: &str,
     sig: &str,
     ticket_json: &str,
@@ -876,9 +1093,9 @@ pub fn gen_add(
 ) -> Result<(), String> {
     conn.execute(
         "INSERT OR IGNORE INTO generated_tickets
-         (created_at, day, strategy, grok_used, ingest_used, kind, sig, ticket_json, combined_odds)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![now, day, strategy, grok_used as i64, ingest_used as i64, kind, sig, ticket_json, combined_odds],
+         (created_at, day, strategy, grok_used, ingest_used, index_used, kind, sig, ticket_json, combined_odds)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![now, day, strategy, grok_used as i64, ingest_used as i64, index_used as i64, kind, sig, ticket_json, combined_odds],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -1112,4 +1329,23 @@ pub fn setting_set(conn: &Connection, key: &str, value: &str) -> Result<(), Stri
     )
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Clear audited prediction rows — recalibration consumed them; keeping them
+/// would re-apply the same residuals on the next pass and compound the nudge.
+pub fn pred_clear_audited(conn: &Connection) -> Result<usize, String> {
+    conn.execute("DELETE FROM team_pred WHERE actual IS NOT NULL", [])
+        .map_err(|e| e.to_string())
+}
+
+/// The most recent saved build (auto-saved on every fresh run) — served to the
+/// browser extension's slip assistant. (created_at, result_json).
+pub fn latest_saved_ticket(conn: &Connection) -> Result<Option<(i64, String)>, String> {
+    conn.query_row(
+        "SELECT created_at, result_json FROM saved_tickets ORDER BY created_at DESC, id DESC LIMIT 1",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .optional()
+    .map_err(|e| e.to_string())
 }

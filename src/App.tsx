@@ -22,6 +22,7 @@ import Spinner from "./components/Spinner";
 import Settings from "./components/Settings";
 import History from "./components/History";
 import Inspector from "./components/Inspector";
+import Lineups from "./components/Lineups";
 import IngestedStats from "./components/IngestedStats";
 import Tracker from "./components/Tracker";
 import Newsfeed from "./components/Newsfeed";
@@ -283,7 +284,20 @@ function AppInner() {
   const [ladderMinLegs, setLadderMinLegs] = useState(2);
   // Diversified cross-game acca: max ONE leg per match (truly independent legs).
   const [ladderOnePerFixture, setLadderOnePerFixture] = useState(false);
+  // 🚀 Mega acca: ONE giant ticket — best 2-3 legs from every match, each leg
+  // in the 1.2-2.0 sweet spot (or the odds band when set).
+  const [ladderMega, setLadderMega] = useState(false);
+  // 🧩 Cover-all: every ticket spans EVERY selected match (≥ N legs each);
+  // the min-hit target is ignored while on (it would be deceiving).
+  const [coverAll, setCoverAll] = useState(false);
+  const [coverLegs, setCoverLegs] = useState(1);
+  // ↻ Manual data refresh: odds/lineups/injuries go stale near kickoff.
+  const [refreshing, setRefreshing] = useState(false);
   const [darwinBusy, setDarwinBusy] = useState(false);
+  const darwinRef = useRef(false); // sync double-click guard (state updates lag a fast second click)
+  // Darwin sweep report — stays on screen until dismissed (a toast vanished
+  // before anyone could read what the sweep actually recorded).
+  const [darwinReport, setDarwinReport] = useState<string[] | null>(null);
   const [ladderDiversityReset, setLadderDiversityReset] = useState(true);
   const [ladderVariation, setLadderVariation] = useState(0);
   // Shared per-leg odds sweet-spot (applies to regular + acca builds). 1 / 1000 = off.
@@ -316,7 +330,7 @@ function AppInner() {
   const [usage, setUsage] = useState<BuildUsage | null>(null);
   const [model, setModel] = useState("claude-haiku-4-5");
   const [showBoard, setShowBoard] = useState(false);
-  const [dataTab, setDataTab] = useState<"picks" | "bankers" | "inspector" | "ingested">("picks");
+  const [dataTab, setDataTab] = useState<"picks" | "bankers" | "inspector" | "ingested" | "lineups">("picks");
 
   const [bankroll, setBankroll] = useState(0);
   const [buildStrategy, setBuildStrategy] = useState("value");
@@ -549,6 +563,7 @@ function AppInner() {
         lucky_risky: simple ? rk.risky : feelingLucky ? 2 : 0,
         use_ingest: simple ? true : useIngest,
         min_legs: simple ? null : regMinLegs > 1 ? regMinLegs : null,
+        cover_all: simple ? false : coverAll,
         min_odds: simple ? null : oddsMin > 1.01 ? oddsMin : null,
         max_odds: simple ? null : oddsMax < 999 ? oddsMax : null,
         max_per_subject: simple ? null : regMaxPerSubject > 0 ? regMaxPerSubject : null,
@@ -657,7 +672,10 @@ function AppInner() {
         variation,
         oddsMin > 1.01 ? oddsMin : null,
         oddsMax < 999 ? oddsMax : null,
-        ladderOnePerFixture
+        ladderOnePerFixture,
+        ladderMega,
+        coverAll,
+        coverLegs
       );
       if (append && result) {
         if (res.tickets.length === 0) {
@@ -685,7 +703,7 @@ function AppInner() {
   async function placeTicket(t: Ticket, stake: number, odds: number | null, strategyOverride?: string) {
     const strat = strategyOverride ?? buildStrategy;
     try {
-      await api.placeBet(t, stake, odds, result?.grok_used ?? false, result?.ingest_used ?? false, strat);
+      await api.placeBet(t, stake, odds, result?.grok_used ?? false, result?.ingest_used ?? false, strat, result?.index_used ?? false);
       const n = t.legs.length;
       toast.success(`Bet placed — $${stake.toFixed(2)} · ${n} leg${n > 1 ? "s" : ""}`);
     } catch (e) {
@@ -837,7 +855,7 @@ function AppInner() {
   if (overlay === "ingest") {
     return (
       <Shell meter={meter} cost={settings?.usage.cost_usd ?? 0} grokCost={costBreak?.grok_lifetime ?? 0} onCoins={openCost} onNav={setOverlay} ingestBadge={ingestPending} current="ingest">
-        <Ingest onClose={() => setOverlay(null)} />
+        <Ingest onClose={() => setOverlay(null)} fixtures={toFixtureInputs(fixtures)} />
       </Shell>
     );
   }
@@ -908,6 +926,7 @@ function AppInner() {
                 {([
                   ["picks", "📊 Picks"],
                   ["bankers", "🏦 Bankers"],
+                  ["lineups", "👥 XIs"],
                   ["inspector", "🔍 Inspector"],
                   ["ingested", "🧲 Ingested"],
                 ] as const).map(([id, label]) => (
@@ -935,6 +954,7 @@ function AppInner() {
                 onPlaced={() => api.getBankroll().then((b) => setBankroll(b.current)).catch(() => {})}
               />
             )}
+            {dataTab === "lineups" && <Lineups fixtures={toFixtureInputs(selectedFixtures)} />}
             {dataTab === "inspector" && <Inspector fixtures={toFixtureInputs(selectedFixtures)} />}
             {dataTab === "ingested" && <IngestedStats fixtures={toFixtureInputs(selectedFixtures)} />}
           </div>
@@ -1149,6 +1169,26 @@ function AppInner() {
               remember until next launch
             </label>
           </div>
+
+          <button
+            className="btn btn-ghost w-full text-xs py-2 disabled:opacity-40"
+            disabled={refreshing || busy || selFixtureIds.size === 0}
+            title={`Force-fresh odds, lineups and injuries for the ${selFixtureIds.size} selected match(es) — cached copies go stale near kickoff (lines move, lineups drop ~1h before). Costs ~${selFixtureIds.size * 3} requests.`}
+            onClick={async () => {
+              setRefreshing(true);
+              try {
+                const n = await api.refreshFixtureData(toFixtureInputs(selectedFixtures));
+                setMeter(await api.getMeter());
+                toast.success(`Refreshed ${n} data pull(s) — odds, lineups & injuries are now live-fresh.`);
+              } catch (e) {
+                toast.error(e);
+              } finally {
+                setRefreshing(false);
+              }
+            }}
+          >
+            {refreshing ? "↻ Refreshing…" : `↻ Refresh data (odds · lineups · injuries) — ${selFixtureIds.size} match${selFixtureIds.size === 1 ? "" : "es"}`}
+          </button>
 
           {mode === "simple" && (
             <div className="card space-y-2 border-accent/40">
@@ -1376,6 +1416,7 @@ function AppInner() {
                   // Primary strategies always shown; the redundant/niche ones live
                   // behind the ⚙ Advanced expander.
                   ["apex", "Apex 🎯"],
+                  ["stacker", "Stacker 🧗"],
                   ["scout", "Scout 📡"],
                   ["value", "Value +EV"],
                   ["bankers", "Anchors ⚓"],
@@ -1437,27 +1478,50 @@ function AppInner() {
                               ? "🔮 Match Predictor — a deep read of THIS one game. Forces every market, shows a forecast (likely result, scores, goals, cards, key players with %), then builds several same-game SGP variations. If the match is already in-play, it pulls the LIVE score/stats and the model adjusts every suggestion for the time remaining. (Single fixture only.)"
                               : strategy === "scout"
                                 ? "📡 Scout — FUSES your ingested pages with our data through the model. It builds our table for the markets you pick above (or all of them if you pick none), pulls in the WHOLE ingested page (corners, cards, shots, form, xG, injuries, predictions, analyst reads — whatever you scraped), and the model cross-references the two: leaning in where they agree, judging where they differ, using the page's extra angles. Needs at least one processed page matching your fixtures (a stats/preview page → 🧲 Ingest → process). Your hand-fed edge, run through the model."
-                                : "Ranks by +EV — value/longshots where the price beats the true probability."}
+                                : strategy === "stacker"
+                                  ? "🧗 Stacker — risk-controlled, STAT-LED stacks (not EV-hunting). Canvasses every match and stacks 5-8 measured picks into 6x-25x parlays. The trick: when the obvious line is chalk (corners over 5.5 @ 1.10), it STEPS UP to the still-plausible next line (over 6.5/7.5), and a near-certain scorer becomes Multi Scorer (2+). Safe stepped legs + 1-2 measured risks per ticket — decent multiplier, genuine fighting chance, no lottery junk and no useless 1.10 legs."
+                                  : "Ranks by +EV — value/longshots where the price beats the true probability."}
               </p>
               <button
                 className="btn btn-ghost w-full text-xs py-2 border border-edge mt-2"
                 disabled={darwinBusy || selFixtureIds.size === 0}
                 title="Paper-trades 8 deterministic micro-strategies (sharp-EV ×2, form-gap, line-room, correlated combos, cross-game shooters, chalk treble, contrarian unders) on this slate into the Ledger. Zero model tokens; the Ledger becomes a survival-of-the-fittest leaderboard."
                 onClick={async () => {
-                  if (darwinBusy) return;
+                  if (darwinRef.current) return;
+                  darwinRef.current = true;
                   setDarwinBusy(true);
                   try {
-                    const lines = await api.darwinSweep(toFixtureInputs(selectedFixtures), [...selMarkets]);
-                    toast.success(`🧬 Darwin sweep papered: ${lines.join(" · ")}. Watch the Ledger's 🧬 rows.`);
+                    setDarwinReport(await api.darwinSweep(toFixtureInputs(selectedFixtures), [...selMarkets]));
                   } catch (e) {
                     toast.error(e);
                   } finally {
+                    darwinRef.current = false;
                     setDarwinBusy(false);
                   }
                 }}
               >
                 {darwinBusy ? "🧬 Sweeping…" : "🧬 Darwin sweep — paper-trade 8 micro-strategies on this slate (0 tokens)"}
               </button>
+              {darwinReport && (
+                <div className="mt-2 rounded-lg bg-ink border border-edge px-2.5 py-2 space-y-1">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] font-semibold text-slate-300">🧬 Darwin sweep — what just happened</span>
+                    <button className="text-slate-500 hover:text-slate-200 text-xs" onClick={() => setDarwinReport(null)}>✕</button>
+                  </div>
+                  <p className="text-[10px] text-slate-500">
+                    Nothing was bet. Darwin PAPER-traded these deterministic micro-strategies on your slate
+                    (0 model tokens) and recorded their tickets to the Ledger. When the matches finish they
+                    settle automatically — over weeks the Ledger's 🧬 rows become a survival-of-the-fittest
+                    leaderboard showing which mechanical approach actually wins on YOUR slates.
+                  </p>
+                  <div className="space-y-0.5">
+                    {darwinReport.map((l, i) => (
+                      <div key={i} className="text-[11px] text-slate-300">{l}</div>
+                    ))}
+                  </div>
+                  <p className="text-[10px] text-slate-500">→ Open the 🧬 Ledger tab to watch them settle.</p>
+                </div>
+              )}
             </div>
             <div>
               <div className="text-[11px] text-slate-500 mb-1">
@@ -1511,6 +1575,17 @@ function AppInner() {
                 ))}
               </div>
             </div>
+            <Toggle
+              label="🧩 Cover every match"
+              on={coverAll}
+              onChange={setCoverAll}
+            />
+            {coverAll && (
+              <p className="text-[10px] text-slate-500 -mt-1">
+                Every multi-leg ticket must include at least one leg from EVERY selected match — the
+                model is told to call out (not skip) a match with no defensible leg.
+              </p>
+            )}
             <div>
               <div className="text-[11px] text-slate-500 mb-1">
                 Diversity — {regMaxPerSubject === 0 ? "auto (≤¼ of tickets)" : `max ${regMaxPerSubject} ticket(s) per player/team`}
@@ -1689,7 +1764,7 @@ function AppInner() {
             </div>
             <div>
               <div className="text-[11px] text-slate-500 mb-1">
-                Legs per ticket — {ladderMinLegs}–{ladderMaxLegs}
+                Legs per ticket — {ladderMinLegs}–{ladderMaxLegs === 0 ? "∞" : ladderMaxLegs}
               </div>
               <div className="flex gap-1.5 mb-1">
                 <span className="text-[10px] text-slate-500 w-7 shrink-0 self-center">min</span>
@@ -1699,7 +1774,7 @@ function AppInner() {
                     className={`chip flex-1 text-center ${ladderMinLegs === n ? "chip-on" : ""}`}
                     onClick={() => {
                       setLadderMinLegs(n);
-                      if (n > ladderMaxLegs) setLadderMaxLegs(n);
+                      if (ladderMaxLegs !== 0 && n > ladderMaxLegs) setLadderMaxLegs(n);
                     }}
                   >
                     {n}
@@ -1708,25 +1783,70 @@ function AppInner() {
               </div>
               <div className="flex gap-1.5">
                 <span className="text-[10px] text-slate-500 w-7 shrink-0 self-center">max</span>
-                {[3, 4, 6, 8, 10, 12].map((n) => (
+                {[3, 4, 6, 8, 10, 12, 0].map((n) => (
                   <button
                     key={n}
                     className={`chip flex-1 text-center ${ladderMaxLegs === n ? "chip-on" : ""}`}
+                    title={n === 0 ? "No cap — legs keep stacking until the hit-target floor or the pool runs out" : undefined}
                     onClick={() => {
                       setLadderMaxLegs(n);
-                      if (n < ladderMinLegs) setLadderMinLegs(n);
+                      if (n !== 0 && n < ladderMinLegs) setLadderMinLegs(n);
                     }}
                   >
-                    {n}
+                    {n === 0 ? "∞" : n}
                   </button>
                 ))}
               </div>
             </div>
             <OddsBand min={oddsMin} max={oddsMax} setMin={setOddsMin} setMax={setOddsMax} />
             <Toggle
+              label="🚀 Mega acca"
+              on={ladderMega}
+              onChange={(on: boolean) => {
+                setLadderMega(on);
+                if (on) setLadderOnePerFixture(false); // mutually exclusive shapes
+              }}
+            />
+            {ladderMega && (
+              <p className="text-[10px] text-slate-500 -mt-1">
+                ONE giant accumulator: the best 2–3 legs from EVERY selected match, each leg priced
+                in the 1.2–2.0 sweet spot (set the odds band above to override). All plausible,
+                all stacked — watch it grow. Deterministic — no model tokens.
+              </p>
+            )}
+            <Toggle
+              label="🧩 Cover every match"
+              on={coverAll}
+              onChange={setCoverAll}
+            />
+            {coverAll && (
+              <div className="-mt-1 space-y-1">
+                <div className="flex gap-1.5 items-center">
+                  <span className="text-[10px] text-slate-500 shrink-0">legs per match</span>
+                  {[1, 2, 3].map((n) => (
+                    <button
+                      key={n}
+                      className={`chip flex-1 text-center ${coverLegs === n ? "chip-on" : ""}`}
+                      onClick={() => setCoverLegs(n)}
+                    >
+                      {n}
+                    </button>
+                  ))}
+                </div>
+                <p className="text-[10px] text-slate-500">
+                  Every ticket includes at least {coverLegs} leg{coverLegs > 1 ? "s" : ""} from EVERY
+                  selected match. The min-hit target is ignored in this mode — it would stop the fill
+                  before coverage and be deceiving.
+                </p>
+              </div>
+            )}
+            <Toggle
               label="🎯 One leg per match"
               on={ladderOnePerFixture}
-              onChange={setLadderOnePerFixture}
+              onChange={(on: boolean) => {
+                setLadderOnePerFixture(on);
+                if (on) setLadderMega(false);
+              }}
             />
             {ladderOnePerFixture && (
               <p className="text-[10px] text-slate-500 -mt-1">
@@ -1892,6 +2012,13 @@ function AppInner() {
               <div className="text-xs text-slate-400 mt-2 text-center inline-flex items-center justify-center gap-2 w-full">
                 <Spinner />
                 Fetching… Computing features…{buildTab === "regular" ? " Asking the model…" : ""}
+                <button
+                  className="text-bad underline hover:brightness-125"
+                  title="Stop this build — it aborts at the next checkpoint (no model tokens are billed for an aborted call)"
+                  onClick={() => api.cancelBuild().catch(() => {})}
+                >
+                  ✕ Cancel
+                </button>
               </div>
             )}
           </Sticky>
@@ -1903,10 +2030,29 @@ function AppInner() {
       {step === "results" && result && (
         <div className="space-y-3">
           <Header title="Tickets" onBack={() => setStep("markets")} />
-          <p className="text-xs text-slate-400 -mt-1">Step 4 of 4 — review, tweak the stake, and place. Tap a ticket to expand it.</p>
+          <div className="flex items-center justify-between -mt-1">
+            <p className="text-xs text-slate-400">Step 4 of 4 — review, tweak the stake, and place. Tap a ticket to expand it.</p>
+            <button
+              className="text-xs text-slate-400 underline hover:text-slate-200 shrink-0 ml-2"
+              title="Jump back to the start for a fresh slate — clears the match selection; these tickets stay reachable via the step dots until you build again"
+              onClick={() => {
+                setSelFixtureIds(new Set());
+                setStep("date");
+              }}
+            >
+              ↺ Start over
+            </button>
+          </div>
           {busy && (
             <div className="text-xs text-accent inline-flex items-center gap-2">
               <Spinner /> Generating a fresh set…
+              <button
+                className="text-bad underline hover:brightness-125"
+                title="Stop this build"
+                onClick={() => api.cancelBuild().catch(() => {})}
+              >
+                ✕ Cancel
+              </button>
             </div>
           )}
           <Results

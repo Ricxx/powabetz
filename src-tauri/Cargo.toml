@@ -29,6 +29,12 @@ dotenvy = "0.15"
 tiny_http = "0.12"
 chrono-tz = "0.10.4"
 
+# Desktop-only guard: a second launch focuses the running window instead of
+# starting a rival process that fights over the ingest port and SQLite WAL
+# (which presented as a frozen, non-responsive window).
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-single-instance = "2"
+
 [profile.release]
 strip = true
 
@@ -37,3 +43,7 @@ strip = true
 debug = false
 incremental = false
 strip = "debuginfo"
+# Debug builds ran the Monte-Carlo engine ~30x slower than release — enough to
+# freeze Apex/Darwin during development. opt-level 1 keeps compiles quick while
+# making the numeric loops usable; release builds are unaffected.
+opt-level = 1

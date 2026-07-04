@@ -66,6 +66,7 @@ export interface SettingsView {
   timezone: string;
   proxy_url: string;
   has_proxy_token: boolean;
+  use_team_index: boolean;
   meter: RequestMeter;
   usage: UsageTotal;
 }
@@ -167,6 +168,8 @@ export interface BuildResult {
   grok_used?: boolean;
   /// Ingested page data actually fed this build — carried to bets/ledger (A/B).
   ingest_used?: boolean;
+  /// Opponent-strength index adjusted this build (A/B, like ingest/grok).
+  index_used?: boolean;
   grok_digest?: string | null;
 }
 
@@ -276,6 +279,7 @@ export interface LiveFixture {
   home_goals: number;
   away_goals: number;
   has_stats: boolean;
+  date_utc?: string | null;
 }
 export interface LiveStatKV { label: string; value: string }
 export interface LiveTeamStat { team: string; stats: LiveStatKV[] }
@@ -426,6 +430,8 @@ export interface BuildSelection {
   lucky_risky: number;
   use_ingest: boolean;
   min_legs: number | null;
+  /// Every multi-leg ticket must include ≥1 leg from EVERY selected fixture.
+  cover_all?: boolean;
   min_odds: number | null;
   max_odds: number | null;
   max_per_subject: number | null;
@@ -650,3 +656,50 @@ export const MARKETS: MarketDef[] = [
   { key: "bothcards", label: "Both Teams Carded", group: "team", sub: "Involvement" },
   { key: "mostcards", label: "Most Cards (which team)", group: "team", sub: "Involvement" },
 ];
+
+/// Opponent-strength index — one team's league-relative factors.
+export interface TeamFactors {
+  atk_goals: number;
+  def_goals: number;
+  atk_shots: number;
+  def_shots: number;
+  atk_corners: number;
+  def_corners: number;
+  sos_atk: number;
+  sos_def: number;
+  games: number;
+}
+export interface TeamIndexView {
+  team_id: number;
+  name: string;
+  factors: TeamFactors;
+  games: number;
+}
+export interface IndexLeagueView {
+  league_id: number;
+  season: number;
+  teams: number;
+  built_at: number;
+}
+export interface TeamPerfRow {
+  team_id: number;
+  team_name: string;
+  league_id: number;
+  family: string;
+  games: number;
+  avg_predicted: number;
+  avg_actual: number;
+  ratio: number;
+}
+
+/// One team's starting XI in the Data tab viewer.
+export interface LineupSide {
+  team: string;
+  source: string; // "api" | "ingested" | "none"
+  players: string[];
+}
+export interface LineupView {
+  fixture_id: number;
+  label: string;
+  sides: LineupSide[];
+}

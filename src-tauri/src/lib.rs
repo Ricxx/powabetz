@@ -66,6 +66,10 @@ pub struct Keys {
     /// Per-user access token sent to the proxy (NOT a provider key).
     #[serde(default)]
     pub proxy_token: Option<String>,
+    /// Use the opponent-strength team index (when built) to adjust per-match
+    /// expectations in builds. Building the index is always manual.
+    #[serde(default)]
+    pub use_team_index: Option<bool>,
     /// Browser-extension ingest endpoint: enabled, shared token, and local port.
     #[serde(default)]
     pub ingest_enabled: Option<bool>,
@@ -141,6 +145,9 @@ pub struct AppState {
     /// Timestamp of the last fresh network call — used to space out requests so
     /// the free-tier per-minute rate limit isn't tripped.
     pub throttle: tokio::sync::Mutex<std::time::Instant>,
+    /// User-requested build cancellation (the ✕ next to the build spinner).
+    /// Checked between fixtures and raced against the model call.
+    pub build_cancel: std::sync::atomic::AtomicBool,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -148,7 +155,24 @@ pub fn run() {
     // Load .env (dev convenience). Harmless if absent.
     let _ = dotenvy::dotenv();
 
-    tauri::Builder::default()
+    let mut builder = tauri::Builder::default();
+
+    // Single-instance guard (desktop only, MUST be the first plugin): if a copy
+    // is already running, focus its window and exit this launch instead of
+    // starting a rival that contends for the ingest port + SQLite WAL — which
+    // presented as a frozen, non-responsive window.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.unminimize();
+                let _ = w.show();
+                let _ = w.set_focus();
+            }
+        }));
+    }
+
+    builder
         .plugin(tauri_plugin_shell::init())
         .setup(|app| {
             let data_dir = app
@@ -199,6 +223,27 @@ pub fn run() {
                         .checked_sub(std::time::Duration::from_secs(60))
                         .unwrap_or_else(std::time::Instant::now),
                 ),
+                build_cancel: std::sync::atomic::AtomicBool::new(false),
+            });
+
+            // Background cache pruning: starts well AFTER launch, deletes in
+            // small batches with yields between them, so the window opens
+            // instantly and other DB users are never starved. (This used to
+            // run synchronously in setup and froze launch on a big cache.)
+            let prune_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                loop {
+                    let n = {
+                        let state = prune_handle.state::<AppState>();
+                        let deleted = state.db.lock().map(|c| db::prune_batch(&c)).unwrap_or(0);
+                        deleted
+                    };
+                    if n == 0 {
+                        break; // fully pruned for this launch
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
             });
 
             // CLOSING-LINE snapshot loop: every 10 minutes, check open bets'
@@ -225,6 +270,16 @@ pub fn run() {
             commands::fetch_fixtures,
             commands::fetch_squads,
             commands::build_tickets,
+            commands::cancel_build,
+            commands::refresh_fixture_data,
+            commands::get_lineups,
+            commands::build_team_index,
+            commands::list_team_index,
+            commands::index_league_teams,
+            commands::reset_team_index,
+            commands::export_team_index,
+            commands::index_review,
+            commands::recalibrate_index,
             commands::get_picks,
             commands::build_ladder,
             commands::prewarm_plausibility,
@@ -248,6 +303,7 @@ pub fn run() {
             commands::ingest_info,
             commands::list_ingested,
             commands::process_ingested,
+            commands::fix_ingest_names,
             commands::delete_ingested,
             commands::update_ingest_note,
             commands::assign_ingest_fixture,

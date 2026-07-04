@@ -115,27 +115,35 @@ export default function CustomSlip({
 
       {open && (
         <>
-          <div className="space-y-1">
-            {legs.map((l) => (
-              <div key={legKey(l)} className="flex items-center justify-between gap-2 text-xs rounded-lg bg-ink border border-edge px-2.5 py-1.5">
-                <div className="min-w-0">
-                  <div className="font-medium break-words">
-                    {l.selection}
-                    {l.team && (
-                      <span className="ml-1.5 text-[9px] font-semibold text-slate-400 bg-edge rounded px-1 py-0.5 align-middle">
-                        {shortTeam(l.team)}
-                      </span>
-                    )}
-                  </div>
-                  <div className="text-slate-500 break-words">
-                    {l.match} · {l.market}
-                    {l.line ? ` ${l.line}` : ""}
-                    {l.book_odds != null ? ` · @ ${l.book_odds.toFixed(2)}` : " · no price"}
-                  </div>
+          {/* Grouped by fixture — a slip mixing 3-4 games was hard to scan flat. */}
+          <div className="space-y-2">
+            {[...new Set(legs.map((l) => l.match))].map((match) => (
+              <div key={match} className="space-y-1">
+                <div className="text-[10px] font-semibold text-slate-400 uppercase tracking-wide px-0.5">
+                  {match}
                 </div>
-                <button className="text-slate-500 hover:text-bad shrink-0" onClick={() => onRemove(legKey(l))} title="Remove from slip">
-                  ✕
-                </button>
+                {legs.filter((l) => l.match === match).map((l) => (
+                  <div key={legKey(l)} className="flex items-center justify-between gap-2 text-xs rounded-lg bg-ink border border-edge px-2.5 py-1.5">
+                    <div className="min-w-0">
+                      <div className="font-medium break-words">
+                        {l.selection}
+                        {l.team && (
+                          <span className="ml-1.5 text-[9px] font-semibold text-slate-400 bg-edge rounded px-1 py-0.5 align-middle">
+                            {shortTeam(l.team)}
+                          </span>
+                        )}
+                      </div>
+                      <div className="text-slate-500 break-words">
+                        {l.market}
+                        {l.line ? ` ${l.line}` : ""}
+                        {l.book_odds != null ? ` · @ ${l.book_odds.toFixed(2)}` : " · no price"}
+                      </div>
+                    </div>
+                    <button className="text-slate-500 hover:text-bad shrink-0" onClick={() => onRemove(legKey(l))} title="Remove from slip">
+                      ✕
+                    </button>
+                  </div>
+                ))}
               </div>
             ))}
           </div>

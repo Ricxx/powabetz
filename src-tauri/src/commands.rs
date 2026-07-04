@@ -19,7 +19,7 @@ use crate::{db, AppState};
 
 #[tauri::command]
 pub fn get_settings(state: State<AppState>) -> Result<SettingsView, String> {
-    let (has_af, has_anthropic, has_grok, has_openai, has_deepseek, has_parlay, model, limit, books, kelly, default_stake, timezone, proxy_url, has_proxy_token) = {
+    let (has_af, has_anthropic, has_grok, has_openai, has_deepseek, has_parlay, model, limit, books, kelly, default_stake, timezone, proxy_url, has_proxy_token, use_team_index) = {
         let keys = state.keys.lock().map_err(|_| "keys lock")?;
         (
             keys.api_football.is_some(),
@@ -36,6 +36,7 @@ pub fn get_settings(state: State<AppState>) -> Result<SettingsView, String> {
             keys.timezone.clone().unwrap_or_else(|| "Etc/GMT+5".to_string()),
             keys.proxy_url.clone().unwrap_or_default(),
             keys.proxy_token.is_some(),
+            keys.use_team_index.unwrap_or(true),
         )
     };
     let (meter, by_model) = {
@@ -64,6 +65,7 @@ pub fn get_settings(state: State<AppState>) -> Result<SettingsView, String> {
         timezone,
         proxy_url,
         has_proxy_token,
+        use_team_index,
         meter,
         usage: UsageTotal {
             input_tokens: input,
@@ -91,6 +93,7 @@ pub fn save_settings(
     proxy_url: Option<String>,
     proxy_token: Option<String>,
     ingest_enabled: Option<bool>,
+    use_team_index: Option<bool>,
 ) -> Result<SettingsView, String> {
     {
         let mut keys = state.keys.lock().map_err(|_| "keys lock")?;
@@ -135,6 +138,9 @@ pub fn save_settings(
         if let Some(e) = ingest_enabled {
             keys.ingest_enabled = Some(e);
         }
+        if let Some(u) = use_team_index {
+            keys.use_team_index = Some(u);
+        }
         if let Some(m) = model {
             if llm::is_allowed_model(&m) {
                 keys.model = Some(m);
@@ -148,6 +154,13 @@ pub fn save_settings(
         keys.persist(&state.settings_path)?;
     }
     get_settings(state)
+}
+
+/// The ✕ next to the build spinner — flags the in-flight build to stop at its
+/// next checkpoint (between fixture fetches, or aborting the model call).
+#[tauri::command]
+pub fn cancel_build(state: State<AppState>) {
+    state.build_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[tauri::command]
@@ -421,6 +434,16 @@ impl LiveState {
 }
 
 /// Has kickoff already passed? (RFC3339 string vs now.)
+/// Within 75 min of kickoff, or already started — the window where lineups
+/// exist and stale caches actively mislead.
+fn near_kickoff(date_utc: &Option<String>) -> bool {
+    date_utc
+        .as_deref()
+        .and_then(|d| chrono::DateTime::parse_from_rfc3339(d).ok())
+        .map(|d| d.timestamp() - af::now_ts() <= 75 * 60)
+        .unwrap_or(false)
+}
+
 fn kickoff_elapsed(date_utc: &Option<String>) -> bool {
     date_utc
         .as_deref()
@@ -431,7 +454,10 @@ fn kickoff_elapsed(date_utc: &Option<String>) -> bool {
 
 /// Fresh live state from `/fixtures?id=` (short TTL). None if unavailable.
 async fn fetch_live_state(state: &AppState, fixture_id: i64) -> Option<LiveState> {
-    let json = af::cached_get(state, "/fixtures", vec![("id", fixture_id.to_string())], af::TTL_LIVE)
+    // ALWAYS network: other paths (index audit, settling) cache the same
+    // /fixtures?id key with LONG TTLs — a pre-match row would otherwise make an
+    // in-play game look not-started for hours. fetch_live = fresh + essential.
+    let json = af::fetch_live(state, "/fixtures", vec![("id", fixture_id.to_string())], af::TTL_LIVE)
         .await
         .ok()?;
     let item = response_array(&json).into_iter().next()?;
@@ -456,19 +482,71 @@ async fn fetch_live_state(state: &AppState, fixture_id: i64) -> Option<LiveState
 
 /// Confirmed starting XI per team for a fixture (player ids), if lineups are
 /// posted yet. Empty map → not available (use season minutes as before).
-async fn fetch_starters(state: &AppState, fixture_id: i64) -> HashMap<i64, HashSet<i64>> {
+/// Lineups from INGESTED pages (SofaScore posts XIs ~1h before kickoff — the
+/// API often has none for friendlies/minor comps). Returns team_id → folded
+/// starter names for pages matched to this fixture. Empty when no page has one.
+fn ingest_lineups_for_fixture(state: &AppState, fx: &FixtureInput) -> HashMap<i64, Vec<String>> {
+    let mut out: HashMap<i64, Vec<String>> = HashMap::new();
+    let rows = {
+        let conn = match state.db.lock() {
+            Ok(c) => c,
+            Err(_) => return out,
+        };
+        db::ingest_list(&conn).unwrap_or_default()
+    }; // lock released before any parsing (see the db-lock reentrancy rule)
+    for r in rows.iter().filter(|r| r.status == "processed") {
+        let matches = r.fixture_id == Some(fx.fixture_id)
+            || r.fixture_label.as_deref().map_or(false, |fl| {
+                let fl = crate::odds::fold(fl); // team_match expects a FOLDED haystack
+                crate::odds::team_match(&fl, &fx.home_team) && crate::odds::team_match(&fl, &fx.away_team)
+            });
+        if !matches {
+            continue;
+        }
+        let Some(v) = r.extracted_json.as_deref().and_then(|j| serde_json::from_str::<Value>(j).ok()) else {
+            continue;
+        };
+        let Some(lineups) = v.get("lineups").and_then(|l| l.as_array()) else { continue };
+        for entry in lineups {
+            let tname = crate::odds::fold(entry.get("team").and_then(|t| t.as_str()).unwrap_or(""));
+            let tid = if crate::odds::team_match(&tname, &fx.home_team) {
+                fx.home_team_id
+            } else if crate::odds::team_match(&tname, &fx.away_team) {
+                fx.away_team_id
+            } else {
+                continue;
+            };
+            let players: Option<Vec<String>> = entry
+                .get("players")
+                .and_then(|p| p.as_array())
+                .map(|arr| arr.iter().filter_map(|p| p.as_str()).map(|n| n.to_string()).collect());
+            if let Some(names) = players.filter(|n| n.len() >= 7) {
+                let slot = out.entry(tid).or_default();
+                for n in names {
+                    if !slot.contains(&n) {
+                        slot.push(n);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+async fn fetch_starters(state: &AppState, fixture_id: i64, near_kickoff: bool) -> HashMap<i64, HashSet<i64>> {
     let mut out: HashMap<i64, HashSet<i64>> = HashMap::new();
-    let json = match af::cached_get(
-        state,
-        "/fixtures/lineups",
-        vec![("fixture", fixture_id.to_string())],
-        af::TTL_LINEUPS,
-    )
-    .await
-    {
+    let params = vec![("fixture", fixture_id.to_string())];
+    let mut json = match af::cached_get(state, "/fixtures/lineups", params.clone(), af::TTL_LINEUPS).await {
         Ok(j) => j,
         Err(_) => return out,
     };
+    // Lineups drop ~40-70 min before kickoff. If we're near/past kickoff and the
+    // cached row is EMPTY, it was cached pre-announcement — punch through once.
+    if near_kickoff && response_array(&json).is_empty() {
+        if let Ok(fresh) = af::fetch_fresh(state, "/fixtures/lineups", params, af::TTL_LINEUPS).await {
+            json = fresh;
+        }
+    }
     for team in response_array(&json) {
         let team_id = match team.get("team").and_then(|t| t.get("id")).and_then(|v| v.as_i64()) {
             Some(id) => id,
@@ -1663,6 +1741,7 @@ async fn live_adjust_forecast(
         home_goals: 0,
         away_goals: 0,
         has_stats: false,
+        date_utc: fx.date_utc.clone(),
     };
     let snap = match live_snapshot_inner(state, lf).await {
         Ok(s) => s,
@@ -1801,16 +1880,20 @@ fn forecast_from_candidates(all: &[Candidate], fixture_label: &str, home: &str, 
         sections.push(ForecastSection { title: "Corners".into(), lines: corners });
     }
 
-    // Likely players
+    // Likely players. ⚠ = live match with no lineup feed and the player hasn't
+    // appeared in any event — may not be on the pitch at all.
+    let warn = |c: &Candidate| {
+        if c.flags.iter().any(|f| f.starts_with("unconfirmed on pitch")) { " ⚠" } else { "" }
+    };
     let mut players = Vec::new();
     for c in top_n("scorer", 3) {
-        players.push(mk(format!("{} to score", c.subject), c.est_prob));
+        players.push(mk(format!("{} to score{}", c.subject, warn(c)), c.est_prob));
     }
     for c in top_n("sot", 2) {
-        players.push(mk(format!("{} — {}", c.subject, c.line), c.est_prob));
+        players.push(mk(format!("{} — {}{}", c.subject, c.line, warn(c)), c.est_prob));
     }
     for c in top_n("cards", 2) {
-        players.push(mk(format!("{} to be carded", c.subject), c.est_prob));
+        players.push(mk(format!("{} to be carded{}", c.subject, warn(c)), c.est_prob));
     }
     if !players.is_empty() {
         sections.push(ForecastSection { title: "Likely players".into(), lines: players });
@@ -1840,14 +1923,16 @@ pub async fn build_tickets(
     if selection.fixtures.is_empty() {
         return Err("Select at least one match first.".to_string());
     }
+    // Fresh build → clear any stale cancel request from a previous one.
+    state.build_cancel.store(false, std::sync::atomic::Ordering::Relaxed);
 
     // Match Predictor: a deep read of ONE game — force every market so the
     // forecast and the SGP variations have the full picture.
     let predictor = selection.strategy.as_deref() == Some("predictor") && selection.fixtures.len() == 1;
     // Scout fuses OUR data with the ingested page through the model. It RESPECTS
     // the markets you picked (like any strategy) — only falling back to the whole
-    // table when you've selected none. (The ingest-derived corner/card/shot lines
-    // are added on top regardless.)
+    // table when you've selected none. The ingest-derived stat lines respect the
+    // same selection (the full page still rides along as prose context).
     let scout = selection.strategy.as_deref() == Some("scout");
     let markets: Vec<String> = if selection.markets.is_empty() || predictor {
         ALL_MARKETS.iter().map(|s| s.to_string()).collect()
@@ -1861,6 +1946,15 @@ pub async fn build_tickets(
         let keys = state.keys.lock().map_err(|_| "keys lock")?;
         keys.books.clone()
     };
+
+    // Opponent-strength index: league factors loaded once per league; empty map
+    // = not built. Applied only when the Settings toggle is on (default on).
+    let use_index = {
+        let keys = state.keys.lock().map_err(|_| "keys lock")?;
+        keys.use_team_index.unwrap_or(true)
+    };
+    let mut index_cache: HashMap<(i64, i64), HashMap<i64, TeamFactors>> = HashMap::new();
+    let mut index_used = false;
 
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut pred_notes: Vec<String> = Vec::new();
@@ -1929,15 +2023,39 @@ pub async fn build_tickets(
     let mut ingest_used = false;
 
     for fx in &selection.fixtures {
+        // The fetch loop is the long pre-model stretch — honour a cancel here.
+        if state.build_cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("Build cancelled.".to_string());
+        }
         let fixture_label = format!("{} vs {}", fx.home_team, fx.away_team);
         let fx_start = candidates.len();
 
+        // This fixture's index factors (home, away) — both present or unused.
+        let (idx_home, idx_away) = if use_index {
+            let m = index_cache
+                .entry((fx.league_id, fx.season))
+                .or_insert_with(|| load_league_factors(&state, fx.league_id, fx.season));
+            match (m.get(&fx.home_team_id).cloned(), m.get(&fx.away_team_id).cloned()) {
+                (Some(h), Some(a)) => (Some(h), Some(a)),
+                _ => (None, None),
+            }
+        } else {
+            (None, None)
+        };
+        if idx_home.is_some() {
+            index_used = true;
+        }
+
         // If kickoff has passed, pull fresh in-play state so the model reasons
-        // off the current scoreline/clock, not pre-match season rates.
-        if kickoff_elapsed(&fx.date_utc) {
+        // off the current scoreline/clock, not pre-match season rates. A
+        // predictor call with an UNKNOWN kickoff also checks (1 request) — a
+        // caller that omits date_utc must not silently get a pre-match read.
+        let mut fx_is_live = false;
+        if kickoff_elapsed(&fx.date_utc) || (predictor && fx.date_utc.is_none()) {
             if let Some(live) = fetch_live_state(&state, fx.fixture_id).await {
                 if live.is_live() {
                     any_live = true;
+                    fx_is_live = true;
                     let line = format!(
                         "LIVE NOW — {} {}-{} {} ({}′, {}). Account for the current scoreline and the time remaining; do not suggest lines that are already settled.",
                         fx.home_team, live.home_goals, live.away_goals, fx.away_team, live.elapsed, live.status
@@ -2048,10 +2166,25 @@ pub async fn build_tickets(
         // Confirmed lineups (if posted) — restrict to the starting XI so we don't
         // build bets around players who won't start.
         let starters = if selection.use_lineups.unwrap_or(true) {
-            fetch_starters(&state, fx.fixture_id).await
+            fetch_starters(&state, fx.fixture_id, near_kickoff(&fx.date_utc)).await
         } else {
             HashMap::new()
         };
+        // Fallback: lineups from INGESTED pages (SofaScore etc.) when the API
+        // has none — matched by name against the season-stats roster below.
+        let ingest_xi: HashMap<i64, HashSet<String>> = if starters.is_empty() && selection.use_lineups.unwrap_or(true) {
+            ingest_lineups_for_fixture(&state, fx)
+                .into_iter()
+                .map(|(k, v)| (k, v.iter().map(|n| crate::odds::fold(n)).collect()))
+                .collect()
+        } else {
+            HashMap::new()
+        };
+        if !ingest_xi.is_empty() {
+            pred_notes.push(format!(
+                "{fixture_label}: lineups taken from YOUR ingested page (the data feed has none) — player props restricted to that XI."
+            ));
+        }
         if !starters.is_empty() {
             pred_notes.push(format!(
                 "{}: confirmed lineups posted — only the starting XI is used for player props.",
@@ -2067,7 +2200,7 @@ pub async fn build_tickets(
                 (fx.away_team_id, fx.away_team.clone(), false, fx.home_team.clone()),
             ] {
                 let consistency = fetch_consistency(&state, team_id, fx.season).await;
-                let entries = match fetch_team_players(&state, team_id, fx.season).await {
+                let mut entries = match fetch_team_players(&state, team_id, fx.season).await {
                     Ok(e) => e,
                     Err(e) => {
                         degraded_notes.push(format!(
@@ -2076,8 +2209,52 @@ pub async fn build_tickets(
                         Vec::new()
                     }
                 };
+                // PHANTOM GUARD: league season-stats keep players who already
+                // LEFT the club (transfers) — e.g. a "striker" who isn't in the
+                // squad at all. The squad list is the roster truth; cross-check
+                // it cache-only (0 requests) whenever we have it.
+                let squad_ids: Option<HashSet<i64>> = peek(&state, "/players/squads", vec![("team", team_id.to_string())])
+                    .and_then(|j| {
+                        response_array(&j)
+                            .first()
+                            .and_then(|e| e.get("players"))
+                            .and_then(|p| p.as_array())
+                            .map(|arr| arr.iter().filter_map(|p| p.get("id").and_then(|v| v.as_i64())).collect::<HashSet<i64>>())
+                    })
+                    .filter(|sq| sq.len() >= 8); // partial/junk squads don't veto
+                if let Some(sq) = &squad_ids {
+                    entries.retain(|e| {
+                        e.get("player")
+                            .and_then(|p| p.get("id"))
+                            .and_then(|v| v.as_i64())
+                            .map(|id| sq.contains(&id))
+                            .unwrap_or(false)
+                    });
+                }
                 let baselines = features::squad_baselines(&entries, fx.league_id);
-                let team_starters = starters.get(&team_id);
+                // Ingested-XI fallback: map the page's starter NAMES onto this
+                // team's season-stats roster (full-name or surname match). Only
+                // trusted when it matches enough of a real XI (≥7 players).
+                let ingest_ids: Option<HashSet<i64>> = starters
+                    .get(&team_id)
+                    .is_none()
+                    .then(|| ingest_xi.get(&team_id))
+                    .flatten()
+                    .map(|names| {
+                        let surs: HashSet<&str> = names.iter().filter_map(|n| n.split(' ').last()).collect();
+                        entries
+                            .iter()
+                            .filter_map(|e| {
+                                let pl = e.get("player")?;
+                                let id = pl.get("id").and_then(|v| v.as_i64())?;
+                                let f = crate::odds::fold(pl.get("name").and_then(|v| v.as_str())?);
+                                let sur = f.split(' ').last().unwrap_or("");
+                                (names.contains(&f) || (sur.len() > 2 && surs.contains(sur))).then_some(id)
+                            })
+                            .collect::<HashSet<i64>>()
+                    })
+                    .filter(|ids| ids.len() >= 7);
+                let team_starters = starters.get(&team_id).or(ingest_ids.as_ref());
                 // If lineups are out for this team, keep only confirmed starters.
                 let entries: Vec<Value> = match team_starters {
                     Some(set) => entries
@@ -2099,6 +2276,9 @@ pub async fn build_tickets(
                     } else {
                         pid.and_then(|id| injuries.get(&id).cloned()).unwrap_or_else(|| "unknown".to_string())
                     };
+                    // Opponent's defensive index factors suppress/boost this
+                    // player's shot & goal volume (dampened inside the engine).
+                    let opp_idx = if is_home { idx_away.as_ref() } else { idx_home.as_ref() };
                     let ctx = FixtureCtx {
                         fixture_label: fixture_label.clone(),
                         fixture_id: fx.fixture_id,
@@ -2106,6 +2286,8 @@ pub async fn build_tickets(
                         opponent: opp.clone(),
                         is_home,
                         availability,
+                        opp_def_shots: opp_idx.map(|f| f.def_shots),
+                        opp_def_goals: opp_idx.map(|f| f.def_goals),
                     };
                     candidates.extend(features::build_player_candidates_entry(
                         &entry,
@@ -2191,9 +2373,88 @@ pub async fn build_tickets(
                     a.most_card_rate = ac.3;
                 }
             }
-            if let (Some(h), Some(a)) = (home, away) {
+            if let (Some(mut h), Some(mut a)) = (home, away) {
+                // Opponent-strength index: fold each side's schedule correction
+                // into its rates before the engine's attack×defence crossing.
+                if let (Some(fh), Some(fa)) = (idx_home.as_ref(), idx_away.as_ref()) {
+                    apply_index_sos(&mut h, fh);
+                    apply_index_sos(&mut a, fa);
+                    live_notes.push(format!(
+                        "{fixture_label}: opponent index on — {} def×{:.2} shots (sos {:.2}), {} def×{:.2} (sos {:.2}); schedule-corrected rates.",
+                        fx.home_team, fh.def_shots, fh.sos_atk, fx.away_team, fa.def_shots, fa.sos_atk
+                    ));
+                }
+                // Team-performance ledger: record our per-match expectations for
+                // pre-kickoff fixtures so index_review can audit predicted-vs-
+                // actual per team later ("is this team stronger than we rate?").
+                if !kickoff_elapsed(&fx.date_utc) {
+                    let exp = features::match_expectations(&h, &a);
+                    if let Ok(conn) = state.db.lock() {
+                        let now = af::now_ts();
+                        for (tid, tname, goals, shots, corners) in [
+                            (fx.home_team_id, &fx.home_team, exp.home_goals, exp.home_shots, exp.home_corners),
+                            (fx.away_team_id, &fx.away_team, exp.away_goals, exp.away_shots, exp.away_corners),
+                        ] {
+                            let _ = db::pred_add(&conn, fx.fixture_id, tid, tname, fx.league_id, fx.season, "goals", goals, now);
+                            if let Some(v) = shots {
+                                let _ = db::pred_add(&conn, fx.fixture_id, tid, tname, fx.league_id, fx.season, "shots", v, now);
+                            }
+                            if let Some(v) = corners {
+                                let _ = db::pred_add(&conn, fx.fixture_id, tid, tname, fx.league_id, fx.season, "corners", v, now);
+                            }
+                        }
+                    }
+                }
                 candidates.extend(features::build_team_candidates(&h, &a, &fixture_label, fx.fixture_id, &team_groups));
             }
+        }
+
+        // LIVE + NO LINEUP COVERAGE (friendlies/minor comps): season-stats
+        // players may not be on the pitch at all. The live EVENTS feed is the
+        // only ground truth — flag who we've SEEN (surname match), mark the
+        // rest unconfirmed, and SAY so. Flags only; probabilities stay honest.
+        if fx_is_live && starters.is_empty() {
+            let sur = |s: &str| crate::odds::fold(s).split(' ').last().unwrap_or("").to_string();
+            let mut seen: HashSet<String> = HashSet::new();
+            // Your ingested lineups count as on-pitch confirmation too.
+            for names in ingest_xi.values() {
+                for n in names {
+                    let t = sur(n);
+                    if t.len() > 2 {
+                        seen.insert(t);
+                    }
+                }
+            }
+            if let Ok(ej) = af::fetch_live(&state, "/fixtures/events", vec![("fixture", fx.fixture_id.to_string())], af::TTL_LIVE).await {
+                for e in response_array(&ej) {
+                    for k in ["player", "assist"] {
+                        if let Some(n) = e.get(k).and_then(|p| p.get("name")).and_then(|v| v.as_str()) {
+                            let t = sur(n);
+                            if t.len() > 2 {
+                                seen.insert(t);
+                            }
+                        }
+                    }
+                }
+            }
+            let mut confirmed: Vec<String> = Vec::new();
+            for c in candidates[fx_start..].iter_mut() {
+                if c.subject_kind != "player" {
+                    continue;
+                }
+                if seen.contains(&sur(&c.subject)) {
+                    c.flags.push("seen in live events — on the pitch".to_string());
+                    if !confirmed.contains(&c.subject) {
+                        confirmed.push(c.subject.clone());
+                    }
+                } else {
+                    c.flags.push("unconfirmed on pitch — no lineup coverage for this match".to_string());
+                }
+            }
+            live_notes.push(format!(
+                "{fixture_label}: the data feed has NO lineups for this match — player names come from season stats and may include players not actually on the pitch.{}",
+                if confirmed.is_empty() { String::new() } else { format!(" Confirmed on pitch (from events): {}.", confirmed.join(", ")) }
+            ));
         }
 
         // Referee context stays SOFT (a pred_notes line the model weighs). The old
@@ -2237,6 +2498,11 @@ pub async fn build_tickets(
                 // Stat lines the ingested page supports, derived + priced from its
                 // own numbers — added ALONGSIDE the engine's, both flagged by source.
                 let mut sc = crate::ingeststats::candidates_for_fixture(&matched, &fx.home_team, &fx.away_team, &fixture_label, fx.fixture_id);
+                // Respect the user's market selection here too — ingest lines used
+                // to be added regardless, which read as "Scout ignores my markets".
+                if !selection.markets.is_empty() {
+                    sc.retain(|c| markets.iter().any(|m| *m == c.market_group));
+                }
                 features::attach_odds(&mut sc, &fixture_odds, &fixture_label, &fx.home_team);
                 scout_candidates.extend(sc);
             }
@@ -2370,6 +2636,7 @@ pub async fn build_tickets(
         "jackpot" => (90, 14), // lottery — wide pool of plausible longshots to stack big
         "predictor" => (110, 20), // deep single-match read — the whole market for one game
         "scout" => (220, 44), // send the WHOLE picture (Haiku's context is huge): anchors + all solid moderate (≥30%) picks
+        "stacker" => (120, 22), // risk-controlled stacks — wide stat pool incl. alt lines
         _ => (50, 8),         // value
     };
     // Make sure the pool is big enough to actually BUILD the requested slate: with
@@ -2445,7 +2712,7 @@ pub async fn build_tickets(
     };
     // Simple mode: a forecast for EVERY selected match — live-adjusted per fixture
     // so an in-play game shows the current-score read, not stale pre-match numbers.
-    let simple_forecasts: Vec<crate::models::MatchForecast> = if selection.simple.unwrap_or(false) {
+    let simple_forecasts: Vec<crate::models::MatchForecast> = if selection.simple.unwrap_or(false) || strategy == "scout" || strategy == "stacker" {
         let mut v = Vec::new();
         for fx in &selection.fixtures {
             let fl = format!("{} vs {}", fx.home_team, fx.away_team);
@@ -2501,10 +2768,48 @@ pub async fn build_tickets(
             ));
         }
     }
+    // APEX transparency: an empty Apex slate is the strategy WORKING, but it
+    // must say WHY it's empty — count the sharp-edge singles deterministically
+    // so "no picks" is explained (no Pinnacle pricing vs no edge clearing +2%).
+    if strategy == "apex" {
+        let priced = candidates.iter().filter(|c| c.pinnacle_prob.is_some()).count();
+        let sharp: Vec<&Candidate> = candidates
+            .iter()
+            .filter(|c| c.ev_source.as_deref() == Some("sharp"))
+            .collect();
+        let qualifying = sharp
+            .iter()
+            .filter(|c| {
+                c.ev.unwrap_or(-1.0) >= 0.02
+                    && c.pinnacle_prob.map_or(false, |ps| (c.est_prob - ps).abs() <= 0.12)
+            })
+            .count();
+        let best_ev = sharp.iter().filter_map(|c| c.ev).fold(f64::NEG_INFINITY, f64::max);
+        if priced == 0 {
+            det_extra.push(
+                "Apex: NO legs on this slate have Pinnacle pricing — sharp-edge singles are impossible without the sharp line (odds feed missing or not yet cached for these fixtures). Expect an empty/short slate."
+                    .to_string(),
+            );
+        } else if qualifying == 0 {
+            det_extra.push(format!(
+                "Apex: 0 of {priced} sharp-priced legs cleared the bar (EV ≥ +2% with model/sharp agreement){} — passing IS the strategy; try more fixtures or another day.",
+                if best_ev.is_finite() { format!("; best sharp EV {:+.1}%", best_ev * 100.0) } else { String::new() }
+            ));
+        } else {
+            det_extra.push(format!(
+                "Apex: {qualifying} sharp-edge single(s) cleared the bar out of {priced} sharp-priced legs."
+            ));
+        }
+    }
     // APEX: hunt correlated combos over the FULL candidate pool (before the
     // shortlist trims it) — the copula edge often lives in mid-probability legs.
     let apex_combos = if strategy == "apex" {
-        let block = apex_combo_block(&candidates);
+        // CPU-heavy Monte-Carlo — run on a blocking thread so the UI (and every
+        // other command) stays responsive; this used to freeze the whole app.
+        let cands_snapshot = candidates.clone();
+        let block = tokio::task::spawn_blocking(move || apex_combo_block(&cands_snapshot))
+            .await
+            .unwrap_or_default();
         if block.is_empty() {
             det_extra.push("Apex: no correlated combos cleared the bar (lift ≥1.08, corr-EV ≥2%) — singles only.".to_string());
         } else {
@@ -2544,6 +2849,7 @@ pub async fn build_tickets(
         min_legs: selection.min_legs.unwrap_or(1).clamp(1, 12),
         max_per_subject: selection.max_per_subject.unwrap_or(0).min(20),
         apex_combos,
+        cover_all: selection.cover_all.unwrap_or(false),
     };
     // Pull in any browser-ingested pages matched to these fixtures — labeled
     // 3rd-party context for the model, and mark each item "used".
@@ -2624,10 +2930,12 @@ pub async fn build_tickets(
         }
     }
 
-    // Two-stage (cheap DeepSeek draft → premium finalise) only pays off when the
-    // user picked a PREMIUM final model. Default Haiku builds directly (one call).
+    // Two-stage (cheap draft → premium finalise) only pays off when the user
+    // picked a PREMIUM final model. Default Haiku builds directly (one call).
+    // Haiku drafts — it's sharper than DeepSeek on qualitative picking; DeepSeek
+    // is reserved for pure DATA work (ingest extraction).
     let two_stage = (scout || selection.simple.unwrap_or(false)) && llm::is_premium_model(&model);
-    let draft_model = llm::DETERMINISTIC_MODEL;
+    let draft_model = llm::DEFAULT_MODEL;
     // Cache key must distinguish two-stage from a single-model build.
     let hash_model = if two_stage { format!("{draft_model}+{model}") } else { model.clone() };
     let hash = llm::input_hash(
@@ -2684,20 +2992,35 @@ pub async fn build_tickets(
             r.from_cache = true;
             (r, 0, 0, true)
         } else {
-            // Two-stage (Scout/Simple) or a single call.
-            let (call, draft_in, draft_out) = if two_stage {
-                llm::call_model_two_stage(
-                    &state, draft_model, &model, &table, &markets, selection.reasoning,
-                    &selection.notes, &pred_notes, grok_digest.as_deref(), &opts,
-                )
-                .await?
-            } else {
-                let c = llm::call_model(
-                    &state, &model, &table, &markets, selection.reasoning,
-                    &selection.notes, &pred_notes, grok_digest.as_deref(), &opts,
-                )
-                .await?;
-                (c, 0, 0)
+            // Two-stage (Scout/Simple) or a single call — raced against the
+            // cancel flag so the user can abort even mid model call (dropping
+            // the future cancels the HTTP request).
+            let model_fut = async {
+                if two_stage {
+                    llm::call_model_two_stage(
+                        &state, draft_model, &model, &table, &markets, selection.reasoning,
+                        &selection.notes, &pred_notes, grok_digest.as_deref(), &opts,
+                    )
+                    .await
+                } else {
+                    llm::call_model(
+                        &state, &model, &table, &markets, selection.reasoning,
+                        &selection.notes, &pred_notes, grok_digest.as_deref(), &opts,
+                    )
+                    .await
+                    .map(|c| (c, 0, 0))
+                }
+            };
+            tokio::pin!(model_fut);
+            let (call, draft_in, draft_out) = loop {
+                tokio::select! {
+                    r = &mut model_fut => break r?,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {
+                        if state.build_cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                            return Err("Build cancelled.".to_string());
+                        }
+                    }
+                }
             };
             let mut r = call.result;
             r.from_cache = false;
@@ -2731,6 +3054,7 @@ pub async fn build_tickets(
     result.context_notes = pred_notes;
     result.forecast = forecast;
     result.forecasts = simple_forecasts;
+    result.index_used = index_used;
 
     // Paper-trading ledger: record each unique generated ticket by strategy +
     // grok flag, so we can later settle them all and see which approach wins.
@@ -2748,7 +3072,7 @@ pub async fn build_tickets(
                 .collect();
             sig.sort();
             if let Ok(tj) = serde_json::to_string(t) {
-                let _ = db::gen_add(&conn, af::now_ts(), &day, &strategy, grok_used, ingest_used, &t.kind, &sig.join("##"), &tj, t.combined_odds);
+                let _ = db::gen_add(&conn, af::now_ts(), &day, &strategy, grok_used, ingest_used, index_used, &t.kind, &sig.join("##"), &tj, t.combined_odds);
             }
         }
     }
@@ -2855,10 +3179,25 @@ async fn gather_candidates(
     // the board than in a Build (and the ladder ledger recorded raw probs).
     let (calib_lambda, _calib_n) = calibration_shrink(state);
     let calib_on = (calib_lambda - 1.0).abs() > 1e-6;
+    // Opponent index in the deterministic paths too (ladder/darwin/boards) — the
+    // same leg must carry the same probability everywhere.
+    let use_index = state.keys.lock().map(|k| k.use_team_index.unwrap_or(true)).unwrap_or(true);
+    let mut index_cache: HashMap<(i64, i64), HashMap<i64, TeamFactors>> = HashMap::new();
     let mut candidates: Vec<Candidate> = Vec::new();
     for fx in fixtures {
         let fixture_label = format!("{} vs {}", fx.home_team, fx.away_team);
         let fx_start = candidates.len();
+        let (idx_home, idx_away) = if use_index {
+            let m = index_cache
+                .entry((fx.league_id, fx.season))
+                .or_insert_with(|| load_league_factors(state, fx.league_id, fx.season));
+            match (m.get(&fx.home_team_id).cloned(), m.get(&fx.away_team_id).cloned()) {
+                (Some(h), Some(a)) => (Some(h), Some(a)),
+                _ => (None, None),
+            }
+        } else {
+            (None, None)
+        };
         let injuries = fetch_injury_map(state, fx.fixture_id).await.unwrap_or_default();
         let fixture_odds = af::cached_get(state, "/odds", vec![("fixture", fx.fixture_id.to_string())], af::TTL_ODDS)
             .await
@@ -2867,7 +3206,16 @@ async fn gather_candidates(
             .unwrap_or_default();
         // Confirmed lineups, same as builds: once posted, only the starting XI
         // gets player props (a board pick for a benched player is a trap).
-        let starters = fetch_starters(state, fx.fixture_id).await;
+        let starters = fetch_starters(state, fx.fixture_id, near_kickoff(&fx.date_utc)).await;
+        // Same ingested-lineup fallback as builds — boards must agree with builds.
+        let ingest_xi: HashMap<i64, HashSet<String>> = if starters.is_empty() {
+            ingest_lineups_for_fixture(state, fx)
+                .into_iter()
+                .map(|(k, v)| (k, v.iter().map(|n| crate::odds::fold(n)).collect()))
+                .collect()
+        } else {
+            HashMap::new()
+        };
 
         if !player_groups.is_empty() {
             let in_form = fetch_inform(state, fx.league_id, fx.season).await;
@@ -2876,9 +3224,50 @@ async fn gather_candidates(
                 (fx.away_team_id, fx.away_team.clone(), false, fx.home_team.clone()),
             ] {
                 let consistency = fetch_consistency(state, team_id, fx.season).await;
-                let entries = fetch_team_players(state, team_id, fx.season).await.unwrap_or_default();
+                let mut entries = fetch_team_players(state, team_id, fx.season).await.unwrap_or_default();
+                // PHANTOM GUARD: league season-stats keep players who already
+                // LEFT the club (transfers) — e.g. a "striker" who isn't in the
+                // squad at all. The squad list is the roster truth; cross-check
+                // it cache-only (0 requests) whenever we have it.
+                let squad_ids: Option<HashSet<i64>> = peek(state, "/players/squads", vec![("team", team_id.to_string())])
+                    .and_then(|j| {
+                        response_array(&j)
+                            .first()
+                            .and_then(|e| e.get("players"))
+                            .and_then(|p| p.as_array())
+                            .map(|arr| arr.iter().filter_map(|p| p.get("id").and_then(|v| v.as_i64())).collect::<HashSet<i64>>())
+                    })
+                    .filter(|sq| sq.len() >= 8); // partial/junk squads don't veto
+                if let Some(sq) = &squad_ids {
+                    entries.retain(|e| {
+                        e.get("player")
+                            .and_then(|p| p.get("id"))
+                            .and_then(|v| v.as_i64())
+                            .map(|id| sq.contains(&id))
+                            .unwrap_or(false)
+                    });
+                }
                 let baselines = features::squad_baselines(&entries, fx.league_id);
-                let team_starters = starters.get(&team_id);
+                let ingest_ids: Option<HashSet<i64>> = starters
+                    .get(&team_id)
+                    .is_none()
+                    .then(|| ingest_xi.get(&team_id))
+                    .flatten()
+                    .map(|names| {
+                        let surs: HashSet<&str> = names.iter().filter_map(|n| n.split(' ').last()).collect();
+                        entries
+                            .iter()
+                            .filter_map(|e| {
+                                let pl = e.get("player")?;
+                                let id = pl.get("id").and_then(|v| v.as_i64())?;
+                                let f = crate::odds::fold(pl.get("name").and_then(|v| v.as_str())?);
+                                let sur = f.split(' ').last().unwrap_or("");
+                                (names.contains(&f) || (sur.len() > 2 && surs.contains(sur))).then_some(id)
+                            })
+                            .collect::<HashSet<i64>>()
+                    })
+                    .filter(|ids| ids.len() >= 7);
+                let team_starters = starters.get(&team_id).or(ingest_ids.as_ref());
                 let entries: Vec<Value> = match team_starters {
                     Some(set) => entries
                         .into_iter()
@@ -2899,6 +3288,7 @@ async fn gather_candidates(
                     } else {
                         pid.and_then(|id| injuries.get(&id).cloned()).unwrap_or_else(|| "unknown".to_string())
                     };
+                    let opp_idx = if is_home { idx_away.as_ref() } else { idx_home.as_ref() };
                     let ctx = FixtureCtx {
                         fixture_label: fixture_label.clone(),
                         fixture_id: fx.fixture_id,
@@ -2906,6 +3296,8 @@ async fn gather_candidates(
                         opponent: opp.clone(),
                         is_home,
                         availability,
+                        opp_def_shots: opp_idx.map(|f| f.def_shots),
+                        opp_def_goals: opp_idx.map(|f| f.def_goals),
                     };
                     candidates.extend(features::build_player_candidates_entry(&entry, fx.league_id, &ctx, &player_groups, &in_form, &consistency, &baselines));
                 }
@@ -2956,7 +3348,11 @@ async fn gather_candidates(
                     a.most_card_rate = ac.3;
                 }
             }
-            if let (Some(h), Some(a)) = (home, away) {
+            if let (Some(mut h), Some(mut a)) = (home, away) {
+                if let (Some(fh), Some(fa)) = (idx_home.as_ref(), idx_away.as_ref()) {
+                    apply_index_sos(&mut h, fh);
+                    apply_index_sos(&mut a, fa);
+                }
                 candidates.extend(features::build_team_candidates(&h, &a, &fixture_label, fx.fixture_id, &team_groups));
             }
         }
@@ -3154,15 +3550,30 @@ pub async fn build_ladder(
     min_odds: Option<f64>,
     max_odds: Option<f64>,
     one_per_fixture: Option<bool>,
+    mega: Option<bool>,
+    cover_all: Option<bool>,
+    cover_legs: Option<u32>,
 ) -> Result<BuildResult, String> {
     if fixtures.is_empty() {
         return Err("Select at least one match first.".to_string());
     }
+    // MEGA ACCA: one giant ticket — the best 2-3 legs from EVERY selected match,
+    // each leg priced in the sweet spot (defaults to 1.2-2.0 when no band is
+    // set). Deterministic; built for watching the whole slate grow.
+    let mega = mega.unwrap_or(false);
+    // COVER-ALL: every ticket must span EVERY selected fixture with at least
+    // `cover_legs` legs. The hit-chance target is IGNORED while on (it would
+    // stop the fill before coverage completes — deceiving, per the spec).
+    let cover_all = cover_all.unwrap_or(false);
+    let cover_legs = cover_legs.unwrap_or(1).clamp(1, 3) as usize;
     // Diversified cross-game mode: at most ONE leg per match — legs are then
     // truly independent (no shared game state), which is exactly the low-
     // correlation acca ("the 10 best shooters from 10 games") that a same-game
     // stack can't give you.
-    let one_per_fixture = one_per_fixture.unwrap_or(false);
+    let mut one_per_fixture = one_per_fixture.unwrap_or(false);
+    if cover_all && cover_legs > 1 {
+        one_per_fixture = false; // coverage of 2+ legs/fixture contradicts it
+    }
     let ou_side = ou_side.unwrap_or_else(|| "auto".to_string());
     // Default MIXED: the selected MARKETS already say what the user wants — the
     // scope is only an optional narrowing on top (and defaulting to "team" made
@@ -3170,7 +3581,12 @@ pub async fn build_ladder(
     let scope = scope.unwrap_or_else(|| "mixed".to_string()); // team | props | mixed
     let count = count.unwrap_or(5).clamp(1, 20) as usize;
     let min_prob = min_prob.unwrap_or(0.55).clamp(0.05, 0.97);
-    let max_legs = max_legs.unwrap_or(8).clamp(2, 20) as usize;
+    // 0 = NO CAP — the ticket grows until the hit-target floor or the pool
+    // runs out (mega accas). Otherwise clamp to a sane band.
+    let max_legs = match max_legs.unwrap_or(8) {
+        0 => usize::MAX,
+        n => n.clamp(2, 60) as usize,
+    };
     let min_hit = min_hit.unwrap_or(0.05).clamp(0.005, 0.9);
     let max_per_subject = max_per_subject.unwrap_or(2).clamp(1, 20) as usize;
     let min_legs = (min_legs.unwrap_or(2).clamp(2, 20) as usize).min(max_legs);
@@ -3292,13 +3708,19 @@ pub async fn build_ladder(
     };
     // Drop any subjects the user voided (e.g. a player ruled out) so they can't
     // reappear in newly-added tickets. Also apply the per-leg odds sweet-spot.
-    let odds_lo = min_odds.unwrap_or(1.0);
-    let odds_hi = max_odds.unwrap_or(1000.0);
-    let band_active = odds_lo > 1.01 || odds_hi < 999.0;
+    let (odds_lo, odds_hi, band_active) = {
+        let lo = min_odds.unwrap_or(1.0);
+        let hi = max_odds.unwrap_or(1000.0);
+        let active = lo > 1.01 || hi < 999.0;
+        // Mega accas live in the plausible-but-paying band by default.
+        if mega && !active { (1.2, 2.0, true) } else { (lo, hi, active) }
+    };
     let mut legs: Vec<Candidate> = legs
         .into_iter()
         .filter(|c| !excl_subj.contains(&crate::odds::fold(&c.subject)))
-        .filter(|c| !band_active || c.book_odds.map_or(true, |o| o >= odds_lo && o <= odds_hi))
+        // Mega legs must be PRICED (the point is the growing combined odds);
+        // elsewhere unpriced props survive the band as before.
+        .filter(|c| !band_active || c.book_odds.map_or(!mega, |o| o >= odds_lo && o <= odds_hi))
         // Trivial-leg policy: near-certainties pad a ladder's hit% while adding
         // ≤10% payout against real risk — never useful rungs.
         .filter(|c| c.est_prob <= TRIVIAL_PROB && !matches!(c.book_odds, Some(o) if o <= TRIVIAL_ODDS))
@@ -3334,10 +3756,112 @@ pub async fn build_ladder(
         if p >= 0.6 { "safe" } else if p >= 0.35 { "moderate" } else if p >= 0.12 { "risky" } else { "long" }
     };
 
+    // MEGA ACCA: one ticket, best 2-3 legs from every fixture, sweet-spot priced.
+    if mega {
+        let mut chosen: Vec<Candidate> = Vec::new();
+        let mut in_ticket: HashSet<String> = HashSet::new();
+        let mut thin_fx: Vec<String> = Vec::new();
+        for f in &fixtures {
+            let flabel = format!("{} vs {}", f.home_team, f.away_team);
+            // This fixture's pool, best-scored first (the interleaved global
+            // order isn't strictly sorted within one fixture).
+            let mut pool: Vec<&Candidate> = legs.iter().filter(|c| c.fixture == flabel).collect();
+            pool.sort_by(|a, b| lscore(b).partial_cmp(&lscore(a)).unwrap_or(std::cmp::Ordering::Equal));
+            let mut n = 0usize;
+            for c in pool {
+                if n >= 3 {
+                    break; // 2-3 legs per match — greed stops here
+                }
+                let fkey = format!("{}|{}", c.fixture, c.market_group);
+                let k = dkey(c);
+                if in_ticket.contains(&fkey) || in_ticket.contains(&k) {
+                    continue;
+                }
+                // Same joint-satisfiability guard as the ladder — no impossible
+                // goal/result stacks inside one match.
+                if is_goal_market(&c.market_group) {
+                    let home = home_by_fix.get(&c.fixture).map(|s| s.as_str()).unwrap_or("");
+                    let mut same: Vec<Candidate> =
+                        chosen.iter().filter(|x| x.fixture == c.fixture).cloned().collect();
+                    same.push(c.clone());
+                    if !goals_satisfiable(&same, home) {
+                        continue;
+                    }
+                }
+                chosen.push(c.clone());
+                in_ticket.insert(fkey);
+                in_ticket.insert(k);
+                n += 1;
+            }
+            if n < 2 {
+                thin_fx.push(format!("{flabel} ({n})"));
+            }
+        }
+        if chosen.len() < 2 {
+            return Err(format!(
+                "Mega acca: only {} leg(s) priced inside {:.2}-{:.2} across your slate — widen the odds band or add markets/fixtures.",
+                chosen.len(), odds_lo, odds_hi
+            ));
+        }
+        let prod: f64 = chosen.iter().map(|c| c.est_prob).product();
+        let odds: f64 = chosen.iter().map(|c| c.book_odds.unwrap_or(1.0)).product();
+        let title = format!(
+            "🚀 Mega acca · {} legs across {} matches · @{}",
+            chosen.len(),
+            fixtures.len(),
+            if odds >= 100.0 { format!("{odds:.0}") } else { format!("{odds:.1}") }
+        );
+        let ticket = make_ladder_ticket(&chosen, &title);
+        // Ledger under its own strategy so its conversion tracks separately.
+        {
+            let conn = state.db.lock().map_err(|_| "db lock")?;
+            let day = local_today(&state);
+            let mut sig: Vec<String> = ticket
+                .legs
+                .iter()
+                .map(|l| format!("{}|{}|{}", l.market, l.selection, l.line.clone().unwrap_or_default()))
+                .collect();
+            sig.sort();
+            if let Ok(tj) = serde_json::to_string(&ticket) {
+                let _ = db::gen_add(&conn, af::now_ts(), &day, "mega", false, false, false, &ticket.kind, &sig.join("##"), &tj, ticket.combined_odds);
+            }
+        }
+        let mut notes = vec![format!(
+            "Mega acca — {} legs (2-3 per match, each priced {:.2}-{:.2}), combined ~{}% @ {:.1}. Deterministic, no model call.",
+            chosen.len(), odds_lo, odds_hi, (prod * 100.0).round() as i64, odds
+        )];
+        if !thin_fx.is_empty() {
+            notes.push(format!(
+                "Thin fixtures (fewer than 2 sweet-spot legs available): {}.",
+                thin_fx.join(" · ")
+            ));
+        }
+        return Ok(BuildResult {
+            tickets: vec![ticket],
+            forecast: None,
+            forecasts: vec![],
+            data_quality_notes: notes,
+            context_notes: vec![],
+            from_cache: false,
+            grok_used: false,
+            ingest_used: false,
+            index_used: false,
+            grok_digest: None,
+        });
+    }
+
     // Build `count` tickets at geometrically-spaced hit-chance targets (safe →
     // risky). Each ticket: ≤ max_legs, no repeated subject, and no player in more
     // than `max_per_subject` tickets total — so one star can't sink the slate.
     let hi = 0.78f64.max(min_hit);
+    // Cover-all: the cap must fit fixtures × legs-each; fixtures with NO pool
+    // legs (all filtered out) can't be covered — noted, not silently skipped.
+    let max_legs = if cover_all { max_legs.max(fixtures.len() * cover_legs) } else { max_legs };
+    let coverable: Vec<String> = fixtures
+        .iter()
+        .map(|f| format!("{} vs {}", f.home_team, f.away_team))
+        .filter(|fl| legs.iter().any(|c| &c.fixture == fl))
+        .collect();
     let mut subj_used: HashMap<String, usize> = HashMap::new();
     // Continue the diversity pool across an "add more" (unless the user reset it):
     // pre-charge subjects already used by the existing tickets.
@@ -3365,6 +3889,49 @@ pub async fn build_ladder(
         let mut chosen: Vec<Candidate> = Vec::new();
         let mut prod = 1.0f64;
         let mut in_ticket: HashSet<String> = HashSet::new();
+        if cover_all {
+            // FIXTURE-FIRST fill: walk the fixtures (rotating the lead each
+            // attempt for variety) and take up to `cover_legs` best available
+            // legs from each — the hit-target is deliberately not consulted.
+            let nfx = coverable.len().max(1);
+            for k0 in 0..coverable.len() {
+                let flabel = &coverable[(attempt + k0) % nfx];
+                let mut got = 0usize;
+                for j in 0..pool_len {
+                    if got >= cover_legs || chosen.len() >= max_legs {
+                        break;
+                    }
+                    let c = &legs[(start + j) % pool_len];
+                    if &c.fixture != flabel {
+                        continue;
+                    }
+                    let fkey = format!("{}|{}", c.fixture, c.market_group);
+                    let fxkey = format!("fx:{}", c.fixture);
+                    let k = dkey(c);
+                    if in_ticket.contains(&fkey)
+                        || in_ticket.contains(&k)
+                        || *subj_used.get(&k).unwrap_or(&0) >= cap
+                    {
+                        continue;
+                    }
+                    if is_goal_market(&c.market_group) {
+                        let home = home_by_fix.get(&c.fixture).map(|s| s.as_str()).unwrap_or("");
+                        let mut same: Vec<Candidate> =
+                            chosen.iter().filter(|x| x.fixture == c.fixture).cloned().collect();
+                        same.push(c.clone());
+                        if !goals_satisfiable(&same, home) {
+                            continue;
+                        }
+                    }
+                    prod *= c.est_prob;
+                    chosen.push(c.clone());
+                    in_ticket.insert(fkey);
+                    in_ticket.insert(fxkey);
+                    in_ticket.insert(k);
+                    got += 1;
+                }
+            }
+        } else {
         for j in 0..pool_len {
             if chosen.len() >= max_legs {
                 break;
@@ -3402,8 +3969,17 @@ pub async fn build_ladder(
             in_ticket.insert(fxkey);
             in_ticket.insert(k);
         }
+        }
         attempt += 1;
-        if chosen.len() < min_legs {
+        // Cover-all: a valid ticket must span every coverable fixture (one with
+        // pool legs at all); otherwise the normal min-legs floor applies.
+        let floor_ok = if cover_all {
+            let covered: HashSet<&str> = chosen.iter().map(|c| c.fixture.as_str()).collect();
+            coverable.iter().all(|fl| covered.contains(fl.as_str()))
+        } else {
+            chosen.len() >= min_legs
+        };
+        if !floor_ok {
             // Stuck — the per-subject cap is starving us; relax it so the count
             // still gets met (the count the user asked for wins over diversity).
             if attempt % count.max(1) == 0 && cap < 8 {
@@ -3436,22 +4012,41 @@ pub async fn build_ladder(
                 .collect();
             sig.sort();
             if let Ok(tj) = serde_json::to_string(t) {
-                let _ = db::gen_add(&conn, af::now_ts(), &day, "ladder", false, false, &t.kind, &sig.join("##"), &tj, t.combined_odds);
+                let _ = db::gen_add(&conn, af::now_ts(), &day, "ladder", false, false, false, &t.kind, &sig.join("##"), &tj, t.combined_odds);
             }
         }
     }
 
+    let max_legs_label =
+        if max_legs == usize::MAX { "∞".to_string() } else { max_legs.to_string() };
     let mut notes = vec![format!(
         "Accumulator ladder — {} candidate lines (one per match/market, ≥{}% preferred); {} tickets, {}-{} legs, ≥{}% hit chance. Deterministic, no model call.",
         legs.len(),
         (min_prob * 100.0).round() as i64,
         tickets.len(),
         min_legs,
-        max_legs,
+        max_legs_label,
         (min_hit * 100.0).round() as i64
     )];
     if let Some(n) = scope_note {
         notes.push(n);
+    }
+    if cover_all {
+        notes.push(format!(
+            "Cover-all ON: every ticket spans all {} covered match(es) with ≥{} leg(s) each — the min-hit target is intentionally ignored in this mode (it would stop the fill before coverage).",
+            coverable.len(), cover_legs
+        ));
+        let missing: Vec<String> = fixtures
+            .iter()
+            .map(|f| format!("{} vs {}", f.home_team, f.away_team))
+            .filter(|fl| !coverable.contains(fl))
+            .collect();
+        if !missing.is_empty() {
+            notes.push(format!(
+                "⚠ No usable legs for: {} — these matches can't appear on the tickets (widen the markets, odds band or min-prob).",
+                missing.join(" · ")
+            ));
+        }
     }
     if tickets.len() < count {
         notes.push(format!(
@@ -3468,6 +4063,7 @@ pub async fn build_ladder(
         from_cache: false,
         grok_used: false,
         ingest_used: false,
+        index_used: false,
         grok_digest: None,
     })
 }
@@ -3700,6 +4296,7 @@ pub fn place_bet(
     odds: Option<f64>,
     grok_used: Option<bool>,
     ingest_used: Option<bool>,
+    index_used: Option<bool>,
     strategy: Option<String>,
 ) -> Result<i64, String> {
     // Inject the actual odds the user took (if given) so P&L is accurate.
@@ -3720,6 +4317,7 @@ pub fn place_bet(
         stake,
         grok_used.unwrap_or(false),
         ingest_used.unwrap_or(false),
+        index_used.unwrap_or(false),
         strategy.as_deref().unwrap_or("value"),
     )
 }
@@ -4174,6 +4772,7 @@ pub async fn live_fixtures(state: State<'_, AppState>) -> Result<Vec<LiveFixture
             home_goals: f.get("goals").and_then(|g| g.get("home")).and_then(|v| v.as_i64()).unwrap_or(0),
             away_goals: f.get("goals").and_then(|g| g.get("away")).and_then(|v| v.as_i64()).unwrap_or(0),
             has_stats: false,
+            date_utc: fx.and_then(|x| x.get("date")).and_then(|v| v.as_str()).map(|s| s.to_string()),
         });
     }
     // HT first (most actionable), then later games first.
@@ -4750,8 +5349,15 @@ pub fn ingest_info(state: State<AppState>) -> Result<IngestInfo, String> {
 
 #[tauri::command]
 pub fn list_ingested(state: State<AppState>) -> Result<Vec<IngestItem>, String> {
-    let conn = state.db.lock().map_err(|_| "db lock")?;
-    Ok(db::ingest_list(&conn)?.iter().map(|r| to_ingest_item(&state, r)).collect())
+    // Read the rows, then RELEASE the db lock before mapping: to_ingest_item
+    // calls peek(), which re-locks the same (non-reentrant) Mutex<Connection>.
+    // Holding it across the map self-deadlocked the main thread — a blank,
+    // "not responding" window on every launch once any row had a fixture_id.
+    let rows = {
+        let conn = state.db.lock().map_err(|_| "db lock")?;
+        db::ingest_list(&conn)?
+    };
+    Ok(rows.iter().map(|r| to_ingest_item(&state, r)).collect())
 }
 
 #[tauri::command]
@@ -4798,8 +5404,13 @@ pub async fn process_ingested(
         let _ = db::usage_add(&conn, af::now_ts(), model, gin, gout, "ingest");
         db::ingest_set_processed(&conn, id, &label, None, &json, model)?;
     }
-    let conn = state.db.lock().map_err(|_| "db lock")?;
-    let updated = db::ingest_get(&conn, id)?.ok_or_else(|| "not found".to_string())?;
+    // Read the updated row, then RELEASE the lock before to_ingest_item — it
+    // calls peek(), which re-locks the same non-reentrant mutex (see the note
+    // on list_ingested; holding it here would deadlock the same way).
+    let updated = {
+        let conn = state.db.lock().map_err(|_| "db lock")?;
+        db::ingest_get(&conn, id)?.ok_or_else(|| "not found".to_string())?
+    };
     Ok(to_ingest_item(&state, &updated))
 }
 
@@ -4951,7 +5562,12 @@ pub struct ApexCombo {
 /// (max 3 per fixture) sorted by corr-EV.
 fn apex_top_combos(cands: &[Candidate]) -> Vec<ApexCombo> {
     use crate::montecarlo::{is_scoreline_market, sgp_probability, theme_of, SimLeg};
-    const SEARCH_SIMS: usize = 8_000;
+    // TWO-STAGE search. The old exhaustive pass (165 combos × 8k sims × every
+    // fixture) ran MINUTES in a debug build and froze the UI. Now: screen all
+    // PAIRS cheaply, extend only the best pairs into triples, then re-price
+    // just the global winners at full precision — ~10× less work, same answer.
+    const PAIR_SIMS: usize = 3_000;
+    const REFINE_SIMS: usize = 10_000;
     const MIN_LIFT: f64 = 1.08;
     const MIN_CORR_EV: f64 = 0.02;
 
@@ -4971,13 +5587,13 @@ fn apex_top_combos(cands: &[Candidate]) -> Vec<ApexCombo> {
 
     let mut all: Vec<ApexCombo> = Vec::new();
     for (fid, mut idx) in by_fix {
-        // Rank by fair probability and keep the top 10 → ≤165 combos to price.
+        // Rank by fair probability; top 8 legs per fixture (28 pairs max).
         idx.sort_by(|a, b| {
             let fa = cands[*a].pinnacle_prob.unwrap_or(cands[*a].est_prob);
             let fb = cands[*b].pinnacle_prob.unwrap_or(cands[*b].est_prob);
             fb.partial_cmp(&fa).unwrap_or(std::cmp::Ordering::Equal)
         });
-        idx.truncate(10);
+        idx.truncate(8);
         let sim_of = |i: usize| -> SimLeg {
             let c = &cands[i];
             SimLeg {
@@ -4994,34 +5610,54 @@ fn apex_top_combos(cands: &[Candidate]) -> Vec<ApexCombo> {
             crate::odds::fold(&x.subject) != crate::odds::fold(&y.subject)
                 && !(x.market == y.market && x.team == y.team)
         };
-        let mut combos: Vec<Vec<usize>> = Vec::new();
-        for a in 0..idx.len() {
-            for b in (a + 1)..idx.len() {
-                if !compatible(idx[a], idx[b]) {
-                    continue;
-                }
-                combos.push(vec![idx[a], idx[b]]);
-                for c3 in (b + 1)..idx.len() {
-                    if compatible(idx[a], idx[c3]) && compatible(idx[b], idx[c3]) {
-                        combos.push(vec![idx[a], idx[b], idx[c3]]);
-                    }
-                }
-            }
-        }
-        let mut fixture_best: Vec<ApexCombo> = Vec::new();
-        for combo in combos {
+        let price_combo = |combo: &[usize], sims: usize| -> ApexCombo {
             let legs: Vec<SimLeg> = combo.iter().map(|&i| sim_of(i)).collect();
-            let price = sgp_probability(&legs, SEARCH_SIMS);
+            let price = sgp_probability(&legs, sims);
             let product_odds: f64 = combo.iter().map(|&i| cands[i].book_odds.unwrap_or(1.0)).product();
             let corr_ev = product_odds * price.correlated - 1.0;
-            if price.lift >= MIN_LIFT && corr_ev >= MIN_CORR_EV {
-                fixture_best.push(ApexCombo { idx: combo, price, product_odds, corr_ev });
+            ApexCombo { idx: combo.to_vec(), price, product_odds, corr_ev }
+        };
+
+        // Stage 1 — screen every pair cheaply.
+        let mut pairs: Vec<ApexCombo> = Vec::new();
+        for a in 0..idx.len() {
+            for b in (a + 1)..idx.len() {
+                if compatible(idx[a], idx[b]) {
+                    pairs.push(price_combo(&[idx[a], idx[b]], PAIR_SIMS));
+                }
             }
         }
-        // Top 3 per fixture so one match can't flood the slate.
+        pairs.sort_by(|a, b| b.corr_ev.partial_cmp(&a.corr_ev).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Stage 2 — extend only the best pairs into triples (deduped).
+        let mut seen: std::collections::HashSet<Vec<usize>> = std::collections::HashSet::new();
+        let mut triples: Vec<ApexCombo> = Vec::new();
+        for p in pairs.iter().take(8) {
+            for &c3 in &idx {
+                if p.idx.contains(&c3) || !p.idx.iter().all(|&x| compatible(x, c3)) {
+                    continue;
+                }
+                let mut key = p.idx.clone();
+                key.push(c3);
+                key.sort_unstable();
+                if seen.insert(key.clone()) {
+                    triples.push(price_combo(&key, PAIR_SIMS));
+                }
+            }
+        }
+
+        // Keep the fixture's best qualifiers (top 3 so one match can't flood).
+        let mut fixture_best: Vec<ApexCombo> = pairs
+            .into_iter()
+            .chain(triples)
+            .filter(|cb| cb.price.lift >= MIN_LIFT && cb.corr_ev >= MIN_CORR_EV)
+            .collect();
         fixture_best.sort_by(|a, b| b.corr_ev.partial_cmp(&a.corr_ev).unwrap_or(std::cmp::Ordering::Equal));
-        all.extend(fixture_best.into_iter().take(3));
+        fixture_best.truncate(3);
+        // Stage 3 — re-price the survivors at full precision.
+        all.extend(fixture_best.into_iter().map(|cb| price_combo(&cb.idx, REFINE_SIMS)));
     }
+    all.retain(|cb| cb.price.lift >= MIN_LIFT && cb.corr_ev >= MIN_CORR_EV);
     all.sort_by(|a, b| b.corr_ev.partial_cmp(&a.corr_ev).unwrap_or(std::cmp::Ordering::Equal));
     all.truncate(8);
     all
@@ -5157,8 +5793,13 @@ pub async fn darwin_sweep(
         .collect();
     singles("dw:lineroom", room, 4, &mut tickets);
 
-    // dw:corrlift — the copula's best correlated combos as real tickets.
-    for cb in apex_top_combos(&cands).into_iter().take(2) {
+    // dw:corrlift — the copula's best correlated combos as real tickets
+    // (blocking thread: the MC search must never stall the UI).
+    let cands_snapshot = cands.clone();
+    let top_combos = tokio::task::spawn_blocking(move || apex_top_combos(&cands_snapshot))
+        .await
+        .unwrap_or_default();
+    for cb in top_combos.into_iter().take(2) {
         let legs: Vec<Candidate> = cb.idx.iter().map(|&i| cands[i].clone()).collect();
         let t = make_ladder_ticket(&legs, &format!("🧬 dw:corrlift · lift x{:.2}", cb.price.lift));
         tickets.push(("dw:corrlift", t));
@@ -5231,7 +5872,7 @@ pub async fn darwin_sweep(
                 .collect();
             sig.sort();
             if let Ok(tj) = serde_json::to_string(t) {
-                let _ = db::gen_add(&conn, af::now_ts(), &day, name, false, false, &t.kind, &sig.join("##"), &tj, t.combined_odds);
+                let _ = db::gen_add(&conn, af::now_ts(), &day, name, false, false, false, &t.kind, &sig.join("##"), &tj, t.combined_odds);
                 *counts.entry(name).or_insert(0) += 1;
             }
         }
@@ -5575,4 +6216,585 @@ pub async fn inspect_team_stats(
     )
     .await?;
     Ok(features::parse_team_stats(&json, "").map(|t| features::team_stats_view(&t)))
+}
+
+// ---------- opponent-strength team index ----------
+
+/// One team's raw last-N sample for the index build.
+struct IndexSample {
+    games: i64,
+    opponents: Vec<i64>,
+    shots_f: f64,
+    shots_a: f64,
+    corners_f: f64,
+    corners_a: f64,
+    goals_f: f64,
+    goals_a: f64,
+}
+
+/// Fold the index's schedule correction into a team's rates: attack numbers
+/// earned against a soft schedule (sos_atk > 1) deflate, and vice versa. The
+/// opponent interaction itself happens in the feature engine's crossing.
+fn apply_index_sos(t: &mut features::TeamStats, f: &TeamFactors) {
+    let ma = (1.0 / f.sos_atk.max(0.5)).clamp(0.8, 1.25);
+    let md = (1.0 / f.sos_def.max(0.5)).clamp(0.8, 1.25);
+    t.gf_avg *= ma;
+    t.ga_avg *= md;
+    for v in [&mut t.xg_for, &mut t.shots_for, &mut t.corners_for] {
+        if let Some(x) = v.as_mut() {
+            *x *= ma;
+        }
+    }
+    for v in [&mut t.xg_against, &mut t.shots_against, &mut t.corners_against] {
+        if let Some(x) = v.as_mut() {
+            *x *= md;
+        }
+    }
+}
+
+/// Load a league's built factors as team_id → factors (empty if not built).
+fn load_league_factors(state: &AppState, league_id: i64, season: i64) -> HashMap<i64, TeamFactors> {
+    let conn = match state.db.lock() {
+        Ok(c) => c,
+        Err(_) => return HashMap::new(),
+    };
+    db::index_get_league(&conn, league_id, season)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|r| serde_json::from_str::<TeamFactors>(&r.factors).ok().map(|f| (r.team_id, f)))
+        .collect()
+}
+
+/// A team's last finished matches: opponents + per-game for/against sums.
+/// Cache-first; the fixture-stats rows are usually already cached by builds
+/// and settlement, so a rebuild mostly costs only the NEW fixtures.
+async fn index_team_sample(state: &AppState, team_id: i64) -> Option<IndexSample> {
+    let lj = af::cached_get(
+        state,
+        "/fixtures",
+        vec![("team", team_id.to_string()), ("last", "10".to_string())],
+        af::TTL_FIXTURES,
+    )
+    .await
+    .ok()?;
+    let mut s = IndexSample { games: 0, opponents: vec![], shots_f: 0.0, shots_a: 0.0, corners_f: 0.0, corners_a: 0.0, goals_f: 0.0, goals_a: 0.0 };
+    for f in response_array(&lj) {
+        let short = f.get("fixture").and_then(|x| x.get("status")).and_then(|x| x.get("short")).and_then(|v| v.as_str()).unwrap_or("");
+        if !matches!(short, "FT" | "AET" | "PEN") {
+            continue;
+        }
+        let fid = f.get("fixture").and_then(|x| x.get("id")).and_then(|v| v.as_i64())?;
+        let home_id = f.get("teams").and_then(|t| t.get("home")).and_then(|t| t.get("id")).and_then(|v| v.as_i64())?;
+        let away_id = f.get("teams").and_then(|t| t.get("away")).and_then(|t| t.get("id")).and_then(|v| v.as_i64())?;
+        let is_home = home_id == team_id;
+        let opp = if is_home { away_id } else { home_id };
+        let gh = f.get("goals").and_then(|g| g.get("home")).and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let ga = f.get("goals").and_then(|g| g.get("away")).and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let (gf, gag) = if is_home { (gh, ga) } else { (ga, gh) };
+        // Volume stats per fixture (7-day TTL — final stats never change).
+        let sj = match af::cached_get(state, "/fixtures/statistics", vec![("fixture", fid.to_string())], af::TTL_INJURIES * 28).await {
+            Ok(j) => j,
+            Err(_) => continue, // budget tripped mid-build — use what we have
+        };
+        let arr = response_array(&sj);
+        let me = arr.iter().find(|t| t.get("team").and_then(|x| x.get("id")).and_then(|v| v.as_i64()) == Some(team_id));
+        let op = arr.iter().find(|t| t.get("team").and_then(|x| x.get("id")).and_then(|v| v.as_i64()) != Some(team_id));
+        let (me, op) = match (me, op) {
+            (Some(m), Some(o)) => (m, o),
+            _ => continue,
+        };
+        s.games += 1;
+        s.opponents.push(opp);
+        s.goals_f += gf;
+        s.goals_a += gag;
+        s.shots_f += stat_val(me, "Total Shots").unwrap_or(0.0);
+        s.shots_a += stat_val(op, "Total Shots").unwrap_or(0.0);
+        s.corners_f += stat_val(me, "Corner Kicks").unwrap_or(0.0);
+        s.corners_a += stat_val(op, "Corner Kicks").unwrap_or(0.0);
+    }
+    if s.games < 3 {
+        return None; // too thin to rate honestly
+    }
+    Some(s)
+}
+
+/// Build (or rebuild) the opponent-strength index for one league+season.
+/// MANUAL by design — every request goes through the cache-first meter.
+#[tauri::command]
+pub async fn build_team_index(state: State<'_, AppState>, league_id: i64, season: i64) -> Result<IndexLeagueView, String> {
+    state.build_cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+    // 1. Standings → the league's team list (works for group formats too).
+    let sj = af::cached_get(
+        &state,
+        "/standings",
+        vec![("league", league_id.to_string()), ("season", season.to_string())],
+        af::TTL_PREDICTIONS,
+    )
+    .await?;
+    let mut teams: Vec<(i64, String)> = Vec::new();
+    for entry in response_array(&sj) {
+        if let Some(groups) = entry.get("league").and_then(|l| l.get("standings")).and_then(|s| s.as_array()) {
+            for group in groups.iter().filter_map(|g| g.as_array()) {
+                for row in group {
+                    if let (Some(id), Some(name)) = (
+                        row.get("team").and_then(|t| t.get("id")).and_then(|v| v.as_i64()),
+                        row.get("team").and_then(|t| t.get("name")).and_then(|v| v.as_str()),
+                    ) {
+                        if !teams.iter().any(|(tid, _)| *tid == id) {
+                            teams.push((id, name.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if teams.is_empty() {
+        return Err("No standings for this league/season — the index needs a table to rate against.".to_string());
+    }
+
+    // 2. Per-team samples (cache-first; cancellable between teams).
+    let mut samples: HashMap<i64, IndexSample> = HashMap::new();
+    let mut names: HashMap<i64, String> = HashMap::new();
+    for (tid, name) in &teams {
+        if state.build_cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("Index build cancelled.".to_string());
+        }
+        if let Some(s) = index_team_sample(&state, *tid).await {
+            samples.insert(*tid, s);
+        }
+        names.insert(*tid, name.clone());
+    }
+    if samples.len() < 4 {
+        return Err(format!(
+            "Only {} of {} teams had enough finished matches with stats — not enough for league-relative ratings (try later in the season, or check the request budget).",
+            samples.len(),
+            teams.len()
+        ));
+    }
+
+    // 3. League per-game means (for-side; the against-side mirrors it).
+    let mut n_tot = 0.0;
+    let (mut m_shots, mut m_corners, mut m_goals) = (0.0, 0.0, 0.0);
+    for s in samples.values() {
+        n_tot += s.games as f64;
+        m_shots += s.shots_f;
+        m_corners += s.corners_f;
+        m_goals += s.goals_f;
+    }
+    let (m_shots, m_corners, m_goals) = (m_shots / n_tot, m_corners / n_tot, m_goals / n_tot);
+    if m_shots <= 0.0 || m_goals <= 0.0 {
+        return Err("League averages came out zero — stats feed looks broken for this league.".to_string());
+    }
+
+    // 4. Raw league-relative factors per team.
+    let raw: HashMap<i64, TeamFactors> = samples
+        .iter()
+        .map(|(tid, s)| {
+            let n = s.games as f64;
+            (*tid, TeamFactors {
+                atk_goals: (s.goals_f / n) / m_goals,
+                def_goals: (s.goals_a / n) / m_goals,
+                atk_shots: (s.shots_f / n) / m_shots,
+                def_shots: (s.shots_a / n) / m_shots,
+                atk_corners: if m_corners > 0.0 { (s.corners_f / n) / m_corners } else { 1.0 },
+                def_corners: if m_corners > 0.0 { (s.corners_a / n) / m_corners } else { 1.0 },
+                sos_atk: 1.0,
+                sos_def: 1.0,
+                games: s.games,
+            })
+        })
+        .collect();
+
+    // 5. Schedule correction + shrinkage, then persist. A rate earned against
+    //    soft defences (avg opponent def > 1) is deflated, and vice versa.
+    //    Opponents outside the index (cup ties) count as neutral 1.0.
+    let now = af::now_ts();
+    let shrink = |f: f64, n: f64| -> f64 { (1.0 + (f - 1.0) * n / (n + 4.0)).clamp(0.5, 1.6) };
+    {
+        let conn = state.db.lock().map_err(|_| "db lock")?;
+        for (tid, s) in &samples {
+            let n = s.games as f64;
+            let sos_atk = (s.opponents.iter().map(|o| raw.get(o).map(|f| f.def_shots).unwrap_or(1.0)).sum::<f64>() / n).clamp(0.7, 1.4);
+            let sos_def = (s.opponents.iter().map(|o| raw.get(o).map(|f| f.atk_shots).unwrap_or(1.0)).sum::<f64>() / n).clamp(0.7, 1.4);
+            let r = &raw[tid];
+            let f = TeamFactors {
+                atk_goals: shrink(r.atk_goals / sos_atk, n),
+                def_goals: shrink(r.def_goals / sos_def, n),
+                atk_shots: shrink(r.atk_shots / sos_atk, n),
+                def_shots: shrink(r.def_shots / sos_def, n),
+                atk_corners: shrink(r.atk_corners / sos_atk, n),
+                def_corners: shrink(r.def_corners / sos_def, n),
+                sos_atk,
+                sos_def,
+                games: s.games,
+            };
+            let fj = serde_json::to_string(&f).map_err(|e| e.to_string())?;
+            db::index_put(&conn, league_id, season, *tid, names.get(tid).map(|s| s.as_str()).unwrap_or(""), &fj, s.games, now)?;
+        }
+    }
+    Ok(IndexLeagueView { league_id, season, teams: samples.len() as i64, built_at: now })
+}
+
+/// Built (league, season) list for the Settings UI.
+#[tauri::command]
+pub fn list_team_index(state: State<AppState>) -> Result<Vec<IndexLeagueView>, String> {
+    let conn = state.db.lock().map_err(|_| "db lock")?;
+    Ok(db::index_leagues(&conn)?
+        .into_iter()
+        .map(|(league_id, season, teams, built_at)| IndexLeagueView { league_id, season, teams, built_at })
+        .collect())
+}
+
+/// One league's team factors (for the inspector table in Settings).
+#[tauri::command]
+pub fn index_league_teams(state: State<AppState>, league_id: i64, season: i64) -> Result<Vec<TeamIndexView>, String> {
+    let conn = state.db.lock().map_err(|_| "db lock")?;
+    let mut rows: Vec<TeamIndexView> = db::index_get_league(&conn, league_id, season)?
+        .into_iter()
+        .filter_map(|r| {
+            serde_json::from_str::<TeamFactors>(&r.factors).ok().map(|f| TeamIndexView {
+                team_id: r.team_id,
+                name: r.name,
+                factors: f,
+                games: r.games,
+            })
+        })
+        .collect();
+    rows.sort_by(|a, b| b.factors.atk_goals.partial_cmp(&a.factors.atk_goals).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(rows)
+}
+
+/// Delete one league's weights (or ALL with no league) + their audit rows.
+#[tauri::command]
+pub fn reset_team_index(state: State<AppState>, league_id: Option<i64>) -> Result<usize, String> {
+    let conn = state.db.lock().map_err(|_| "db lock")?;
+    db::index_reset(&conn, league_id)
+}
+
+/// Full weights export (JSON) — copy/backup/share.
+#[tauri::command]
+pub fn export_team_index(state: State<AppState>) -> Result<String, String> {
+    let conn = state.db.lock().map_err(|_| "db lock")?;
+    let rows = db::index_export(&conn)?;
+    let out: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(league_id, season, r)| {
+            serde_json::json!({
+                "league_id": league_id,
+                "season": season,
+                "team_id": r.team_id,
+                "name": r.name,
+                "games": r.games,
+                "built_at": r.built_at,
+                "factors": serde_json::from_str::<serde_json::Value>(&r.factors).unwrap_or(serde_json::json!({})),
+            })
+        })
+        .collect();
+    serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
+}
+
+/// Audit the prediction ledger: fill in actuals for finished fixtures (cache-
+/// first — settlement usually cached the stats already), then report per-team
+/// predicted-vs-actual so you can SEE which ratings run hot or cold.
+#[tauri::command]
+pub async fn index_review(state: State<'_, AppState>) -> Result<Vec<TeamPerfRow>, String> {
+    let pending = {
+        let conn = state.db.lock().map_err(|_| "db lock")?;
+        db::pred_pending_fixtures(&conn, 25)?
+    };
+    for fid in pending {
+        let fj = match af::cached_get(&state, "/fixtures", vec![("id", fid.to_string())], 6 * 3600).await {
+            Ok(j) => j,
+            Err(_) => break, // budget tripped — audit what we can next time
+        };
+        let arr = response_array(&fj);
+        let f = match arr.first() {
+            Some(f) => f,
+            None => continue,
+        };
+        let short = f.get("fixture").and_then(|x| x.get("status")).and_then(|x| x.get("short")).and_then(|v| v.as_str()).unwrap_or("");
+        if !matches!(short, "FT" | "AET" | "PEN") {
+            continue; // not finished yet
+        }
+        let home_id = f.get("teams").and_then(|t| t.get("home")).and_then(|t| t.get("id")).and_then(|v| v.as_i64()).unwrap_or(0);
+        let away_id = f.get("teams").and_then(|t| t.get("away")).and_then(|t| t.get("id")).and_then(|v| v.as_i64()).unwrap_or(0);
+        let gh = f.get("goals").and_then(|g| g.get("home")).and_then(|v| v.as_f64());
+        let ga = f.get("goals").and_then(|g| g.get("away")).and_then(|v| v.as_f64());
+        let stats = af::cached_get(&state, "/fixtures/statistics", vec![("fixture", fid.to_string())], af::TTL_INJURIES * 28).await.ok();
+        let conn = state.db.lock().map_err(|_| "db lock")?;
+        if let (Some(gh), Some(ga)) = (gh, ga) {
+            let _ = db::pred_set_actual(&conn, fid, home_id, "goals", gh);
+            let _ = db::pred_set_actual(&conn, fid, away_id, "goals", ga);
+        }
+        if let Some(sj) = &stats {
+            for t in response_array(sj) {
+                if let Some(tid) = t.get("team").and_then(|x| x.get("id")).and_then(|v| v.as_i64()) {
+                    if let Some(v) = stat_val(&t, "Total Shots") {
+                        let _ = db::pred_set_actual(&conn, fid, tid, "shots", v);
+                    }
+                    if let Some(v) = stat_val(&t, "Corner Kicks") {
+                        let _ = db::pred_set_actual(&conn, fid, tid, "corners", v);
+                    }
+                }
+            }
+        }
+    }
+    let conn = state.db.lock().map_err(|_| "db lock")?;
+    Ok(db::pred_report(&conn)?
+        .into_iter()
+        .map(|(team_id, team_name, league_id, family, games, avg_predicted, avg_actual)| TeamPerfRow {
+            team_id,
+            team_name,
+            league_id,
+            family,
+            games,
+            avg_predicted,
+            avg_actual,
+            ratio: if avg_predicted > 0.0 { avg_actual / avg_predicted } else { 1.0 },
+        })
+        .collect())
+}
+
+/// Fold the audited residuals back into the weights — BOUNDED (30% of the
+/// observed gap, ratio clamped, factors clamped) and user-triggered, so the
+/// index drifts toward reality without ever running away. Consumes the audited
+/// rows (they'd otherwise re-apply next pass).
+#[tauri::command]
+pub fn recalibrate_index(state: State<AppState>) -> Result<String, String> {
+    let conn = state.db.lock().map_err(|_| "db lock")?;
+    let report = db::pred_report(&conn)?;
+    let all = db::index_export(&conn)?;
+    let mut nudged = 0usize;
+    for (team_id, _name, league_id, family, games, avg_pred, avg_actual) in report {
+        if games < 3 || avg_pred <= 0.0 {
+            continue; // too thin to move weights on
+        }
+        let ratio = (avg_actual / avg_pred).clamp(0.7, 1.3);
+        let nudge = 1.0 + (ratio - 1.0) * 0.3;
+        for (lid, season, row) in all.iter().filter(|(lid, _, r)| *lid == league_id && r.team_id == team_id) {
+            let mut f: TeamFactors = match serde_json::from_str(&row.factors) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            let slot = match family.as_str() {
+                "shots" => &mut f.atk_shots,
+                "corners" => &mut f.atk_corners,
+                "goals" => &mut f.atk_goals,
+                _ => continue,
+            };
+            *slot = (*slot * nudge).clamp(0.6, 1.5);
+            if let Ok(fj) = serde_json::to_string(&f) {
+                let _ = db::index_put(&conn, *lid, *season, row.team_id, &row.name, &fj, row.games, row.built_at);
+                nudged += 1;
+            }
+        }
+    }
+    let cleared = db::pred_clear_audited(&conn)?;
+    Ok(format!("Recalibrated {nudged} team-family weight(s) from {cleared} audited prediction(s)."))
+}
+
+/// 🩹 Fix ingested pages whose extracted team names don't match any real
+/// fixture (bad scrapes, abbreviations, translations). ONE cached DeepSeek
+/// call maps every mismatched page to the correct fixture from the provided
+/// list; matched pages are relabelled with the canonical names so grouping
+/// and Scout matching just work. Returns how many pages were fixed.
+#[tauri::command]
+pub async fn fix_ingest_names(state: State<'_, AppState>, fixtures: Vec<FixtureInput>) -> Result<usize, String> {
+    if fixtures.is_empty() {
+        return Err("Load a day's matches first (pick a date on the main flow), then run the fixer.".to_string());
+    }
+    // Rows worth fixing: processed, but their label token-matches NO provided fixture.
+    let rows = {
+        let conn = state.db.lock().map_err(|_| "db lock")?;
+        db::ingest_list(&conn)?
+    };
+    let mut mismatched: Vec<(i64, String, String)> = Vec::new();
+    for r in rows.iter().filter(|r| r.status == "processed") {
+        if r.fixture_id.map(|fid| fixtures.iter().any(|f| f.fixture_id == fid)).unwrap_or(false) {
+            continue; // already pinned to a real fixture
+        }
+        let label = r.fixture_label.clone().unwrap_or_default();
+        let folded = crate::odds::fold(&label); // team_match expects a FOLDED haystack
+        let ok = fixtures
+            .iter()
+            .any(|f| crate::odds::team_match(&folded, &f.home_team) && crate::odds::team_match(&folded, &f.away_team));
+        if !ok {
+            mismatched.push((r.id, label, r.title.clone()));
+        }
+    }
+    if mismatched.is_empty() {
+        return Ok(0);
+    }
+
+    let fixture_list: Vec<String> = fixtures.iter().map(|f| format!("{} vs {}", f.home_team, f.away_team)).collect();
+    let pages: Vec<String> = mismatched
+        .iter()
+        .map(|(id, label, title)| format!("{id}: extracted=\"{label}\" page_title=\"{}\"", title.chars().take(120).collect::<String>()))
+        .collect();
+    let system = "You match scraped football pages to real fixtures. Team names on pages may be abbreviated, misspelled, translated or reordered. Reply with STRICT JSON only.";
+    let user = format!(
+        "REAL FIXTURES (exact strings):\n{}\n\nPAGES:\n{}\n\nFor each page id, pick the ONE fixture it refers to. Reply JSON only: {{\"<page id>\": \"<exact fixture string from the list>\"}} — use null when no fixture fits. Never invent a fixture string.",
+        fixture_list.join("\n"),
+        pages.join("\n")
+    );
+
+    // Cached by input hash (hard rule: cheap helpers cached the same way).
+    let hash = {
+        let mut h = Sha256::new();
+        h.update(b"fixnames|");
+        h.update(user.as_bytes());
+        format!("{:x}", h.finalize())
+    };
+    let cached = {
+        let conn = state.db.lock().map_err(|_| "db lock")?;
+        db::ai_get(&conn, &hash)?
+    };
+    let reply = if let Some(j) = cached {
+        j
+    } else {
+        let (text, tin, tout) = llm::anthropic_call(&state, llm::DETERMINISTIC_MODEL, system, &user, 4000).await?;
+        let conn = state.db.lock().map_err(|_| "db lock")?;
+        let _ = db::usage_add(&conn, af::now_ts(), llm::DETERMINISTIC_MODEL, tin, tout, "ingest");
+        db::ai_put(&conn, &hash, &text, llm::DETERMINISTIC_MODEL, af::now_ts())?;
+        text
+    };
+
+    // Parse (tolerate a fenced block) and apply.
+    let trimmed = reply.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+    let map: HashMap<String, Option<String>> =
+        serde_json::from_str(trimmed).map_err(|e| format!("fixer reply unparsable: {e}"))?;
+    let mut fixed = 0usize;
+    let conn = state.db.lock().map_err(|_| "db lock")?;
+    for (id, _, _) in &mismatched {
+        let Some(Some(label)) = map.get(&id.to_string()) else { continue };
+        // Only accept EXACT strings from our list — the model must not invent.
+        let Some(f) = fixtures.iter().find(|f| format!("{} vs {}", f.home_team, f.away_team) == *label) else {
+            continue;
+        };
+        let date = f.date_utc.as_deref().map(|d| &d[..10.min(d.len())]).unwrap_or("").to_string();
+        db::ingest_set_fixture(&conn, *id, label, &date)?;
+        // Pin the canonical fixture id too (set_fixture clears it by design).
+        let _ = db::ingest_resolve_fixture(&conn, *id, f.fixture_id);
+        fixed += 1;
+    }
+    Ok(fixed)
+}
+
+/// ↻ Manual data refresh for the selected fixtures: forces FRESH pulls of the
+/// stale-prone, kickoff-sensitive data — odds (lines move), lineups (drop ~1h
+/// before kickoff) and injuries — straight through the meter (each refresh
+/// counts ~3 requests per fixture). Cancellable. Returns fresh-call count.
+#[tauri::command]
+pub async fn refresh_fixture_data(state: State<'_, AppState>, fixtures: Vec<FixtureInput>) -> Result<usize, String> {
+    if fixtures.is_empty() {
+        return Err("Select at least one match first.".to_string());
+    }
+    state.build_cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+    let mut refreshed = 0usize;
+    let mut last_err: Option<String> = None;
+    for fx in &fixtures {
+        if state.build_cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+        let fid = fx.fixture_id.to_string();
+        for (endpoint, params, ttl) in [
+            ("/odds", vec![("fixture", fid.clone())], af::TTL_ODDS),
+            ("/fixtures/lineups", vec![("fixture", fid.clone())], af::TTL_LINEUPS),
+            ("/injuries", vec![("fixture", fid.clone())], af::TTL_INJURIES),
+        ] {
+            match af::fetch_fresh(&state, endpoint, params, ttl).await {
+                Ok(_) => refreshed += 1,
+                Err(e) => last_err = Some(e), // budget tripped / network — keep going
+            }
+        }
+    }
+    if refreshed == 0 {
+        return Err(last_err.unwrap_or_else(|| "Nothing refreshed.".to_string()));
+    }
+    Ok(refreshed)
+}
+
+/// 👥 Starting XIs for the Data tab — the API lineup when posted (fresh near
+/// kickoff), else lineups from YOUR ingested pages, else an honest "none yet".
+/// Lets you CONFIRM who plays before trusting player props.
+#[tauri::command]
+pub async fn get_lineups(state: State<'_, AppState>, fixtures: Vec<FixtureInput>) -> Result<Vec<LineupView>, String> {
+    let mut out = Vec::new();
+    for fx in &fixtures {
+        let label = format!("{} vs {}", fx.home_team, fx.away_team);
+        let mut sides: Vec<LineupSide> = Vec::new();
+        // 1. API lineups (same freshness rule as builds: punch through an empty
+        //    cached row near/past kickoff).
+        let params = vec![("fixture", fx.fixture_id.to_string())];
+        let mut lj = af::cached_get(&state, "/fixtures/lineups", params.clone(), af::TTL_LINEUPS).await.ok();
+        if near_kickoff(&fx.date_utc) && lj.as_ref().map_or(true, |j| response_array(j).is_empty()) {
+            if let Ok(fresh) = af::fetch_fresh(&state, "/fixtures/lineups", params, af::TTL_LINEUPS).await {
+                lj = Some(fresh);
+            }
+        }
+        // Coverage tracked on the PLAIN team name — the display label carries
+        // the formation ("Argentina (4-4-2)"), which broke name matching and
+        // appended duplicate "no lineup yet" placeholders.
+        let mut covered: Vec<String> = Vec::new();
+        if let Some(j) = &lj {
+            for team in response_array(j) {
+                let tname = team.get("team").and_then(|t| t.get("name")).and_then(|v| v.as_str()).unwrap_or("");
+                let formation = team.get("formation").and_then(|v| v.as_str()).unwrap_or("");
+                let players: Vec<String> = team
+                    .get("startXI")
+                    .and_then(|x| x.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|p| {
+                                let pl = p.get("player")?;
+                                let name = pl.get("name").and_then(|v| v.as_str())?;
+                                let num = pl.get("number").and_then(|v| v.as_i64());
+                                let pos = pl.get("pos").and_then(|v| v.as_str()).unwrap_or("");
+                                Some(match num {
+                                    Some(n) => format!("{n}. {name}{}", if pos.is_empty() { String::new() } else { format!(" ({pos})") }),
+                                    None => name.to_string(),
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !players.is_empty() {
+                    covered.push(crate::odds::fold(tname));
+                    sides.push(LineupSide {
+                        team: if formation.is_empty() { tname.to_string() } else { format!("{tname} ({formation})") },
+                        source: "api".to_string(),
+                        players,
+                    });
+                }
+            }
+        }
+        // 2. Ingested pages fill the gaps per team.
+        if sides.len() < 2 {
+            for (tid, names) in ingest_lineups_for_fixture(&state, fx) {
+                let tname = if tid == fx.home_team_id { &fx.home_team } else { &fx.away_team };
+                if covered.iter().any(|c| crate::odds::team_match(c, tname)) {
+                    continue;
+                }
+                covered.push(crate::odds::fold(tname));
+                sides.push(LineupSide { team: tname.clone(), source: "ingested".to_string(), players: names });
+            }
+        }
+        // 3. Honest placeholders ONLY for teams with no real side.
+        for tname in [&fx.home_team, &fx.away_team] {
+            if !covered.iter().any(|c| crate::odds::team_match(c, tname)) {
+                sides.push(LineupSide {
+                    team: tname.to_string(),
+                    source: "none".to_string(),
+                    players: vec![],
+                });
+            }
+        }
+        // Home side first for a stable display (plain-name comparison).
+        sides.sort_by_key(|s| {
+            let plain = crate::odds::fold(s.team.split(" (").next().unwrap_or(&s.team));
+            !crate::odds::team_match(&plain, &fx.home_team)
+        });
+        out.push(LineupView { fixture_id: fx.fixture_id, label, sides });
+    }
+    Ok(out)
 }

@@ -528,4 +528,35 @@ looks stellar in the ledger while predicting nothing.
   after the first build using the page. Grouping prefers a resolved date over
   page-printed ones; archiving inherits the same corrected dates.
 
+## Round 18 — Apex/Darwin freeze (blocking Monte-Carlo)
+
+Anatomy of the freeze: Apex's combo search ran ~165 combos × 8k sims × 3
+fixtures of Box-Muller normals SYNCHRONOUSLY on the app's async runtime thread
+— minutes of blocked UI in a debug build. Darwin (clicked "once or twice")
+runs the SAME search, and its busy guard was React state (a fast second click
+races the re-render), so 2-3 additional searches piled onto the same thread.
+
+- [x] **Two-stage combo search** — screen all pairs at 3k sims, extend only the
+  top 8 pairs into triples, re-price the global winners at 10k sims: ~10× less
+  work for the same answer (top-8 legs/fixture instead of 10 too).
+- [x] **Off the UI thread** — both Apex's and Darwin's searches now run in
+  `spawn_blocking`; even a slow search can no longer freeze the app.
+- [x] **Darwin double-click ref guard** (same class as the Place buttons).
+- [x] **Dev profile `opt-level = 1`** — debug builds ran the MC engine ~30×
+  slower than release; light optimization makes dev usable, release unchanged.
+
+## Round 19 — launch freeze (startup pruning, not the sims)
+
+- [x] The round-1 DB pruning ran SYNCHRONOUSLY inside app setup — one unbatched
+  DELETE over the cache table (full API bodies, can be 100s of MB), newly under
+  WAL which journals every deleted page. The window never appeared. Pruning is
+  now `db::prune_batch` (500 rows/pass) driven by a background task that starts
+  20s after launch and yields 250ms between batches — launch is instant, other
+  DB users never starve, and the same cleanup still happens.
+- Note on the simulations (user question): the Monte-Carlo runs ONLY when Apex
+  or Darwin is pressed, in a worker thread, now ~1M simple float ops per build
+  (two-stage search) — an M4 does that in well under a second in release, a few
+  seconds in dev. It's arithmetic, not an N-body sim; it's what prices
+  correlated parlays honestly. Launch has never involved it.
+
 ## Remaining deferred (small)

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { errMsg, toast } from "../toast";
+import type { FixtureInput } from "../types";
 import { api } from "../api";
 import Spinner from "./Spinner";
 import { ANALYSIS_MODELS, type IngestInfo, type IngestItem } from "../types";
@@ -17,7 +18,8 @@ function fmtDate(ts: number): string {
   }
 }
 
-export default function Ingest({ onClose }: { onClose: () => void }) {
+export default function Ingest({ onClose, fixtures = [] }: { onClose: () => void; fixtures?: FixtureInput[] }) {
+  const [fixing, setFixing] = useState(false);
   const [info, setInfo] = useState<IngestInfo | null>(null);
   const [items, setItems] = useState<IngestItem[]>([]);
   const [busy, setBusy] = useState<Set<number>>(new Set()); // ids currently processing
@@ -317,6 +319,25 @@ export default function Ingest({ onClose }: { onClose: () => void }) {
       <div className="flex items-center justify-between">
         <h2 className="text-lg font-bold">Ingested pages</h2>
         <div className="flex items-center gap-2">
+          <button
+            className="btn btn-ghost text-sm py-2 disabled:opacity-40"
+            disabled={fixing || fixtures.length === 0}
+            title={fixtures.length === 0 ? "Load a day's matches first (pick a date), then fix names" : "One cached DeepSeek call re-matches badly-extracted team names to the loaded fixtures, so pages group correctly"}
+            onClick={async () => {
+              setFixing(true);
+              try {
+                const n = await api.fixIngestNames(fixtures);
+                toast.success(n > 0 ? `Fixed ${n} page name${n > 1 ? "s" : ""}.` : "Nothing to fix — all pages already match a fixture.");
+                load();
+              } catch (e) {
+                toast.error(e);
+              } finally {
+                setFixing(false);
+              }
+            }}
+          >
+            {fixing ? "🩹…" : "🩹 Fix names"}
+          </button>
           <button className="btn btn-ghost text-sm py-2" onClick={load} title="Refresh">
             ↻
           </button>

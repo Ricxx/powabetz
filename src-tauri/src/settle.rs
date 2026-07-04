@@ -214,12 +214,36 @@ async fn fetch_result(state: &AppState, fixture_id: i64) -> Option<FixtureResult
     // If we just forced the result and the match IS finished, the fresh player
     // stats are final — cache them for the full week, not the 300s recheck.
     let forced_ttl = if finished { TTL_RESULT } else { TTL_RECHECK };
+    // EMPTY-STATS POISON GUARD: the provider populates player/team stats
+    // minutes-to-hours AFTER full time. A settle that ran in that window cached
+    // an EMPTY response with the 7-day result TTL — every leg then graded
+    // "no stats" and hundreds of tickets sat pending forever. While the match
+    // finished recently, punch through empty cached rows; retries are stored on
+    // the SHORT recheck TTL so a genuinely thin feed re-checks soon, and the
+    // first non-empty pull re-caches for the full week on the next pass.
+    let fixture_ts = e
+        .get("fixture")
+        .and_then(|f| f.get("date"))
+        .and_then(|v| v.as_str())
+        .and_then(|d| chrono::DateTime::parse_from_rfc3339(d).ok())
+        .map(|d| d.timestamp())
+        .unwrap_or(0);
+    let finished_recently = finished && af::now_ts() - fixture_ts < 48 * 3600;
     let players_params = vec![("fixture", fixture_id.to_string())];
-    let pj_res = if forced {
-        af::fetch_live(state, "/fixtures/players", players_params, forced_ttl).await
+    let mut pj_res = if forced {
+        af::fetch_live(state, "/fixtures/players", players_params.clone(), forced_ttl).await
     } else {
-        af::cached_get(state, "/fixtures/players", players_params, TTL_RESULT).await
+        af::cached_get(state, "/fixtures/players", players_params.clone(), TTL_RESULT).await
     };
+    if !forced && finished_recently {
+        if let Ok(pj) = &pj_res {
+            if response_array(pj).is_empty() {
+                if let Ok(fresh) = af::fetch_live(state, "/fixtures/players", players_params, TTL_RECHECK).await {
+                    pj_res = Ok(fresh);
+                }
+            }
+        }
+    }
     let mut players = HashMap::new();
     let mut cards_by_team: HashMap<i64, f64> = HashMap::new();
     if let Ok(pj) = pj_res {
@@ -271,11 +295,21 @@ async fn fetch_result(state: &AppState, fixture_id: i64) -> Option<FixtureResult
     let (mut home_outbox, mut away_outbox, mut home_inbox, mut away_inbox) = (None, None, None, None);
     let (mut home_offsides, mut away_offsides) = (None, None);
     let stats_params = vec![("fixture", fixture_id.to_string())];
-    let sj_res = if forced {
-        af::fetch_live(state, "/fixtures/statistics", stats_params, forced_ttl).await
+    let mut sj_res = if forced {
+        af::fetch_live(state, "/fixtures/statistics", stats_params.clone(), forced_ttl).await
     } else {
-        af::cached_get(state, "/fixtures/statistics", stats_params, TTL_RESULT).await
+        af::cached_get(state, "/fixtures/statistics", stats_params.clone(), TTL_RESULT).await
     };
+    // Same empty-row poison guard as player stats above.
+    if !forced && finished_recently {
+        if let Ok(sj) = &sj_res {
+            if response_array(sj).is_empty() {
+                if let Ok(fresh) = af::fetch_live(state, "/fixtures/statistics", stats_params, TTL_RECHECK).await {
+                    sj_res = Ok(fresh);
+                }
+            }
+        }
+    }
     if let Ok(sj) = sj_res {
         let stat = |team: &Value, ty: &str| -> Option<f64> {
             team.get("statistics")
@@ -623,7 +657,7 @@ fn grade_leg(leg: &TicketLeg, r: &FixtureResult) -> LegResult {
             _ => ungraded("no half-time score"),
         },
         // Player markets
-        "Anytime Scorer" | "Anytime Assist" | "Shots on Target" | "Player Shots" | "Tackles"
+        "Anytime Scorer" | "Multi Scorer (2+)" | "Anytime Assist" | "Shots on Target" | "Player Shots" | "Tackles"
         | "Fouls Committed" | "Fouls Drawn" | "To Be Carded" | "Passes Completed" | "Goalkeeper Saves" => {
             let p = match lookup_player(&r.players, &leg.selection) {
                 Lookup::Found(p) => p,
@@ -645,6 +679,7 @@ fn grade_leg(leg: &TicketLeg, r: &FixtureResult) -> LegResult {
             let et = if r.extra_time { " (incl. ET)" } else { "" };
             match market {
                 "Anytime Scorer" => won(p.goals >= 1.0, format!("{} goals{et}", p.goals as i64)),
+                "Multi Scorer (2+)" => won(p.goals >= 2.0, format!("{} goals{et}", p.goals as i64)),
                 "Anytime Assist" => won(p.assists >= 1.0, format!("{} assists{et}", p.assists as i64)),
                 "Shots on Target" => won(p.sot >= k, format!("{} on target{et}", p.sot as i64)),
                 "Player Shots" => won(p.shots >= k, format!("{} shots{et}", p.shots as i64)),

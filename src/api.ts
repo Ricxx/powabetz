@@ -12,10 +12,12 @@ import type {
   Fixture,
   GenReportRow,
   GrokLogEntry,
+  IndexLeagueView,
   InspectFixture,
   IngestInfo,
   IngestItem,
   LeagueOption,
+  LineupView,
   LiveFixture,
   LiveSnapshot,
   LiveTicket,
@@ -27,6 +29,8 @@ import type {
   SavedTicket,
   SettingsView,
   SgpPrice,
+  TeamIndexView,
+  TeamPerfRow,
   TeamSquad,
   TeamStatsView,
   Ticket,
@@ -54,7 +58,8 @@ export const api = {
     timezone: string | null,
     proxyUrl: string | null,
     proxyToken: string | null,
-    ingestEnabled: boolean | null
+    ingestEnabled: boolean | null,
+    useTeamIndex: boolean | null = null
   ) =>
     invoke<SettingsView>("save_settings", {
       apiFootballKey,
@@ -72,6 +77,7 @@ export const api = {
       proxyUrl,
       proxyToken,
       ingestEnabled,
+      useTeamIndex,
     }),
 
   calibration: () => invoke<CalibrationReport>("calibration"),
@@ -79,6 +85,12 @@ export const api = {
   listGrokLog: () => invoke<GrokLogEntry[]>("list_grok_log"),
 
   getMeter: () => invoke<RequestMeter>("get_meter"),
+  // Interrupt an in-flight build (stops at the next checkpoint / aborts the model call).
+  cancelBuild: () => invoke<void>("cancel_build"),
+  // ↻ Force-fresh odds + lineups + injuries for the selected fixtures (~3 req/match).
+  refreshFixtureData: (fixtures: FixtureInput[]) => invoke<number>("refresh_fixture_data", { fixtures }),
+  // 👥 Starting XIs (API feed → ingested page → none) for the Data tab.
+  getLineups: (fixtures: FixtureInput[]) => invoke<LineupView[]>("get_lineups", { fixtures }),
 
   fetchLeagues: () => invoke<LeagueOption[]>("fetch_leagues"),
 
@@ -118,7 +130,10 @@ export const api = {
     variation: number,
     minOdds: number | null,
     maxOdds: number | null,
-    onePerFixture = false
+    onePerFixture = false,
+    mega = false,
+    coverAll = false,
+    coverLegs = 1
   ) =>
     invoke<BuildResult>("build_ladder", {
       fixtures,
@@ -138,6 +153,9 @@ export const api = {
       minOdds,
       maxOdds,
       onePerFixture,
+      mega,
+      coverAll,
+      coverLegs,
     }),
 
   prewarmPlausibility: (fixture: FixtureInput, markets: string[]) =>
@@ -176,6 +194,17 @@ export const api = {
 
   usageBreakdown: () => invoke<UsageBreakdown>("usage_breakdown"),
 
+  // Opponent-strength index: manual per-league build, audit, recalibrate.
+  buildTeamIndex: (leagueId: number, season: number) =>
+    invoke<IndexLeagueView>("build_team_index", { leagueId, season }),
+  listTeamIndex: () => invoke<IndexLeagueView[]>("list_team_index"),
+  indexLeagueTeams: (leagueId: number, season: number) =>
+    invoke<TeamIndexView[]>("index_league_teams", { leagueId, season }),
+  resetTeamIndex: (leagueId?: number | null) => invoke<number>("reset_team_index", { leagueId: leagueId ?? null }),
+  exportTeamIndex: () => invoke<string>("export_team_index"),
+  indexReview: () => invoke<TeamPerfRow[]>("index_review"),
+  recalibrateIndex: () => invoke<string>("recalibrate_index"),
+
   exportData: () => invoke<string>("export_data"),
   importData: (json: string) => invoke<number>("import_data", { json }),
   resetData: () => invoke<void>("reset_data"),
@@ -197,6 +226,8 @@ export const api = {
   deleteIngested: (id: number) => invoke<void>("delete_ingested", { id }),
   updateIngestNote: (id: number, note: string) => invoke<void>("update_ingest_note", { id, note }),
   assignIngestFixture: (id: number, label: string, date?: string) => invoke<void>("assign_ingest_fixture", { id, label, date }),
+  // 🩹 One cached DeepSeek call re-matches badly-extracted page names to real fixtures.
+  fixIngestNames: (fixtures: FixtureInput[]) => invoke<number>("fix_ingest_names", { fixtures }),
 
   getBankroll: () => invoke<BankrollView>("get_bankroll"),
   setBankroll: (amount: number) => invoke<BankrollView>("set_bankroll", { amount }),
@@ -207,8 +238,9 @@ export const api = {
     odds: number | null,
     grokUsed: boolean,
     ingestUsed: boolean,
-    strategy: string
-  ) => invoke<number>("place_bet", { ticket, stake, odds, grokUsed, ingestUsed, strategy }),
+    strategy: string,
+    indexUsed = false
+  ) => invoke<number>("place_bet", { ticket, stake, odds, grokUsed, ingestUsed, indexUsed, strategy }),
   listBets: () => invoke<PlacedBet[]>("list_bets"),
   deleteBet: (id: number) => invoke<void>("delete_bet", { id }),
   settleBet: (id: number) => invoke<PlacedBet>("settle_bet", { id }),
