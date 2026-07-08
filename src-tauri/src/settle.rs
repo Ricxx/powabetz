@@ -50,6 +50,8 @@ struct FixtureResult {
     away_inbox: Option<f64>,
     home_offsides: Option<f64>,
     away_offsides: Option<f64>,
+    home_sot: Option<f64>,
+    away_sot: Option<f64>,
     home_cards: f64,
     away_cards: f64,
     players: HashMap<String, PlayerLine>,
@@ -173,6 +175,8 @@ async fn fetch_result(state: &AppState, fixture_id: i64) -> Option<FixtureResult
             away_inbox: None,
             home_offsides: None,
             away_offsides: None,
+            home_sot: None,
+            away_sot: None,
             home_cards: 0.0,
             away_cards: 0.0,
             players: HashMap::new(),
@@ -294,6 +298,7 @@ async fn fetch_result(state: &AppState, fixture_id: i64) -> Option<FixtureResult
     let (mut home_corners, mut away_corners, mut home_shots, mut away_shots) = (None, None, None, None);
     let (mut home_outbox, mut away_outbox, mut home_inbox, mut away_inbox) = (None, None, None, None);
     let (mut home_offsides, mut away_offsides) = (None, None);
+    let (mut home_sot, mut away_sot) = (None, None);
     let stats_params = vec![("fixture", fixture_id.to_string())];
     let mut sj_res = if forced {
         af::fetch_live(state, "/fixtures/statistics", stats_params.clone(), forced_ttl).await
@@ -326,12 +331,14 @@ async fn fetch_result(state: &AppState, fixture_id: i64) -> Option<FixtureResult
                 home_outbox = stat(&team, "Shots outsidebox");
                 home_inbox = stat(&team, "Shots insidebox");
                 home_offsides = stat(&team, "Offsides");
+                home_sot = stat(&team, "Shots on Goal");
             } else {
                 away_corners = stat(&team, "Corner Kicks");
                 away_shots = stat(&team, "Total Shots");
                 away_outbox = stat(&team, "Shots outsidebox");
                 away_inbox = stat(&team, "Shots insidebox");
                 away_offsides = stat(&team, "Offsides");
+                away_sot = stat(&team, "Shots on Goal");
             }
         }
     }
@@ -384,6 +391,8 @@ async fn fetch_result(state: &AppState, fixture_id: i64) -> Option<FixtureResult
         away_inbox,
         home_offsides,
         away_offsides,
+        home_sot,
+        away_sot,
         home_cards,
         away_cards,
         players,
@@ -567,6 +576,36 @@ fn grade_leg(leg: &TicketLeg, r: &FixtureResult) -> LegResult {
                 .parse()
                 .unwrap_or(1.5);
             won_ou(line.to_lowercase().contains("over"), tg, thr, format!("{} {}", leg.selection, tg as i64))
+        }
+        "Match Corners" => match (r.home_corners, r.away_corners) {
+            (Some(h), Some(a)) => {
+                let total = h + a;
+                let thr: f64 = line.chars().filter(|c| c.is_ascii_digit() || *c == '.').collect::<String>().parse().unwrap_or(9.5);
+                won_ou(line.to_lowercase().contains("over"), total, thr, format!("{} corners total", total as i64))
+            }
+            _ => ungraded("no corner stats"),
+        },
+        "Match Shots" => match (r.home_shots, r.away_shots) {
+            (Some(h), Some(a)) => {
+                let total = h + a;
+                let thr: f64 = line.chars().filter(|c| c.is_ascii_digit() || *c == '.').collect::<String>().parse().unwrap_or(24.5);
+                won_ou(line.to_lowercase().contains("over"), total, thr, format!("{} shots total", total as i64))
+            }
+            _ => ungraded("no shot stats"),
+        },
+        "Match Shots on Target" => match (r.home_sot, r.away_sot) {
+            (Some(h), Some(a)) => {
+                let total = h + a;
+                let thr: f64 = line.chars().filter(|c| c.is_ascii_digit() || *c == '.').collect::<String>().parse().unwrap_or(8.5);
+                won_ou(line.to_lowercase().contains("over"), total, thr, format!("{} SOT total", total as i64))
+            }
+            _ => ungraded("no SOT stats"),
+        },
+        "Match Cards" => {
+            // Card totals come from the per-player stats aggregation.
+            let total = r.home_cards + r.away_cards;
+            let thr: f64 = line.chars().filter(|c| c.is_ascii_digit() || *c == '.').collect::<String>().parse().unwrap_or(4.5);
+            won_ou(line.to_lowercase().contains("over"), total, thr, format!("{} cards total", total as i64))
         }
         "Team Corners" | "Team Shots" | "Team Shots Outside Box" | "Team Shots Inside Box" | "Team Offsides" => {
             let sel = leg.selection.to_lowercase();

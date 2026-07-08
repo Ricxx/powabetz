@@ -8,6 +8,7 @@ import http from "node:http";
 
 const ROUTES = {
   "/af/": { base: "https://v3.football.api-sports.io/", header: "x-apisports-key", env: "API_FOOTBALL_KEY" },
+  "/propline/": { base: "https://api.prop-line.com/", header: "X-API-Key", env: "PROPLINE_KEY" },
   "/anthropic/": { base: "https://api.anthropic.com/", header: "x-api-key", env: "ANTHROPIC_KEY" },
   "/xai/": { base: "https://api.x.ai/", header: "authorization", env: "XAI_KEY", bearer: true },
   "/openai/": { base: "https://api.openai.com/", header: "authorization", env: "OPENAI_KEY", bearer: true },

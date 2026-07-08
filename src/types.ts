@@ -59,6 +59,7 @@ export interface SettingsView {
   has_openai_key: boolean;
   has_deepseek_key: boolean;
   has_parlay_key: boolean;
+  has_propline_key: boolean;
   model: string;
   books: string[];
   kelly_fraction: number;
@@ -67,6 +68,8 @@ export interface SettingsView {
   proxy_url: string;
   has_proxy_token: boolean;
   use_team_index: boolean;
+  excluded_markets: string[];
+  deepseek_thinking: boolean;
   meter: RequestMeter;
   usage: UsageTotal;
 }
@@ -432,6 +435,8 @@ export interface BuildSelection {
   min_legs: number | null;
   /// Every multi-leg ticket must include ≥1 leg from EVERY selected fixture.
   cover_all?: boolean;
+  /// "over" | "under" | undefined = both sides.
+  ou_side?: string | null;
   min_odds: number | null;
   max_odds: number | null;
   max_per_subject: number | null;
@@ -638,7 +643,9 @@ export const MARKETS: MarketDef[] = [
   { key: "sot", label: "Shots on Target", group: "player", sub: "Attacking" },
   { key: "pshots", label: "Player Shots", group: "player", sub: "Attacking" },
   { key: "tackles", label: "Tackles", group: "player", sub: "Involvement" },
-  { key: "fouls", label: "Fouls", group: "player", sub: "Involvement" },
+  { key: "fouls", label: "Fouls Committed", group: "player", sub: "Involvement" },
+  { key: "fdrawn", label: "Fouls Drawn (To Be Fouled)", group: "player", sub: "Involvement" },
+  { key: "saves", label: "Goalkeeper Saves", group: "player", sub: "Involvement" },
   { key: "cards", label: "Cards", group: "player", sub: "Involvement" },
   { key: "win", label: "Match Result", group: "team", sub: "Result" },
   { key: "dc", label: "Double Chance", group: "team", sub: "Result" },
@@ -650,12 +657,18 @@ export const MARKETS: MarketDef[] = [
   { key: "exactscore", label: "Correct Score", group: "team", sub: "Goals" },
   { key: "tgoals", label: "Team Total Goals", group: "team", sub: "Goals" },
   { key: "btts", label: "BTTS", group: "team", sub: "Goals" },
+  { key: "mcorners", label: "Match Corners — combined", group: "team", sub: "Involvement" },
+  { key: "mcards", label: "Match Cards — combined", group: "team", sub: "Involvement" },
+  { key: "mshots", label: "Match Shots — combined", group: "team", sub: "Involvement" },
+  { key: "msot", label: "Match Shots on Target — combined", group: "team", sub: "Involvement" },
   { key: "tcorners", label: "Team Corners — one team (recent form)", group: "team", sub: "Goals" },
   { key: "tshots", label: "Team Shots — one team (recent form)", group: "team", sub: "Goals" },
   { key: "toffsides", label: "Team Offsides — one team (recent form)", group: "team", sub: "Involvement" },
   { key: "tcards", label: "Team Cards — one team", group: "team", sub: "Involvement" },
   { key: "bothcards", label: "Both Teams Carded", group: "team", sub: "Involvement" },
   { key: "mostcards", label: "Most Cards (which team)", group: "team", sub: "Involvement" },
+  { key: "mostcorners", label: "Most Corners (which team)", group: "team", sub: "Involvement" },
+  { key: "mostshots", label: "Most Shots (which team)", group: "team", sub: "Involvement" },
 ];
 
 /// Opponent-strength index — one team's league-relative factors.
@@ -703,4 +716,93 @@ export interface LineupView {
   fixture_id: number;
   label: string;
   sides: LineupSide[];
+}
+
+/// Ledger market display name → selectable market-group key (best-markets picker).
+export function marketNameToKey(market: string): string | null {
+  const m = market.toLowerCase();
+  if (m.includes("multi scorer") || m.includes("anytime scorer")) return "scorer";
+  if (m.includes("score or assist")) return "goalassist";
+  if (m.includes("anytime assist")) return "assists";
+  if (m.includes("shots on target")) return "sot";
+  if (m.includes("player shots")) return "pshots";
+  if (m.includes("tackles")) return "tackles";
+  if (m.includes("fouls drawn") || m.includes("to be fouled")) return "fdrawn";
+  if (m.includes("fouls")) return "fouls";
+  if (m.includes("passes")) return "passes";
+  if (m.includes("saves")) return "saves";
+  if (m.includes("most corners")) return "mostcorners";
+  if (m.includes("most shots")) return "mostshots";
+  if (m.includes("match corners")) return "mcorners";
+  if (m.includes("match cards")) return "mcards";
+  if (m.includes("match shots on target")) return "msot";
+  if (m.includes("match shots")) return "mshots";
+  if (m.includes("to be carded")) return "cards";
+  if (m.includes("both teams carded")) return "bothcards";
+  if (m.includes("most cards")) return "mostcards";
+  if (m.includes("team total cards") || m.includes("team cards")) return "tcards";
+  if (m.includes("team corners")) return "tcorners";
+  if (m.includes("team shots")) return "tshots";
+  if (m.includes("team offsides")) return "toffsides";
+  if (m.includes("team total goals")) return "tgoals";
+  if (m.includes("correct score")) return "exactscore";
+  if (m.includes("btts")) return "btts";
+  if (m.includes("match result") || m.includes("double chance")) return "win";
+  if (m.includes("1st half")) return "h1goals";
+  if (m.includes("2nd half")) return "h2goals";
+  if (m.includes("goals")) return "ou25"; // Over/Under X.5 Goals
+  return null;
+}
+
+/// Plain-English one-liners for every strategy in the Ledger — what the rows
+/// actually MEAN (written from the real selection rules in the code).
+export function stratDescription(s: string): string {
+  const m: Record<string, string> = {
+    "dw:sharp2": "Singles where the takeable price beats Pinnacle's de-vigged truth by ≥2% — the classic sharp edge at a low bar.",
+    "dw:sharp5": "Same sharp edge but stricter: only ≥5% EV singles. Compares with sharp2 to find which EV bar survives the vig.",
+    "dw:formgap": "Players whose RECENT hit-rate runs far above their season rate (role change the book hasn't repriced yet), ≥50% picks.",
+    "dw:lineroom": "Overs on count markets (corners/shots/cards) whose own settled history clears the line ≥75% of the time — mining lines set too low.",
+    "dw:corrlift": "The Monte-Carlo copula's best correlated same-game combos (legs that reinforce each other more than the book charges for).",
+    "dw:shooters": "One shots/SOT leg (≥55%) from EACH match — a cross-game acca of truly independent legs at the product price.",
+    "dw:chalk3": "A treble of short-priced favourites (1.25-1.60) from different games — tests whether chalk out-earns its drag.",
+    "dw:contra-under": "Unders where OUR model sees less scoring than the sharp line implies (fading the public's over-bias).",
+    value: "Model +EV picks — price beats our estimated true probability.",
+    likely: "Highest-probability picks with real-world context, ignoring price.",
+    favorites: "In-form favourites at useful odds (1.5-2.5), no chalk, no longshots.",
+    oracle: "Only picks where sharp price, our model AND a real edge all agree.",
+    power: "Cross-game doubles of likely-but-generously-priced legs (4x+ combined).",
+    bankers: "High-likelihood recurring events (booked regulars, reliable shooters) — reliability over price.",
+    jackpot: "Deliberate 20-150x lotteries built from individually-plausible legs.",
+    predictor: "Deep single-match read — themed same-game builds from every market.",
+    scout: "Your ingested pages fused with our data — picks both sources support.",
+    stacker: "Stat-led 5-8 leg stacks; steps chalk up to the next plausible line.",
+    powerof3: "Per-game ~3x blocks of very likely legs, compounded across all matches.",
+    mega: "One giant acca — best 2-3 sweet-spot legs from every match.",
+    ladder: "Deterministic accumulator ladder built by hit-chance bands (no AI).",
+    custom: "Legs you cherry-picked by hand.",
+    live: "In-play builds from live state.",
+  };
+  return m[s] ?? "";
+}
+
+/// PropLine (US sports) event + evidence row.
+export interface PlEvent {
+  id: string;
+  sport_key: string;
+  home_team: string;
+  away_team: string;
+  commence_time: string;
+  live: boolean;
+}
+export interface PlPick {
+  fixture: string;
+  market: string;
+  subject: string;
+  side: string;
+  odds?: number | null;
+  book?: string | null;
+  sharp?: number | null;
+  probability?: number | null;
+  implied?: number | null;
+  hit_chance?: number | null;
 }

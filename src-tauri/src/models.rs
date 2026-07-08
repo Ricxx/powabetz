@@ -111,6 +111,7 @@ pub struct SettingsView {
     pub has_openai_key: bool,
     pub has_deepseek_key: bool,
     pub has_parlay_key: bool,
+    pub has_propline_key: bool,
     pub model: String,
     pub books: Vec<String>,
     pub kelly_fraction: f64,
@@ -119,6 +120,9 @@ pub struct SettingsView {
     pub proxy_url: String,
     pub has_proxy_token: bool,
     pub use_team_index: bool,
+    /// Hard-blacklisted market group keys (never appear in any build/mode).
+    pub excluded_markets: Vec<String>,
+    pub deepseek_thinking: bool,
     pub meter: RequestMeter,
     pub usage: UsageTotal,
 }
@@ -357,6 +361,10 @@ pub struct BuildSelection {
     /// Every multi-leg ticket must include ≥1 leg from EVERY selected fixture.
     #[serde(default)]
     pub cover_all: Option<bool>,
+    /// O/U side lock: "over" | "under" | anything else = both. Unders on chaotic
+    /// slates (tournament football) bleed — let the user kill a whole side.
+    #[serde(default)]
+    pub ou_side: Option<String>,
     /// Per-leg odds band — drop priced legs cheaper than min or longer than max
     /// (the "sweet spot", e.g. 1.3–7.0). None = no floor / no ceiling.
     #[serde(default)]
@@ -829,4 +837,39 @@ pub struct LineupView {
     pub fixture_id: i64,
     pub label: String,
     pub sides: Vec<LineupSide>,
+}
+
+/// A PropLine (US sports) upcoming event.
+#[derive(Debug, Clone, Serialize)]
+pub struct PlEvent {
+    pub id: String,
+    pub sport_key: String,
+    pub home_team: String,
+    pub away_team: String,
+    pub commence_time: String,
+    pub live: bool,
+}
+
+/// One evidence row for the US-sports picks list — no tickets, just the
+/// labelled numbers the user copies out.
+#[derive(Debug, Clone, Serialize)]
+pub struct PlPick {
+    pub fixture: String,
+    pub market: String,
+    /// Player name for props; team/side for game lines; "" for totals.
+    pub subject: String,
+    /// "Over 7.5" | "Under 7.5" | "Moneyline" | side label.
+    pub side: String,
+    /// Best decimal odds across returned books.
+    pub odds: Option<f64>,
+    pub book: Option<String>,
+    /// De-vigged sharp probability (Pinnacle two-sided, power method).
+    pub sharp: Option<f64>,
+    /// Our working probability (sharp when priced two-sided, else consensus).
+    pub probability: Option<f64>,
+    /// Raw implied probability of the best price (1/odds — includes vig).
+    pub implied: Option<f64>,
+    /// Player's measured recent hit-rate for this market (trends last-10);
+    /// None when the API tier redacts it.
+    pub hit_chance: Option<f64>,
 }

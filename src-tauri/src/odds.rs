@@ -225,7 +225,7 @@ fn collect_all(json: &Value) -> Vec<(i64, String, &'static str, String, f64)> {
 
 /// POWER-method de-vig: find k with Σ(1/oᵢ)ᵏ = 1, then trueᵢ = (1/oᵢ)ᵏ. Corrects
 /// the favourite-longshot bias of naive proportional de-vig.
-fn devig(odds: &[f64]) -> Vec<f64> {
+pub fn devig(odds: &[f64]) -> Vec<f64> {
     let r: Vec<f64> = odds.iter().map(|o| if *o > 1.0 { 1.0 / o } else { 0.0 }).collect();
     let sum: f64 = r.iter().sum();
     if sum <= 0.0 {

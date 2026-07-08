@@ -13,7 +13,7 @@
 //      Anthropic-compatible endpoint)
 //
 // Secrets (set with `wrangler secret put NAME`):
-//   API_FOOTBALL_KEY, ANTHROPIC_KEY, XAI_KEY, OPENAI_KEY, DEEPSEEK_KEY
+//   API_FOOTBALL_KEY, ANTHROPIC_KEY, XAI_KEY, OPENAI_KEY, DEEPSEEK_KEY, PROPLINE_KEY
 //   PROXY_TOKENS  -> comma-separated list of allowed user tokens, e.g. "alice-xyz,bob-abc"
 
 const ROUTES = {
@@ -24,6 +24,8 @@ const ROUTES = {
   // DeepSeek's Anthropic-compatible endpoint authenticates like Anthropic
   // (x-api-key), not Bearer — the app only calls /deepseek/anthropic/… here.
   "/deepseek/": { base: "https://api.deepseek.com/", header: "x-api-key", env: "DEEPSEEK_KEY" },
+  // PropLine (US sports: MLB/NBA odds + props). App calls /propline/v1/…
+  "/propline/": { base: "https://api.prop-line.com/", header: "X-API-Key", env: "PROPLINE_KEY" },
 };
 
 export default {

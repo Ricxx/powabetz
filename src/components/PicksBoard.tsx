@@ -245,6 +245,26 @@ export default function PicksBoard({
         onChange={(e) => setSearch(e.target.value)}
       />
       <div className="flex gap-2 text-xs">
+        <button
+          className="chip"
+          title="Copy every visible pick (after search/filters) as CSV — fixture, subject, market, line, model %, sharp %, odds, EV"
+          onClick={async () => {
+            const rows = ["fixture,subject,market,line,model_pct,sharp_pct,odds,ev"];
+            const esc = (x: string) => `"${(x || "").replace(/"/g, '""')}"`;
+            for (const { c } of shown) {
+              rows.push([
+                esc(c.fixture), esc(c.subject), esc(c.market), esc(c.line),
+                c.est_prob != null ? Math.round(c.est_prob * 100) : "",
+                c.pinnacle_prob != null ? Math.round(c.pinnacle_prob * 100) : "",
+                c.book_odds != null ? c.book_odds.toFixed(2) : "",
+                c.ev != null ? (c.ev * 100).toFixed(1) : "",
+              ].join(","));
+            }
+            await navigator.clipboard.writeText(rows.join("\n"));
+          }}
+        >
+          ⧉ Copy
+        </button>
         <button className={`chip ${sortBy === "ev" ? "chip-on" : ""}`} onClick={() => setSortBy("ev")}>
           Sort: EV
         </button>

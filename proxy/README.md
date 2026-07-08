@@ -66,3 +66,11 @@ redeploy (`wrangler deploy`) / restart.
 - The proxy forwards `/af/*`, `/anthropic/*`, `/xai/*` to API-Football, Anthropic and
   x.ai respectively. The app builds those paths automatically.
 - Health check: open the URL in a browser — it should say `powabetz proxy ok`.
+
+
+## PropLine (US sports)
+Set the key so keyless installs can use MLB/NBA:
+
+```sh
+wrangler secret put PROPLINE_KEY
+```

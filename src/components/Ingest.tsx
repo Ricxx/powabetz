@@ -338,6 +338,26 @@ export default function Ingest({ onClose, fixtures = [] }: { onClose: () => void
           >
             {fixing ? "🩹…" : "🩹 Fix names"}
           </button>
+          <button
+            className="btn btn-ghost text-sm py-2"
+            title="Copy ALL processed ingested data as CSV (fixture, stat, value, source) — paste into a sheet or any model"
+            onClick={async () => {
+              const rows = ["fixture,stat,value,source"];
+              const esc = (x: string) => `"${(x || "").replace(/"/g, '""')}"`;
+              for (const it of items.filter((i) => i.status === "processed")) {
+                const fx = it.fixture_label || "unassigned";
+                for (const kv of it.data || []) {
+                  rows.push([esc(fx), esc(kv.label), esc(kv.value), esc(it.title)].join(","));
+                }
+                if (it.summary) rows.push([esc(fx), esc("summary"), esc(it.summary), esc(it.title)].join(","));
+              }
+              if (rows.length === 1) { toast.error("No processed data to export."); return; }
+              await navigator.clipboard.writeText(rows.join("\n"));
+              toast.success(`Copied ${rows.length - 1} rows as CSV.`);
+            }}
+          >
+            ⧉ CSV
+          </button>
           <button className="btn btn-ghost text-sm py-2" onClick={load} title="Refresh">
             ↻
           </button>

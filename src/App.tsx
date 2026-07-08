@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./api";
-import {
-  GROK_CATEGORIES,
+import {  GROK_CATEGORIES,
   MARKETS,
   TICKET_TYPES,
   type BuildResult,
@@ -15,6 +14,7 @@ import {
   type TicketLeg,
   type UsageBreakdown,
   legKey,
+  stratDescription,
 } from "./types";
 import Results from "./components/Results";
 import CustomSlip from "./components/CustomSlip";
@@ -23,6 +23,7 @@ import Settings from "./components/Settings";
 import History from "./components/History";
 import Inspector from "./components/Inspector";
 import Lineups from "./components/Lineups";
+import PropLine from "./components/PropLine";
 import MyPicks from "./components/MyPicks";
 import IngestedStats from "./components/IngestedStats";
 import Tracker from "./components/Tracker";
@@ -150,6 +151,9 @@ function CostRow({ label, claude }: { label: string; claude: number }) {
 
 function AppInner() {
   const [step, setStep] = useState<Step>("date");
+  // Sport switcher: football keeps the full wizard; US sports get the simple
+  // evidence-list flow (no tickets) — deliberately isolated from football.
+  const [sportMode, setSportMode] = useState<"football" | "baseball_mlb" | "basketball_nba">("football");
   const [overlay, setOverlay] = useState<Overlay>(null);
   const warnedMeter = useRef(false);
 
@@ -253,7 +257,7 @@ function AppInner() {
   }
   // Simple-mode risk dial — best-in-class presets so it stays one-tap.
   const [simpleRisk, setSimpleRisk] = useState<"safe" | "balanced" | "bold" | "scout">("balanced");
-  const [strategy, setStrategy] = useState("value");
+  const [strategy, setStrategy] = useState("bankers");
   // Match Predictor only works with one fixture — fall back if that changes.
   useEffect(() => {
     if (strategy === "predictor" && selFixtureIds.size !== 1) setStrategy("value");
@@ -302,11 +306,13 @@ function AppInner() {
   const [ladderDiversityReset, setLadderDiversityReset] = useState(true);
   const [ladderVariation, setLadderVariation] = useState(0);
   // Shared per-leg odds sweet-spot (applies to regular + acca builds). 1 / 1000 = off.
-  const [oddsMin, setOddsMin] = useState(1.2); // skip near-certain short legs by default
-  const [oddsMax, setOddsMax] = useState(1000);
+  const [oddsMin] = useState(1.15); // band control hidden — 1.15 floor stands
+  // O/U side lock: unders bleed on chaotic slates — kill a whole side globally.
+  const [ouSide, setOuSide] = useState<"both" | "over" | "under">("both");
+  const [oddsMax] = useState(1000); // band control hidden
   // Regular build: minimum legs per ticket (4-fold etc.) and diversity cap.
-  const [regMinLegs, setRegMinLegs] = useState(1);
-  const [regMaxPerSubject, setRegMaxPerSubject] = useState(0); // 0 = model default
+  const [regMinLegs] = useState(1); // control hidden — kept for the selection payload
+  const [regMaxPerSubject] = useState(0); // control hidden — 0 = model default
   const [usePlausibility] = useState(true); // Haiku pre-score — always on (filter via slider)
   const [useIngest, setUseIngest] = useState(true); // feed ingested page data into builds
   const [prewarmBusy, setPrewarmBusy] = useState(false);
@@ -572,6 +578,7 @@ function AppInner() {
         use_ingest: simple ? true : useIngest,
         min_legs: simple ? null : regMinLegs > 1 ? regMinLegs : null,
         cover_all: simple ? false : coverAll,
+        ou_side: !simple && ouSide !== "both" ? ouSide : null,
         min_odds: simple ? null : oddsMin > 1.01 ? oddsMin : null,
         max_odds: simple ? null : oddsMax < 999 ? oddsMax : null,
         max_per_subject: simple ? null : regMaxPerSubject > 0 ? regMaxPerSubject : null,
@@ -855,7 +862,14 @@ function AppInner() {
   if (overlay === "ledger") {
     return (
       <Shell meter={meter} cost={settings?.usage.cost_usd ?? 0} grokCost={costBreak?.grok_lifetime ?? 0} onCoins={openCost} onNav={setOverlay} ingestBadge={ingestPending} current="ledger">
-        <Ledger onClose={() => setOverlay(null)} />
+        <Ledger
+          onClose={() => setOverlay(null)}
+          onUseMarkets={(keys) => {
+            setSelMarkets(new Set(keys));
+            setOverlay(null);
+            toast.success(`Markets set to your ${keys.length} proven (>50% hit) market(s).`);
+          }}
+        />
       </Shell>
     );
   }
@@ -934,9 +948,7 @@ function AppInner() {
                 {([
                   ["picks", "📊 Picks"],
                   ["mypicks", "📌 Mine"],
-                  ["bankers", "🏦 Bankers"],
                   ["lineups", "👥 XIs"],
-                  ["inspector", "🔍 Inspector"],
                   ["ingested", "🧲 Ingested"],
                 ] as const).map(([id, label]) => (
                   <button
@@ -987,10 +999,32 @@ function AppInner() {
         </div>
       )}
 
-      <StepDots step={step} onJump={setStep} hasResult={result != null} />
+      {/* Sport switcher — football keeps the wizard; US sports are the simple
+          evidence flow. */}
+      <div className="flex gap-1.5 mb-3">
+        {([
+          ["football", "⚽ Football"],
+          ["baseball_mlb", "⚾ MLB"],
+          ["basketball_nba", "🏀 NBA"],
+        ] as const).map(([id, label]) => (
+          <button
+            key={id}
+            className={`flex-1 text-center text-sm rounded-lg py-2 ${
+              sportMode === id ? "bg-accent text-ink font-semibold" : "bg-panel border border-edge text-slate-300"
+            }`}
+            onClick={() => setSportMode(id)}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {sportMode !== "football" && <PropLine sport={sportMode} />}
+
+      {sportMode === "football" && <StepDots step={step} onJump={setStep} hasResult={result != null} />}
 
       {/* DATE */}
-      {step === "date" && (
+      {sportMode === "football" && step === "date" && (
         <div className="space-y-4">
           <div>
             <h2 className="text-lg font-bold">Pick a date &amp; leagues</h2>
@@ -1071,7 +1105,7 @@ function AppInner() {
       )}
 
       {/* MATCHES */}
-      {step === "matches" && (
+      {sportMode === "football" && step === "matches" && (
         <div className="space-y-3 pb-28">
           <Header title={`Matches · ${date}`} onBack={() => setStep("date")} />
           <p className="text-xs text-slate-400 -mt-1">Step 2 of 4 — tap the matches you want to research (up to ~10).</p>
@@ -1351,13 +1385,13 @@ function AppInner() {
           </div>
 
           <div className="space-y-3">
-            {(["Result", "Goals"] as const).map((sub) => (
+            {(["Result", "Goals", "Involvement"] as const).map((sub) => (
               <div key={sub}>
                 <button
                   className="text-xs font-semibold text-slate-400 mb-2 underline-offset-2 hover:underline"
                   onClick={() => toggleGroup(MARKETS.filter((m) => m.group === "team" && m.sub === sub).map((m) => m.key))}
                 >
-                  {sub === "Result" ? "Match result (full-time & by half)" : "Goals"}{" "}
+                  {sub === "Result" ? "Match result (full-time & by half)" : sub === "Goals" ? "Goals" : "Cards / corners / discipline — per team & combined"}{" "}
                   <span className="text-slate-500">— tap to toggle all</span>
                 </button>
                 <div className="flex flex-wrap gap-2">
@@ -1372,6 +1406,21 @@ function AppInner() {
           <p className="text-[11px] text-slate-500">
             Players are auto-selected from each team — no need to pick them.
           </p>
+          <div className="mt-2">
+            <div className="text-[11px] text-slate-500 mb-1">Over/Under sides</div>
+            <div className="flex gap-1.5">
+              {([["both", "Both"], ["over", "Overs only"], ["under", "Unders only"]] as const).map(([id, label]) => (
+                <button
+                  key={id}
+                  className={`chip flex-1 text-center ${ouSide === id ? "chip-on" : ""}`}
+                  title={id === "over" ? "No Under lines anywhere in the build — one mishap turns Under 3.5 corners into 8 fast" : undefined}
+                  onClick={() => setOuSide(id)}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          </div>
 
           {/* mode tabs */}
           <div className="flex gap-1.5">
@@ -1433,13 +1482,11 @@ function AppInner() {
                 {(([
                   // Primary strategies always shown; the redundant/niche ones live
                   // behind the ⚙ Advanced expander.
-                  ["apex", "Apex 🎯"],
                   ["stacker", "Stacker 🧗"],
+                  ["powerof3", "Power of 3 ✖3"],
+                  ["legmonster", "Leg Monster 🐙"],
                   ["scout", "Scout 📡"],
-                  ["value", "Value +EV"],
                   ["bankers", "Anchors ⚓"],
-                  ["jackpot", "Jackpot 🎰"],
-                  ["predictor", "Match Predictor 🔮"],
                   ...(showAdvanced
                     ? [
                         ["favorites", "Form faves"],
@@ -1496,6 +1543,10 @@ function AppInner() {
                               ? "🔮 Match Predictor — a deep read of THIS one game. Forces every market, shows a forecast (likely result, scores, goals, cards, key players with %), then builds several same-game SGP variations. If the match is already in-play, it pulls the LIVE score/stats and the model adjusts every suggestion for the time remaining. (Single fixture only.)"
                               : strategy === "scout"
                                 ? "📡 Scout — FUSES your ingested pages with our data through the model. It builds our table for the markets you pick above (or all of them if you pick none), pulls in the WHOLE ingested page (corners, cards, shots, form, xG, injuries, predictions, analyst reads — whatever you scraped), and the model cross-references the two: leaning in where they agree, judging where they differ, using the page's extra angles. Needs at least one processed page matching your fixtures (a stats/preview page → 🧲 Ingest → process). Your hand-fed edge, run through the model."
+                                : strategy === "legmonster"
+                                  ? "🐙 Leg Monster — ONE giant same-game SGP of up to 10 viable legs PER selected fixture, woven into a single game story (result lean, goals, corners, cards, key players). Every leg must defend its place — no fillers, no nested lines. Cross-checked against your ingested pages where present."
+                                : strategy === "powerof3"
+                                  ? "✖3 Power of 3 — every game becomes a same-game block of 2-3 VERY likely, low-variance legs multiplying to ~3x (1.7-4x). Blocks compound across ALL your matches: 4 games ≈ 81x while each individual leg stays safe. Cross-game blocks are independent, so the compounding is true — and the ticket is built for the cash-out curve (safest/earliest blocks first: survive two games and the offer gets juicy). Builds 4-5 variations."
                                 : strategy === "stacker"
                                   ? "🧗 Stacker — risk-controlled, STAT-LED stacks (not EV-hunting). Canvasses every match and stacks 5-8 measured picks into 6x-25x parlays. The trick: when the obvious line is chalk (corners over 5.5 @ 1.10), it STEPS UP to the still-plausible next line (over 6.5/7.5), and a near-certain scorer becomes Multi Scorer (2+). Safe stepped legs + 1-2 measured risks per ticket — decent multiplier, genuine fighting chance, no lottery junk and no useless 1.10 legs."
                                   : "Ranks by +EV — value/longshots where the price beats the true probability."}
@@ -1532,10 +1583,17 @@ function AppInner() {
                     settle automatically — over weeks the Ledger's 🧬 rows become a survival-of-the-fittest
                     leaderboard showing which mechanical approach actually wins on YOUR slates.
                   </p>
-                  <div className="space-y-0.5">
-                    {darwinReport.map((l, i) => (
-                      <div key={i} className="text-[11px] text-slate-300">{l}</div>
-                    ))}
+                  <div className="space-y-1">
+                    {darwinReport.map((l, i) => {
+                      const key = l.startsWith("dw:") ? l.split(":").slice(0, 2).join(":") : "";
+                      const desc = key ? stratDescription(key) : "";
+                      return (
+                        <div key={i}>
+                          <div className="text-[11px] text-slate-300">{l}</div>
+                          {desc && <div className="text-[10px] text-slate-500 leading-tight">{desc}</div>}
+                        </div>
+                      );
+                    })}
                   </div>
                   <p className="text-[10px] text-slate-500">→ Open the 🧬 Ledger tab to watch them settle.</p>
                 </div>
@@ -1572,39 +1630,6 @@ function AppInner() {
                     onClick={() => setTicketCount(n)}
                   >
                     {n}
-                  </button>
-                ))}
-              </div>
-            </div>
-            <OddsBand min={oddsMin} max={oddsMax} setMin={setOddsMin} setMax={setOddsMax} />
-            <div>
-              <div className="text-[11px] text-slate-500 mb-1">
-                Min legs per ticket — {regMinLegs <= 1 ? "off (any)" : `${regMinLegs}-fold minimum`}
-              </div>
-              <div className="flex gap-1.5">
-                {[1, 2, 3, 4, 5, 6].map((n) => (
-                  <button
-                    key={n}
-                    className={`chip flex-1 text-center ${regMinLegs === n ? "chip-on" : ""}`}
-                    onClick={() => setRegMinLegs(n)}
-                  >
-                    {n === 1 ? "off" : n}
-                  </button>
-                ))}
-              </div>
-            </div>
-            <div>
-              <div className="text-[11px] text-slate-500 mb-1">
-                Diversity — {regMaxPerSubject === 0 ? "auto (≤¼ of tickets)" : `max ${regMaxPerSubject} ticket(s) per player/team`}
-              </div>
-              <div className="flex gap-1.5">
-                {[0, 1, 2, 3, 4].map((n) => (
-                  <button
-                    key={n}
-                    className={`chip flex-1 text-center ${regMaxPerSubject === n ? "chip-on" : ""}`}
-                    onClick={() => setRegMaxPerSubject(n)}
-                  >
-                    {n === 0 ? "auto" : n}
                   </button>
                 ))}
               </div>
@@ -1813,7 +1838,6 @@ function AppInner() {
                 ))}
               </div>
             </div>
-            <OddsBand min={oddsMin} max={oddsMax} setMin={setOddsMin} setMax={setOddsMax} />
             <Toggle
               label="🚀 Mega acca"
               on={ladderMega}
@@ -1994,7 +2018,7 @@ function AppInner() {
                 ) : prewarmBusy ? (
                   "🔒 Pre-scoring…"
                 ) : (
-                  `🎯 Build ${ticketCount} tickets`
+                  "🎯 Build tickets"
                 )}
               </button>
             )}
@@ -2042,7 +2066,7 @@ function AppInner() {
       )}
 
       {/* RESULTS */}
-      {step === "results" && result && (
+      {sportMode === "football" && step === "results" && result && (
         <div className="space-y-3">
           <Header title="Tickets" onBack={() => setStep("markets")} />
           <div className="flex items-center justify-between -mt-1">
@@ -2127,7 +2151,8 @@ function AppInner() {
 
 // ---------- small helpers / subcomponents ----------
 
-function OddsBand({
+// @ts-expect-error kept for reintroduction — band control currently hidden
+function _OddsBand({
   min,
   max,
   setMin,

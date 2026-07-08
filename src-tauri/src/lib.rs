@@ -12,6 +12,7 @@ mod llm;
 mod models;
 mod montecarlo;
 mod odds;
+mod propline;
 mod settle;
 mod weather;
 
@@ -40,6 +41,9 @@ pub struct Keys {
     /// Parlay API key (parlay-api.com) — sharp odds, de-vig, +EV scanner.
     #[serde(default)]
     pub parlay: Option<String>,
+    /// PropLine key (prop-line.com) — US sports (MLB/NBA) odds + props.
+    #[serde(default)]
+    pub propline: Option<String>,
     /// Selected Anthropic model id (defaults to Opus 4.8).
     #[serde(default)]
     pub model: Option<String>,
@@ -70,6 +74,15 @@ pub struct Keys {
     /// expectations in builds. Building the index is always manual.
     #[serde(default)]
     pub use_team_index: Option<bool>,
+    /// DeepSeek extended thinking on BUILD calls — better reads, MUCH slower.
+    /// Off by default; toggle in Settings.
+    #[serde(default)]
+    pub deepseek_thinking: Option<bool>,
+    /// Market group keys the user has UNSUBSCRIBED from (e.g. "toffsides").
+    /// A hard blacklist: applied in EVERY mode, including the ones that force
+    /// all markets (Simple, Predictor, Darwin, Scout ingest lines).
+    #[serde(default)]
+    pub excluded_markets: Vec<String>,
     /// Browser-extension ingest endpoint: enabled, shared token, and local port.
     #[serde(default)]
     pub ingest_enabled: Option<bool>,
@@ -105,6 +118,9 @@ impl Keys {
         }
         if keys.parlay.is_none() {
             keys.parlay = std::env::var("PARLAY_API_KEY").ok().filter(|s| !s.is_empty());
+        }
+        if keys.propline.is_none() {
+            keys.propline = std::env::var("PROPLINE_API_KEY").ok().filter(|s| !s.is_empty());
         }
         if keys.proxy_url.is_none() {
             keys.proxy_url = std::env::var("POWABET_PROXY_URL").ok().filter(|s| !s.is_empty());
@@ -274,6 +290,9 @@ pub fn run() {
             commands::refresh_fixture_data,
             commands::get_lineups,
             commands::picks_ai_build,
+            commands::pl_events,
+            commands::pl_picks,
+            commands::pl_usage,
             commands::build_team_index,
             commands::list_team_index,
             commands::index_league_teams,

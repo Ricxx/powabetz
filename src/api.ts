@@ -24,6 +24,8 @@ import type {
   MarketReportRow,
   ModelPurposeRow,
   PlacedBet,
+  PlEvent,
+  PlPick,
   PlayerInspect,
   RequestMeter,
   SavedTicket,
@@ -59,7 +61,10 @@ export const api = {
     proxyUrl: string | null,
     proxyToken: string | null,
     ingestEnabled: boolean | null,
-    useTeamIndex: boolean | null = null
+    useTeamIndex: boolean | null = null,
+    excludedMarkets: string[] | null = null,
+    deepseekThinking: boolean | null = null,
+    proplineKey: string | null = null
   ) =>
     invoke<SettingsView>("save_settings", {
       apiFootballKey,
@@ -78,6 +83,9 @@ export const api = {
       proxyToken,
       ingestEnabled,
       useTeamIndex,
+      excludedMarkets,
+      deepseekThinking,
+      proplineKey,
     }),
 
   calibration: () => invoke<CalibrationReport>("calibration"),
@@ -204,6 +212,12 @@ export const api = {
   exportTeamIndex: () => invoke<string>("export_team_index"),
   indexReview: () => invoke<TeamPerfRow[]>("index_review"),
   recalibrateIndex: () => invoke<string>("recalibrate_index"),
+
+  // PropLine (US sports) — events + evidence list (no tickets).
+  plEvents: (sport: string) => invoke<PlEvent[]>("pl_events", { sport }),
+  plPicks: (sport: string, eventIds: string[], markets: string[]) =>
+    invoke<PlPick[]>("pl_picks", { sport, eventIds, markets }),
+  plUsage: () => invoke<number>("pl_usage"),
 
   exportData: () => invoke<string>("export_data"),
   importData: (json: string) => invoke<number>("import_data", { json }),

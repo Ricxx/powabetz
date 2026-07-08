@@ -19,7 +19,7 @@ use crate::{db, AppState};
 
 #[tauri::command]
 pub fn get_settings(state: State<AppState>) -> Result<SettingsView, String> {
-    let (has_af, has_anthropic, has_grok, has_openai, has_deepseek, has_parlay, model, limit, books, kelly, default_stake, timezone, proxy_url, has_proxy_token, use_team_index) = {
+    let (has_af, has_anthropic, has_grok, has_openai, has_deepseek, has_parlay, has_propline, model, limit, books, kelly, default_stake, timezone, proxy_url, has_proxy_token, use_team_index, excluded_markets, deepseek_thinking) = {
         let keys = state.keys.lock().map_err(|_| "keys lock")?;
         (
             keys.api_football.is_some(),
@@ -28,6 +28,7 @@ pub fn get_settings(state: State<AppState>) -> Result<SettingsView, String> {
             keys.openai.is_some(),
             keys.deepseek.is_some(),
             keys.parlay.is_some(),
+            keys.propline.is_some(),
             keys.model.clone().unwrap_or_else(|| llm::DEFAULT_MODEL.to_string()),
             keys.daily_limit.unwrap_or(db::DEFAULT_DAILY_LIMIT),
             keys.books.clone(),
@@ -37,6 +38,8 @@ pub fn get_settings(state: State<AppState>) -> Result<SettingsView, String> {
             keys.proxy_url.clone().unwrap_or_default(),
             keys.proxy_token.is_some(),
             keys.use_team_index.unwrap_or(true),
+            keys.excluded_markets.clone(),
+            keys.deepseek_thinking.unwrap_or(false),
         )
     };
     let (meter, by_model) = {
@@ -58,6 +61,7 @@ pub fn get_settings(state: State<AppState>) -> Result<SettingsView, String> {
         has_openai_key: has_openai,
         has_deepseek_key: has_deepseek,
         has_parlay_key: has_parlay,
+        has_propline_key: has_propline,
         model,
         books,
         kelly_fraction: kelly,
@@ -66,6 +70,8 @@ pub fn get_settings(state: State<AppState>) -> Result<SettingsView, String> {
         proxy_url,
         has_proxy_token,
         use_team_index,
+        excluded_markets,
+        deepseek_thinking,
         meter,
         usage: UsageTotal {
             input_tokens: input,
@@ -94,6 +100,9 @@ pub fn save_settings(
     proxy_token: Option<String>,
     ingest_enabled: Option<bool>,
     use_team_index: Option<bool>,
+    excluded_markets: Option<Vec<String>>,
+    deepseek_thinking: Option<bool>,
+    propline_key: Option<String>,
 ) -> Result<SettingsView, String> {
     {
         let mut keys = state.keys.lock().map_err(|_| "keys lock")?;
@@ -129,6 +138,9 @@ pub fn save_settings(
         if let Some(k) = parlay_key {
             keys.parlay = non_empty(k);
         }
+        if let Some(k) = propline_key {
+            keys.propline = non_empty(k);
+        }
         if let Some(u) = proxy_url {
             keys.proxy_url = non_empty(u);
         }
@@ -140,6 +152,12 @@ pub fn save_settings(
         }
         if let Some(u) = use_team_index {
             keys.use_team_index = Some(u);
+        }
+        if let Some(x) = excluded_markets {
+            keys.excluded_markets = x;
+        }
+        if let Some(t) = deepseek_thinking {
+            keys.deepseek_thinking = Some(t);
         }
         if let Some(m) = model {
             if llm::is_allowed_model(&m) {
@@ -633,6 +651,8 @@ struct TeamForm {
     inbox_against: Option<f64>,
     offsides_for: Option<f64>,
     offsides_against: Option<f64>,
+    sot_for: Option<f64>,
+    sot_against: Option<f64>,
 }
 
 fn stat_val(stats: &Value, ty: &str) -> Option<f64> {
@@ -656,8 +676,8 @@ async fn fetch_team_form(state: &AppState, team_id: i64) -> Option<TeamForm> {
     .await
     .ok()?;
     // (sum, n) per metric (for & against interleaved).
-    let metrics = ["expected_goals", "Corner Kicks", "Total Shots", "Shots outsidebox", "Shots insidebox", "Offsides"];
-    let mut acc: [(f64, f64); 12] = [(0.0, 0.0); 12];
+    let metrics = ["expected_goals", "Corner Kicks", "Total Shots", "Shots outsidebox", "Shots insidebox", "Offsides", "Shots on Goal"];
+    let mut acc: [(f64, f64); 14] = [(0.0, 0.0); 14];
     for f in response_array(&lj) {
         let short = f.get("fixture").and_then(|x| x.get("status")).and_then(|s| s.get("short")).and_then(|v| v.as_str()).unwrap_or("");
         if !matches!(short, "FT" | "AET" | "PEN") {
@@ -708,6 +728,8 @@ async fn fetch_team_form(state: &AppState, team_id: i64) -> Option<TeamForm> {
         inbox_against: avg(acc[9]),
         offsides_for: avg(acc[10]),
         offsides_against: avg(acc[11]),
+        sot_for: avg(acc[12]),
+        sot_against: avg(acc[13]),
     };
     if form.xg_for.is_none() && form.corners_for.is_none() && form.shots_for.is_none() && form.outbox_for.is_none() {
         return None;
@@ -1007,7 +1029,7 @@ async fn team_tactics(state: &AppState, team: &str, coach: Option<&str>, formati
 fn is_player_market(m: &str) -> bool {
     matches!(
         m,
-        "scorer" | "sot" | "tackles" | "fouls" | "cards" | "passes" | "assists" | "goalassist" | "pshots" | "saves"
+        "scorer" | "sot" | "tackles" | "fouls" | "fdrawn" | "cards" | "passes" | "assists" | "goalassist" | "pshots" | "saves"
     )
 }
 
@@ -1039,10 +1061,10 @@ fn map_availability(kind: &str, reason: &str) -> String {
 
 // ---------- build tickets ----------
 
-const ALL_MARKETS: [&str; 24] = [
-    "scorer", "sot", "pshots", "assists", "goalassist", "tackles", "fouls", "cards", "win", "dc",
-    "btts", "half1", "half2", "ou25", "tgoals", "tcorners", "tshots", "h1goals",
-    "h2goals", "exactscore", "toffsides", "tcards", "bothcards", "mostcards",
+const ALL_MARKETS: [&str; 32] = [
+    "scorer", "sot", "pshots", "assists", "goalassist", "tackles", "fouls", "fdrawn", "cards", "saves",
+    "win", "dc", "btts", "half1", "half2", "ou25", "tgoals", "tcorners", "tshots", "h1goals",
+    "h2goals", "exactscore", "toffsides", "tcards", "bothcards", "mostcards", "mostcorners", "mostshots", "mcorners", "mcards", "mshots", "msot",
 ];
 
 /// Fetch a team's full player list + season stats (paged), for auto candidate
@@ -1962,11 +1984,17 @@ pub async fn build_tickets(
     // table when you've selected none. The ingest-derived stat lines respect the
     // same selection (the full page still rides along as prose context).
     let scout = selection.strategy.as_deref() == Some("scout");
-    let markets: Vec<String> = if selection.markets.is_empty() || predictor {
+    let excluded = excluded_markets(&state);
+    let mut markets: Vec<String> = if selection.markets.is_empty() || predictor {
         ALL_MARKETS.iter().map(|s| s.to_string()).collect()
     } else {
         selection.markets.clone()
     };
+    // Hard blacklist beats EVERYTHING, including forced-all modes.
+    markets.retain(|m| !excluded.contains(m));
+    if markets.is_empty() {
+        return Err("All selected markets are in your excluded list (Settings) — un-exclude some or pick others.".to_string());
+    }
     let player_groups: Vec<String> = markets.iter().filter(|m| is_player_market(m)).cloned().collect();
     let team_groups: Vec<String> = markets.iter().filter(|m| !is_player_market(m)).cloned().collect();
 
@@ -2297,7 +2325,7 @@ pub async fn build_tickets(
                         .collect(),
                     None => entries,
                 };
-                for entry in top_players(entries, 16) {
+                for entry in top_players(entries, 24) {
                     let pid = entry.get("player").and_then(|p| p.get("id")).and_then(|v| v.as_i64());
                     let availability = if team_starters.map(|s| pid.map(|id| s.contains(&id)).unwrap_or(false)).unwrap_or(false) {
                         "starting".to_string()
@@ -2340,6 +2368,8 @@ pub async fn build_tickets(
                 || team_groups.iter().any(|m| matches!(m.as_str(), "tcorners" | "tshots" | "toutbox" | "tinbox" | "toffsides"));
             if need_form {
                 let apply = |t: &mut crate::features::TeamStats, f: &TeamForm| {
+                    t.sot_for = f.sot_for;
+                    t.sot_against = f.sot_against;
                     t.xg_for = f.xg_for;
                     t.xg_against = f.xg_against;
                     t.corners_for = f.corners_for;
@@ -2349,6 +2379,8 @@ pub async fn build_tickets(
                     t.outbox_for = f.outbox_for;
                     t.inbox_for = f.inbox_for;
                     t.offsides_for = f.offsides_for;
+                    t.sot_for = f.sot_for;
+                    t.sot_against = f.sot_against;
                 };
                 if let Some(h) = home.as_mut() {
                     if let Some(f) = fetch_team_form(&state, fx.home_team_id).await {
@@ -2531,6 +2563,7 @@ pub async fn build_tickets(
                 if !selection.markets.is_empty() {
                     sc.retain(|c| markets.iter().any(|m| *m == c.market_group));
                 }
+                sc.retain(|c| !excluded.contains(&c.market_group)); // blacklist always wins
                 features::attach_odds(&mut sc, &fixture_odds, &fixture_label, &fx.home_team);
                 scout_candidates.extend(sc);
             }
@@ -2588,6 +2621,13 @@ pub async fn build_tickets(
         ));
     }
 
+    // O/U side lock: "overs only" kills every Under line (and vice versa) across
+    // ALL O/U families — one mishap turns Under 3.5 corners into 8 fast.
+    match selection.ou_side.as_deref() {
+        Some("over") => candidates.retain(|c| !c.line.to_lowercase().starts_with("under")),
+        Some("under") => candidates.retain(|c| !c.line.to_lowercase().starts_with("over")),
+        _ => {}
+    }
     // Per-leg odds sweet-spot: when set, keep only PRICED legs inside [min,max]
     // — drops chalk (e.g. 1.07) and lottery prices (e.g. 29x) before the model.
     let odds_lo = selection.min_odds.unwrap_or(1.0);
@@ -2665,6 +2705,8 @@ pub async fn build_tickets(
         "predictor" => (110, 20), // deep single-match read — the whole market for one game
         "scout" => (220, 44), // send the WHOLE picture (Haiku's context is huge): anchors + all solid moderate (≥30%) picks
         "stacker" => (120, 22), // risk-controlled stacks — wide stat pool incl. alt lines
+        "powerof3" => (110, 18), // per-game 3x blocks — needs likely legs across every fixture
+        "legmonster" => (170, 34), // 10-leg SGPs need a deep per-fixture pool
         _ => (50, 8),         // value
     };
     // Make sure the pool is big enough to actually BUILD the requested slate: with
@@ -2902,7 +2944,8 @@ pub async fn build_tickets(
         min_legs: selection.min_legs.unwrap_or(1).clamp(1, 12),
         max_per_subject: selection.max_per_subject.unwrap_or(0).min(20),
         apex_combos,
-        cover_all: selection.cover_all.unwrap_or(false),
+        // Power of 3 IS a coverage strategy — every fixture must contribute a block.
+        cover_all: selection.cover_all.unwrap_or(false) || strategy == "powerof3",
     };
     // Pull in any browser-ingested pages matched to these fixtures — labeled
     // 3rd-party context for the model, and mark each item "used".
@@ -3260,6 +3303,9 @@ async fn gather_candidates(
     markets: &[String],
     books: &[String],
 ) -> Vec<Candidate> {
+    // Hard blacklist (Settings) — deterministic paths honour it too.
+    let excluded = excluded_markets(state);
+    let markets: Vec<String> = markets.iter().filter(|m| !excluded.contains(*m)).cloned().collect();
     let player_groups: Vec<String> = markets.iter().filter(|m| is_player_market(m)).cloned().collect();
     let team_groups: Vec<String> = markets.iter().filter(|m| !is_player_market(m)).cloned().collect();
     // Same calibration shrink as builds — the Picks/Bankers boards used to show
@@ -3399,6 +3445,8 @@ async fn gather_candidates(
                 // goal-derived lines match what a Build would show (the board's
                 // apply used to omit xg_for/xg_against — same leg, different prob).
                 let apply = |t: &mut crate::features::TeamStats, f: &TeamForm| {
+                    t.sot_for = f.sot_for;
+                    t.sot_against = f.sot_against;
                     t.xg_for = f.xg_for;
                     t.xg_against = f.xg_against;
                     t.corners_for = f.corners_for;
@@ -3724,11 +3772,10 @@ pub async fn build_ladder(
     // Isolate Over or Under on the O/U families (goals, corners, shots, team
     // goals) when the user asks — otherwise both sides compete on probability.
     if ou_side == "over" || ou_side == "under" {
-        let want_over = ou_side == "over";
-        candidates.retain(|c| {
-            let is_ou = matches!(c.market_group.as_str(), "ou25" | "tcorners" | "tshots" | "tgoals");
-            !is_ou || c.line.to_lowercase().starts_with(if want_over { "over" } else { "under" })
-        });
+        // Same semantics as builds: kill the OTHER side across ALL O/U families
+        // (this used to only cover 4 groups — offsides/cards unders leaked in).
+        let drop = if ou_side == "over" { "under" } else { "over" };
+        candidates.retain(|c| !c.line.to_lowercase().starts_with(drop));
     }
 
     // POOL: one best line per PLAYER (so a player can't appear as both scorer
@@ -5809,6 +5856,9 @@ pub async fn darwin_sweep(
     // Trivial-leg policy — a paper variant padded with near-certainties would
     // fake a stellar hit rate (the exact ledger pollution Darwin must avoid).
     cands.retain(|c| c.est_prob <= TRIVIAL_PROB && !matches!(c.book_odds, Some(o) if o <= TRIVIAL_ODDS));
+    // Feedback honesty: the ledger dedupes (day, strategy, legs) — re-sweeping
+    // the same slate inserts NOTHING, which used to look like "did nothing".
+    let (mut inserted, mut deduped) = (0usize, 0usize);
     if cands.is_empty() {
         return Err("No candidate legs for these fixtures/markets.".to_string());
     }
@@ -5960,7 +6010,11 @@ pub async fn darwin_sweep(
                 .collect();
             sig.sort();
             if let Ok(tj) = serde_json::to_string(t) {
-                let _ = db::gen_add(&conn, af::now_ts(), &day, name, false, false, false, &t.kind, &sig.join("##"), &tj, t.combined_odds);
+                match db::gen_add(&conn, af::now_ts(), &day, name, false, false, false, &t.kind, &sig.join("##"), &tj, t.combined_odds) {
+                    Ok(true) => inserted += 1,
+                    Ok(false) => deduped += 1,
+                    Err(_) => {}
+                }
                 *counts.entry(name).or_insert(0) += 1;
             }
         }
@@ -5973,6 +6027,17 @@ pub async fn darwin_sweep(
     if summary.is_empty() {
         summary.push("No variant found qualifying legs on this slate (thin data or unpriced markets).".to_string());
     }
+    // The honest headline: what actually changed in the ledger THIS click.
+    summary.insert(
+        0,
+        if inserted > 0 {
+            format!("✅ {inserted} NEW paper ticket(s) recorded to the Ledger{}.", if deduped > 0 { format!(" ({deduped} already papered today — skipped)") } else { String::new() })
+        } else if deduped > 0 {
+            format!("↺ Nothing new — all {deduped} ticket(s) for this slate were already papered today (Darwin dedupes per day). They're in the Ledger's 🧬 rows, settling as matches finish.")
+        } else {
+            "Nothing recorded.".to_string()
+        },
+    );
     Ok(summary)
 }
 
@@ -6318,6 +6383,16 @@ struct IndexSample {
     corners_a: f64,
     goals_f: f64,
     goals_a: f64,
+}
+
+/// The user's hard market blacklist (Settings → excluded markets). Applied at
+/// every candidate source — even modes that force "all markets".
+fn excluded_markets(state: &AppState) -> HashSet<String> {
+    state
+        .keys
+        .lock()
+        .map(|k| k.excluded_markets.iter().cloned().collect())
+        .unwrap_or_default()
 }
 
 /// Fold the index's schedule correction into a team's rates: attack numbers
@@ -6982,4 +7057,361 @@ pub async fn picks_ai_build(
         return Err("The model returned no usable combinations — try more/varied picks.".to_string());
     }
     Ok(out)
+}
+
+// ---------- PropLine (US sports: MLB / NBA) — evidence list, not tickets ----------
+
+/// Upcoming events for a PropLine sport (next slate). Cached 30 min.
+#[tauri::command]
+pub async fn pl_events(state: State<'_, AppState>, sport: String) -> Result<Vec<PlEvent>, String> {
+    let j = crate::propline::get(&state, &format!("/sports/{sport}/events"), vec![], crate::propline::TTL_EVENTS).await?;
+    let arr = j.as_array().cloned().or_else(|| j.get("events").and_then(|e| e.as_array()).cloned()).unwrap_or_default();
+    let mut evs: Vec<PlEvent> = arr
+        .iter()
+        .filter_map(|e| {
+            Some(PlEvent {
+                id: e.get("id").map(|v| v.as_str().map(|s| s.to_string()).unwrap_or_else(|| v.to_string()))?,
+                sport_key: sport.clone(),
+                home_team: e.get("home_team").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                away_team: e.get("away_team").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                commence_time: e.get("commence_time").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                live: e.get("live").and_then(|v| v.as_bool()).unwrap_or(false),
+            })
+        })
+        .collect();
+    // Chronological — the UI groups these under date headers.
+    evs.sort_by(|a, b| a.commence_time.cmp(&b.commence_time));
+    Ok(evs)
+}
+
+/// The evidence list: every priced outcome for the selected events/markets with
+/// best odds, de-vigged sharp probability, implied prob and (when the tier
+/// allows) the player's measured hit-rate. Anchors-style ordering: most
+/// reliable first within each fixture. Handles 12-15 fixtures (one cached odds
+/// call each; trends cached 24h per player).
+#[tauri::command]
+pub async fn pl_picks(
+    state: State<'_, AppState>,
+    sport: String,
+    event_ids: Vec<String>,
+    markets: Vec<String>,
+) -> Result<Vec<PlPick>, String> {
+    if event_ids.is_empty() {
+        return Err("Select at least one game first.".to_string());
+    }
+    if markets.is_empty() {
+        return Err("Select at least one market first.".to_string());
+    }
+    state.build_cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+    // EVIDENCE FIRST: pull any newly-completed games' box scores into the
+    // player logs, so probabilities below rest on actual recent performance.
+    let _ = pl_refresh_logs(&state, &sport).await;
+    let mkts = markets.join(",");
+    let mut out: Vec<PlPick> = Vec::new();
+    let mut trend_cache: HashMap<String, Option<f64>> = HashMap::new();
+
+    for eid in &event_ids {
+        if state.build_cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+        let j = match crate::propline::get(
+            &state,
+            &format!("/sports/{sport}/events/{eid}/odds"),
+            vec![("markets", mkts.clone())],
+            crate::propline::TTL_ODDS,
+        )
+        .await
+        {
+            Ok(j) => j,
+            Err(_) => continue, // one bad event must not sink a 15-game slate
+        };
+        let fixture = format!(
+            "{} @ {}",
+            j.get("away_team").and_then(|v| v.as_str()).unwrap_or("?"),
+            j.get("home_team").and_then(|v| v.as_str()).unwrap_or("?")
+        );
+        // Collect per (market, subject, point): every book's price per side.
+        // side key: outcome name ("Over"/"Under"/team). subject: description
+        // (player) or the outcome name for game lines.
+        #[derive(Default)]
+        struct Cell {
+            best: Option<(f64, String)>,          // best decimal + book
+            pinnacle: Option<f64>,                // pinnacle decimal (this side)
+        }
+        let mut cells: HashMap<(String, String, String, String), Cell> = HashMap::new(); // (market, subject, point, side)
+        for b in j.get("bookmakers").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
+            let book = b.get("key").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            for m in b.get("markets").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
+                let mkey = m.get("key").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                for o in m.get("outcomes").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
+                    let name = o.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let desc = o.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let point = o
+                        .get("point")
+                        .and_then(|v| v.as_f64())
+                        .map(|p| format!("{p}"))
+                        .unwrap_or_default();
+                    let price = o.get("price").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let dec = crate::propline::american_to_decimal(price);
+                    if dec <= 1.0 {
+                        continue;
+                    }
+                    // subject = the ENTITY (player from description; empty for game
+                    // lines), side = the OUTCOME (Over/Under/team). Keying the
+                    // pair group on subject+point lets de-vig find both sides —
+                    // keying on the outcome name split Over/Under apart.
+                    let subject = desc.clone();
+                    let side = name.clone();
+                    let cell = cells.entry((mkey.clone(), subject, point, side)).or_default();
+                    if cell.best.as_ref().map_or(true, |(d, _)| dec > *d) && book != "pinnacle" {
+                        cell.best = Some((dec, book.clone()));
+                    }
+                    if book == "pinnacle" {
+                        // Pinnacle counts as best too when it's the only book.
+                        if cell.best.is_none() {
+                            cell.best = Some((dec, book.clone()));
+                        }
+                        cell.pinnacle = Some(dec);
+                    }
+                }
+            }
+        }
+        // De-vig sharp pairs: same (market, subject, point) with 2 sides.
+        let mut sharp: HashMap<(String, String, String, String), f64> = HashMap::new();
+        {
+            let mut groups: HashMap<(String, String, String), Vec<(String, f64)>> = HashMap::new();
+            for ((mk, subj, pt, side), cell) in &cells {
+                if let Some(p) = cell.pinnacle {
+                    groups.entry((mk.clone(), subj.clone(), pt.clone())).or_default().push((side.clone(), p));
+                }
+            }
+            for ((mk, subj, pt), sides) in groups {
+                if sides.len() >= 2 {
+                    let odds: Vec<f64> = sides.iter().map(|(_, d)| *d).collect();
+                    let probs = crate::odds::devig(&odds);
+                    for ((side, _), pr) in sides.iter().zip(probs.iter()) {
+                        sharp.insert((mk.clone(), subj.clone(), pt.clone(), side.clone()), *pr);
+                    }
+                }
+            }
+        }
+        for ((mk, subj, pt, side), cell) in cells {
+            let (odds, book) = match &cell.best {
+                Some((d, b)) => (Some(*d), Some(b.clone())),
+                None => (None, None),
+            };
+            let implied = odds.map(|d| 1.0 / d);
+            let sp = sharp.get(&(mk.clone(), subj.clone(), pt.clone(), side.clone())).copied();
+            // OUR evidence for player props: the player's own recent box
+            // scores → Poisson probability over THIS line + empirical hit rate
+            // over THIS line. Independent of every bookmaker.
+            let is_prop = mk.starts_with("player_") || mk.starts_with("batter_") || mk.starts_with("pitcher_");
+            let (mut our_prob, mut hit) = (None, None);
+            if is_prop && !subj.is_empty() {
+                if let (Some(stat), Ok(line_v)) = (pl_stat_of(&mk), pt.parse::<f64>()) {
+                    let logs = {
+                        let conn = state.db.lock().map_err(|_| "db lock")?;
+                        db::pl_logs_player(&conn, &sport, &subj, stat, 15)
+                    };
+                    if logs.len() >= 5 {
+                        let over_p = pl_prob_over(stat, &logs, line_v);
+                        let is_over = side.to_lowercase().starts_with("over");
+                        our_prob = Some(if is_over { over_p } else { 1.0 - over_p });
+                        let hits = logs.iter().filter(|v| if is_over { **v > line_v } else { **v < line_v }).count();
+                        hit = Some(hits as f64 / logs.len() as f64);
+                    }
+                }
+                // Trends endpoint as a secondary source when our logs are thin.
+                if hit.is_none() {
+                    let ck = format!("{sport}|{subj}");
+                    hit = if let Some(h) = trend_cache.get(&ck) {
+                        *h
+                    } else {
+                        let h = fetch_pl_hit_rate(&state, &sport, &subj, &mk).await;
+                        trend_cache.insert(ck, h);
+                        h
+                    };
+                }
+            }
+            let label_side = if pt.is_empty() { side.clone() } else { format!("{side} {pt}") };
+            out.push(PlPick {
+                fixture: fixture.clone(),
+                market: mk,
+                subject: subj,
+                side: label_side,
+                odds: odds.map(|d| (d * 100.0).round() / 100.0),
+                book,
+                sharp: sp.map(|p| (p * 10000.0).round() / 10000.0),
+                // probability = OURS when the logs support one (that's the whole
+                // point); sharp, then implied, as honest fallbacks.
+                probability: our_prob.or(sp).or(implied).map(|p| (p * 10000.0).round() / 10000.0),
+                implied: implied.map(|p| (p * 10000.0).round() / 10000.0),
+                hit_chance: hit.map(|p| (p * 10000.0).round() / 10000.0),
+            });
+        }
+    }
+    // Anchors ordering: fixture, then most reliable first.
+    out.sort_by(|a, b| {
+        a.fixture
+            .cmp(&b.fixture)
+            .then(b.probability.unwrap_or(0.0).partial_cmp(&a.probability.unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    if out.is_empty() {
+        return Err("No priced outcomes for those games/markets — try more markets or closer to game time.".to_string());
+    }
+    Ok(out)
+}
+
+/// Trends → last-10 hit rate for a player+market. None when unavailable or
+/// the tier redacts the numbers (we never invent one).
+async fn fetch_pl_hit_rate(state: &AppState, sport: &str, player: &str, market: &str) -> Option<f64> {
+    let enc = player.replace(' ', "%20");
+    let j = crate::propline::get(state, &format!("/sports/{sport}/players/{enc}/trends"), vec![], crate::propline::TTL_TRENDS)
+        .await
+        .ok()?;
+    let markets = j.get("markets").and_then(|v| v.as_array())?;
+    let m = markets.iter().find(|m| m.get("market").and_then(|v| v.as_str()) == Some(market))?;
+    if m.get("redacted").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return None;
+    }
+    m.get("last_10").and_then(|v| v.as_f64()).or_else(|| m.get("last_5").and_then(|v| v.as_f64()))
+}
+
+/// Market key → box-score stat type, per sport. The evidence bridge.
+fn pl_stat_of(market: &str) -> Option<&'static str> {
+    Some(match market {
+        // MLB
+        "pitcher_strikeouts" => "strikeouts",
+        "batter_total_bases" => "total_bases",
+        "batter_hits" => "hits",
+        "batter_home_runs" => "home_runs",
+        "batter_rbis" => "rbis",
+        // NBA (box-score stat names per PropLine)
+        "player_points" => "points",
+        "player_rebounds" => "rebounds",
+        "player_assists" => "assists",
+        "player_threes" => "threes",
+        "player_steals" => "steals",
+        "player_blocks" => "blocks",
+        "player_turnovers" => "turnovers",
+        "player_points_rebounds_assists" => "points_rebounds_assists",
+        _ => return None,
+    })
+}
+
+/// Ingest NEW completed games' box scores into the player logs (incremental —
+/// already-ingested events cost nothing; ~one call per new completed game).
+async fn pl_refresh_logs(state: &AppState, sport: &str) -> usize {
+    let scores = match crate::propline::get(state, &format!("/sports/{sport}/scores"), vec![], 1800).await {
+        Ok(j) => j,
+        Err(_) => return 0,
+    };
+    let evs = scores.as_array().cloned().or_else(|| scores.get("scores").and_then(|v| v.as_array()).cloned()).unwrap_or_default();
+    let mut ingested = 0usize;
+    for e in evs {
+        if state.build_cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+        let status = e.get("status").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+        if !matches!(status.as_str(), "final" | "completed" | "closed") {
+            continue;
+        }
+        let eid = e.get("id").map(|v| v.as_str().map(|s| s.to_string()).unwrap_or_else(|| v.to_string())).unwrap_or_default();
+        if eid.is_empty() {
+            continue;
+        }
+        {
+            let conn = match state.db.lock() {
+                Ok(c) => c,
+                Err(_) => break,
+            };
+            if db::pl_logs_has_event(&conn, sport, &eid) {
+                continue;
+            }
+        }
+        // Final box scores never change — cache them for a month.
+        let sj = match crate::propline::get(state, &format!("/sports/{sport}/events/{eid}/stats"), vec![], 30 * 24 * 3600).await {
+            Ok(j) => j,
+            Err(_) => continue,
+        };
+        let ts = sj.get("commence_time").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let rows: Vec<(String, String, f64)> = sj
+            .get("stats")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|r| {
+                        let p = r.get("player_name").and_then(|v| v.as_str()).unwrap_or("");
+                        if p.is_empty() {
+                            return None; // team/period rows — not player evidence
+                        }
+                        Some((
+                            p.to_string(),
+                            r.get("stat_type").and_then(|v| v.as_str())?.to_string(),
+                            r.get("stat_value").and_then(|v| v.as_f64())?,
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if rows.is_empty() {
+            continue;
+        }
+        if let Ok(conn) = state.db.lock() {
+            let _ = db::pl_logs_add(&conn, sport, &eid, &ts, &rows);
+            ingested += 1;
+        }
+    }
+    ingested
+}
+
+/// P(X > line) from the player's own game logs — the independent probability
+/// the odds screen can DISAGREE with. Distribution dispatched per stat:
+///   • Poisson  — true count events (Ks, HRs, RBIs, steals, blocks, threes)
+///   • Neg-Bin  — bursty counts (total bases, hits, rebounds, assists, TOs)
+///     with dispersion φ ESTIMATED from the player's own variance/mean
+///   • Normal   — high-mean stats (points, PRA) where CLT applies
+fn pl_prob_over(stat: &str, logs: &[f64], line: f64) -> f64 {
+    let n = logs.len() as f64;
+    let mean = logs.iter().sum::<f64>() / n;
+    if mean <= 0.0 {
+        return 0.0;
+    }
+    let var = logs.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n.max(1.0);
+    match stat {
+        // High-mean: normal approximation on the player's own mean/sd.
+        "points" | "points_rebounds_assists" => {
+            let sd = var.sqrt().max(1.0);
+            let z = (line - mean) / sd;
+            // Φ(-z) via erf-free logistic approximation (max err ~1.4e-2, fine
+            // for ranking; honest numbers stay in the logs columns).
+            1.0 / (1.0 + (1.702 * z).exp())
+        }
+        // Bursty counts: NB with φ = var/mean from the logs (≥1, capped).
+        "total_bases" | "hits" | "rebounds" | "assists" | "turnovers" | "hits_runs_rbis" => {
+            let phi = (var / mean).clamp(1.0, 3.0);
+            let thr = line.floor().max(0.0) as u32;
+            crate::features::nb_over(thr, mean, phi)
+        }
+        // True count events: Poisson.
+        _ => {
+            let thr = line.floor() as i64;
+            let mut p = (-mean).exp();
+            let mut cdf = p;
+            for k in 1..=thr.max(0) {
+                p *= mean / k as f64;
+                cdf += p;
+            }
+            (1.0 - cdf).clamp(0.0, 1.0)
+        }
+    }
+}
+
+
+/// PropLine fresh calls made today (local counter — the provider doesn't
+/// expose a quota header on standard endpoints).
+#[tauri::command]
+pub fn pl_usage(state: State<AppState>) -> Result<i64, String> {
+    let conn = state.db.lock().map_err(|_| "db lock")?;
+    Ok(db::pl_meter(&conn, &af::today()))
 }

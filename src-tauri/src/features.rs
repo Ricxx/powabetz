@@ -668,16 +668,22 @@ pub fn build_player_candidates_entry(
                     vec![format!("fouls/90 {:.2}", fouls_p90)],
                     vec!["workload proxy".to_string()],
                 ));
+            }
+            "fdrawn" => {
+                // Fouls Drawn — its own toggle (bet365 "Player To Be Fouled");
+                // used to hide inside the committed-fouls key.
                 let ld = fdrawn_p90 * min_scale;
-                out.push(base(
-                    "Fouls Drawn",
-                    "fouls",
-                    "1+ foul drawn",
-                    fdrawn_p90,
-                    pois_ge1(ld),
-                    vec![format!("fouls_drawn/90 {:.2}", fdrawn_p90)],
-                    vec![],
-                ));
+                if fdrawn_p90 >= 0.3 {
+                    out.push(base(
+                        "Fouls Drawn",
+                        "fdrawn",
+                        "1+ foul drawn",
+                        fdrawn_p90,
+                        pois_ge1(ld),
+                        vec![format!("fouls_drawn/90 {:.2}", fdrawn_p90)],
+                        vec![],
+                    ));
+                }
             }
             "cards" => {
                 let lambda = cards_p90 * workload * min_scale;
@@ -852,6 +858,8 @@ pub struct TeamStats {
     pub outbox_for: Option<f64>,
     pub inbox_for: Option<f64>,
     pub offsides_for: Option<f64>,
+    pub sot_for: Option<f64>,
+    pub sot_against: Option<f64>,
     /// Recent card model: avg cards this team / the opponent per game, the rate
     /// BOTH teams got a card, and the rate this team had the MOST cards.
     pub cards_for: Option<f64>,
@@ -918,6 +926,8 @@ pub fn parse_team_stats(json: &Value, name: &str) -> Option<TeamStats> {
         xg_for: None,
         xg_against: None,
         corners_for: None,
+        sot_for: None,
+        sot_against: None,
         offsides_for: None,
         cards_for: None,
         cards_against: None,
@@ -1196,6 +1206,70 @@ pub fn build_team_candidates(
                     let (ph, pa) = (prob_more(hc, ac), prob_more(ac, hc));
                     out.push(mk(&home.name, "Most Corners", "mostcorners", "most corners", ph, clampp(ph), vec![format!("corners/g {hc:.1} vs {ac:.1}")]));
                     out.push(mk(&away.name, "Most Corners", "mostcorners", "most corners", pa, clampp(pa), vec![format!("corners/g {ac:.1} vs {hc:.1}")]));
+                }
+            }
+            "mcorners" => {
+                // MATCH total corners (both teams combined) — bet365's "Corners".
+                if let (Some(hc), Some(ac)) = (h_corners, a_corners) {
+                    let lam = hc + ac;
+                    for line in [7.5_f64, 8.5, 9.5, 10.5, 11.5] {
+                        let thr = line.floor() as u32;
+                        let over = nb_over(thr, lam, PHI_CORNERS);
+                        let sup = vec![format!("match corners exp {lam:.1}"), "Neg-Binomial".into()];
+                        out.push(mk("Match", "Match Corners", "mcorners", &format!("Over {line:.1}"), lam, over, sup.clone()));
+                        out.push(mk("Match", "Match Corners", "mcorners", &format!("Under {line:.1}"), lam, 1.0 - over, sup));
+                    }
+                }
+            }
+            "mcards" => {
+                // MATCH total cards (both teams) — bet365's "Cards".
+                if let (Some(hc), Some(ac)) = (home.cards_for, away.cards_for) {
+                    let lam = hc + ac;
+                    for line in [3.5_f64, 4.5, 5.5] {
+                        let thr = line.floor() as u32;
+                        let over = nb_over(thr, lam, PHI_CARDS);
+                        let sup = vec![format!("match cards exp {lam:.1}"), "Neg-Binomial".into()];
+                        out.push(mk("Match", "Match Cards", "mcards", &format!("Over {line:.1}"), lam, over, sup.clone()));
+                        out.push(mk("Match", "Match Cards", "mcards", &format!("Under {line:.1}"), lam, 1.0 - over, sup));
+                    }
+                }
+            }
+            "mshots" => {
+                // MATCH total shots (both teams) — bet365's "Total Shots".
+                if let (Some(hs), Some(as_)) = (h_shots, a_shots) {
+                    let lam = hs + as_;
+                    let base_l = (lam / 2.0).round() * 2.0; // even anchor near the mean
+                    for off in [-3.5_f64, -0.5, 2.5] {
+                        let line = (base_l + off).max(14.5);
+                        let thr = line.floor() as u32;
+                        let over = nb_over(thr, lam, PHI_SHOTS);
+                        let sup = vec![format!("match shots exp {lam:.1}"), "Neg-Binomial".into()];
+                        out.push(mk("Match", "Match Shots", "mshots", &format!("Over {line:.1}"), lam, over, sup.clone()));
+                        out.push(mk("Match", "Match Shots", "mshots", &format!("Under {line:.1}"), lam, 1.0 - over, sup));
+                    }
+                }
+            }
+            "msot" => {
+                // MATCH total shots on target — bet365's "Total Shots on Target".
+                // Recent-form SOT for/against, crossed like the other volumes.
+                let cross_sot = |own: Option<f64>, oc: Option<f64>| -> Option<f64> {
+                    let o = own?;
+                    Some(match oc {
+                        Some(c) => 0.5 * (o * c / 4.5) + 0.5 * (o + c) / 2.0,
+                        None => o,
+                    })
+                };
+                let h_sot = cross_sot(home.sot_for, away.sot_against);
+                let a_sot = cross_sot(away.sot_for, home.sot_against);
+                if let (Some(hs), Some(as_)) = (h_sot, a_sot) {
+                    let lam = hs + as_;
+                    for line in [6.5_f64, 7.5, 8.5, 9.5] {
+                        let thr = line.floor() as u32;
+                        let over = nb_over(thr, lam, PHI_SHOTS);
+                        let sup = vec![format!("match SOT exp {lam:.1}"), "Neg-Binomial".into()];
+                        out.push(mk("Match", "Match Shots on Target", "msot", &format!("Over {line:.1}"), lam, over, sup.clone()));
+                        out.push(mk("Match", "Match Shots on Target", "msot", &format!("Under {line:.1}"), lam, 1.0 - over, sup));
+                    }
                 }
             }
             "mostshots" => {

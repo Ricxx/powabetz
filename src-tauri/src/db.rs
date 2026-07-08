@@ -485,6 +485,15 @@ fn init(conn: &Connection) -> Result<(), String> {
             built_at  INTEGER NOT NULL,
             PRIMARY KEY (league_id, season, team_id)
         );
+        CREATE TABLE IF NOT EXISTS pl_logs (
+            sport    TEXT NOT NULL,
+            player   TEXT NOT NULL,
+            stat     TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            ts       TEXT NOT NULL,
+            value    REAL NOT NULL,
+            PRIMARY KEY (sport, player, stat, event_id)
+        );
         CREATE TABLE IF NOT EXISTS team_pred (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
             fixture_id INTEGER NOT NULL,
@@ -1090,15 +1099,16 @@ pub fn gen_add(
     sig: &str,
     ticket_json: &str,
     combined_odds: Option<f64>,
-) -> Result<(), String> {
-    conn.execute(
-        "INSERT OR IGNORE INTO generated_tickets
+) -> Result<bool, String> {
+    let n = conn
+        .execute(
+            "INSERT OR IGNORE INTO generated_tickets
          (created_at, day, strategy, grok_used, ingest_used, index_used, kind, sig, ticket_json, combined_odds)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-        params![now, day, strategy, grok_used as i64, ingest_used as i64, index_used as i64, kind, sig, ticket_json, combined_odds],
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(())
+            params![now, day, strategy, grok_used as i64, ingest_used as i64, index_used as i64, kind, sig, ticket_json, combined_odds],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(n > 0) // false = deduped (same day+strategy+legs already papered)
 }
 
 /// Paper-ledger A/B: with vs without ingested data (void-aware, windowed).
@@ -1348,4 +1358,62 @@ pub fn latest_saved_ticket(conn: &Connection) -> Result<Option<(i64, String)>, S
     )
     .optional()
     .map_err(|e| e.to_string())
+}
+
+// ---------- PropLine player game logs (built from completed-game box scores) ----------
+
+/// Batch-insert one completed game's player stat lines. Idempotent.
+pub fn pl_logs_add(
+    conn: &Connection,
+    sport: &str,
+    event_id: &str,
+    ts: &str,
+    rows: &[(String, String, f64)], // (player, stat, value)
+) -> Result<(), String> {
+    for (player, stat, value) in rows {
+        conn.execute(
+            "INSERT OR IGNORE INTO pl_logs (sport, player, stat, event_id, ts, value) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![sport, player, stat, event_id, ts, value],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Has this completed event already been ingested into the logs?
+pub fn pl_logs_has_event(conn: &Connection, sport: &str, event_id: &str) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM pl_logs WHERE sport = ?1 AND event_id = ?2 LIMIT 1",
+        params![sport, event_id],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
+/// A player's most recent values for one stat (newest first).
+pub fn pl_logs_player(conn: &Connection, sport: &str, player: &str, stat: &str, n: i64) -> Vec<f64> {
+    let mut out = Vec::new();
+    if let Ok(mut st) = conn.prepare(
+        "SELECT value FROM pl_logs WHERE sport = ?1 AND player = ?2 AND stat = ?3 ORDER BY ts DESC LIMIT ?4",
+    ) {
+        if let Ok(rows) = st.query_map(params![sport, player, stat, n], |r| r.get::<_, f64>(0)) {
+            out = rows.filter_map(|r| r.ok()).collect();
+        }
+    }
+    out
+}
+
+/// PropLine daily fresh-call counter (separate from the API-Football meter —
+/// day key prefixed so the two can never mix).
+pub fn pl_meter_bump(conn: &Connection, day: &str) {
+    let _ = conn.execute(
+        "INSERT INTO request_log (day, count) VALUES (?1, 1)
+         ON CONFLICT(day) DO UPDATE SET count = count + 1",
+        params![format!("pl:{day}")],
+    );
+}
+
+pub fn pl_meter(conn: &Connection, day: &str) -> i64 {
+    conn.query_row("SELECT count FROM request_log WHERE day = ?1", params![format!("pl:{day}")], |r| r.get(0))
+        .unwrap_or(0)
 }

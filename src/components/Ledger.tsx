@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { errMsg, toast } from "../toast";
 import { api } from "../api";
-import { stratLabel } from "../types";
+import { stratLabel , marketNameToKey , stratDescription } from "../types";
 import type { GenReportRow, MarketReportRow, ModelPurposeRow } from "../types";
 
 function purposeLabel(p: string): string {
@@ -113,8 +113,15 @@ function ReportTable({
           {sorted.map((r, i) => (
             <tr key={i} className="border-t border-edge">
               <td className="py-1">
-                {labelFn(r.strategy)}
-                {r.grok_used && <span className="text-accent ml-1">🔍</span>}
+                <div>
+                  {labelFn(r.strategy)}
+                  {r.grok_used && <span className="text-accent ml-1">🔍</span>}
+                </div>
+                {stratDescription(r.strategy) && (
+                  <div className="text-[10px] text-slate-500 leading-tight max-w-[200px]">
+                    {stratDescription(r.strategy)}
+                  </div>
+                )}
               </td>
               <td className="text-right text-slate-400">
                 {r.settled}/{r.total}
@@ -164,12 +171,26 @@ function ReportTable({
 
 // Per-pick (market) calibration: actual hit-rate vs the model's prediction. The
 // gap is the bias — and it's exactly what auto-feeds the model's calibration.
-function MarketTable({ rows }: { rows: MarketReportRow[] }) {
+function MarketTable({ rows, onUseMarkets }: { rows: MarketReportRow[]; onUseMarkets?: (keys: string[]) => void }) {
   const sorted = rows.slice().filter((r) => r.settled > 0).sort((a, b) => b.settled - a.settled);
   if (sorted.length === 0) return null;
+  // Proven markets: actual hit > 50% on a real sample (≥10 graded legs).
+  const best = sorted.filter((r) => r.settled >= 10 && r.hit_rate > 0.5);
+  const bestKeys = [...new Set(best.map((r) => marketNameToKey(r.market)).filter((k): k is string => !!k))];
   return (
     <div className="card">
-      <div className="text-xs font-semibold text-slate-400 mb-1">By pick (market) — predicted vs actual</div>
+      <div className="flex items-center justify-between mb-1">
+        <div className="text-xs font-semibold text-slate-400">By pick (market) — predicted vs actual</div>
+        {onUseMarkets && bestKeys.length > 0 && (
+          <button
+            className="text-[11px] text-accent underline shrink-0"
+            title={`Select the markets that actually LAND >50% of the time on your slates (≥10 graded legs): ${best.map((r) => r.market).join(", ")}`}
+            onClick={() => onUseMarkets(bestKeys)}
+          >
+            ✓ use best markets ({bestKeys.length})
+          </button>
+        )}
+      </div>
       <table className="w-full text-xs">
         <thead className="text-slate-500">
           <tr>
@@ -229,7 +250,7 @@ function MarketTable({ rows }: { rows: MarketReportRow[] }) {
   );
 }
 
-export default function Ledger({ onClose }: { onClose: () => void }) {
+export default function Ledger({ onClose, onUseMarkets }: { onClose: () => void; onUseMarkets?: (keys: string[]) => void }) {
   const [rows, setRows] = useState<GenReportRow[] | null>(null);
   // Recency window for the strategy report — edges decay, and lifetime totals
   // bury what's working NOW under months-old results.
@@ -336,7 +357,7 @@ export default function Ledger({ onClose }: { onClose: () => void }) {
           <ReportTable rows={rows} label="By strategy" />
           <ReportTable rows={byKind} label="By ticket type" labelFn={(s) => s} />
       <ReportTable rows={ingestSplit} label="Does ingested data help? 🧲" labelFn={(s) => s} />
-          <MarketTable rows={byMarket} />
+          <MarketTable rows={byMarket} onUseMarkets={onUseMarkets} />
           <p className="text-[10px] text-slate-500">
             Hit = all legs landed. ROI = notional return at 1 unit/ticket on priced tickets only
             (unpriced player-prop accas show hit-rate but no ROI).

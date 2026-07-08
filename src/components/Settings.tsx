@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { errMsg, toast } from "../toast";
 import { api } from "../api";
 import Hint from "./Hint";
-import { COMMON_BOOKS, MODEL_OPTIONS, TIMEZONES, type BankrollView, type IndexLeagueView, type LeagueOption, type SettingsView, type TeamPerfRow } from "../types";
+import { COMMON_BOOKS, MARKETS, MODEL_OPTIONS, TIMEZONES, type BankrollView, type IndexLeagueView, type LeagueOption, type SettingsView, type TeamPerfRow } from "../types";
 
 export default function Settings({
   settings,
@@ -18,6 +18,7 @@ export default function Settings({
   const [grok, setGrok] = useState("");
   const [openai, setOpenai] = useState("");
   const [deepseek, setDeepseek] = useState("");
+  const [propline, setPropline] = useState("");
   const [model, setModel] = useState(settings.model);
   const [limit, setLimit] = useState(String(settings.meter.limit));
   const [selBooks, setSelBooks] = useState<Set<string>>(new Set(settings.books));
@@ -34,6 +35,9 @@ export default function Settings({
   const [ingestEnabled, setIngestEnabled] = useState(true);
   // Opponent-strength index state.
   const [useIndex, setUseIndex] = useState(settings.use_team_index ?? true);
+  // 🚫 Hard market blacklist — outranks every mode, incl. forced-all ones.
+  const [excluded, setExcluded] = useState<Set<string>>(new Set(settings.excluded_markets ?? []));
+  const [dsThinking, setDsThinking] = useState(settings.deepseek_thinking ?? false);
   const [idxLeagues, setIdxLeagues] = useState<IndexLeagueView[]>([]);
   const [leagueOpts, setLeagueOpts] = useState<LeagueOption[]>([]);
   const [idxLeagueSel, setIdxLeagueSel] = useState<number | "">("");
@@ -77,7 +81,10 @@ export default function Settings({
         proxyUrl.trim(),
         proxyToken || null,
         ingestEnabled,
-        useIndex
+        useIndex,
+        [...excluded],
+        dsThinking,
+        propline || null
       );
       onSaved(next);
       setAf("");
@@ -85,6 +92,7 @@ export default function Settings({
       setGrok("");
       setOpenai("");
       setDeepseek("");
+      setPropline("");
       setProxyToken("");
       toast.success("Settings saved.");
     } catch (e) {
@@ -385,6 +393,12 @@ export default function Settings({
           value={openai}
           onChange={setOpenai}
         />
+        <KeyInput
+          label="PropLine key — US sports (MLB/NBA) odds & props"
+          set={settings.has_propline_key}
+          value={propline}
+          onChange={setPropline}
+        />
         <div className="pt-1 border-t border-edge">
           <div className="text-xs font-semibold text-slate-300 mt-2">🌐 Server mode (shared access)</div>
           <p className="text-[11px] text-slate-500 mt-0.5 mb-2">
@@ -432,6 +446,61 @@ export default function Settings({
             <span className={`absolute top-1 w-5 h-5 rounded-full bg-ink transition-all ${ingestEnabled ? "left-6" : "left-1"}`} />
           </button>
         </div>
+      </div>
+
+      <div className="card space-y-2">
+        <div className="flex items-center justify-between">
+          <div className="min-w-0">
+            <div className="text-xs font-semibold text-slate-300">🧠 DeepSeek deep thinking</div>
+            <div className="text-[11px] text-slate-500">
+              Lets DeepSeek REASON about the slate before answering — sharper builds, but MUCH
+              slower (minutes, not seconds). Off = fast answer-only builds.
+            </div>
+          </div>
+          <button
+            className={`shrink-0 w-12 h-7 rounded-full transition relative ${dsThinking ? "bg-accent" : "bg-edge"}`}
+            onClick={() => setDsThinking((v) => !v)}
+            aria-label="toggle deepseek thinking"
+          >
+            <span className={`absolute top-1 w-5 h-5 rounded-full bg-ink transition-all ${dsThinking ? "left-6" : "left-1"}`} />
+          </button>
+        </div>
+      </div>
+
+      <div className="card space-y-2">
+        <div className="text-xs font-semibold text-slate-300">🚫 Excluded markets</div>
+        <p className="text-[11px] text-slate-500">
+          Unsubscribe from markets entirely. A red chip NEVER appears in any build — including the
+          modes that force all markets (Simple, Match Predictor, Darwin, Scout page-lines). Tap to
+          toggle, then Save.
+        </p>
+        <div className="flex flex-wrap gap-1.5">
+          {MARKETS.map((m) => {
+            const off = excluded.has(m.key);
+            return (
+              <button
+                key={m.key}
+                className={`chip text-xs ${off ? "bg-bad/20 border-bad text-bad" : ""}`}
+                title={off ? `${m.label} — excluded from ALL builds` : m.label}
+                onClick={() =>
+                  setExcluded((prev) => {
+                    const n = new Set(prev);
+                    n.has(m.key) ? n.delete(m.key) : n.add(m.key);
+                    return n;
+                  })
+                }
+              >
+                {off ? "🚫 " : ""}{m.label.split(" — ")[0]}
+              </button>
+            );
+          })}
+        </div>
+        {excluded.size > 0 && (
+          <p className="text-[10px] text-slate-500">
+            {excluded.size} market(s) excluded. Existing ledger/history rows keep their old legs —
+            this controls new builds only.
+          </p>
+        )}
       </div>
 
       <div className="card space-y-2">
